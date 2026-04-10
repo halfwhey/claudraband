@@ -1,0 +1,51 @@
+# CLAUDE.md
+
+This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+
+## Build & Test
+
+```bash
+make build          # go build -o allagent .
+make test           # go test ./... -count=1 -timeout=30s
+make vet            # go vet ./...
+make run            # build + run with default model (sonnet)
+
+# Run a single test
+go test ./pkg/clients/claude/ -run TestTailerReadsExistingLines -v
+
+# Run tests for one package
+go test ./pkg/tmuxctl/ -v -count=1 -timeout=15s
+```
+
+## Architecture
+
+allagent is an ACP (Agent Client Protocol) agent server that wraps Claude Code. An ACP client (e.g. Zed) launches allagent as a subprocess and communicates via stdio JSON-RPC. allagent spawns Claude Code in a hidden tmux session and translates between ACP and Claude's JSONL event stream.
+
+Two layers:
+
+**Layer 1 -- Reusable wrapper packages (`pkg/`)**
+
+- `pkg/wrap` defines the `Wrapper` interface and `Event` types. This is the contract between backends and any consumer.
+- `pkg/clients/claude` implements `Wrapper`. It spawns Claude in tmux via `pkg/tmuxctl`, then tails the on-disk JSONL session file to emit structured `Event`s on a channel.
+- `pkg/tmuxctl` wraps tmux CLI operations (new-session, send-keys, capture-pane, kill-session).
+
+**Layer 2 -- ACP bridge (`pkg/acpbridge/`)**
+
+- `pkg/acpbridge` implements `acp.Agent` from `github.com/coder/acp-go-sdk`. It bridges ACP JSON-RPC to `wrap.Wrapper`: translating `session/prompt` into `Wrapper.Send()`, and streaming `wrap.Event`s back as `session/update` notifications.
+- `internal/config` is a factory that constructs a Claude `Wrapper`.
+
+**Key data flow:** ACP client -> `session/prompt` (stdin JSON-RPC) -> `Wrapper.Send()` -> tmux send-keys -> Claude CLI processes it -> writes JSONL to disk -> tailer parses it -> `Event` on channel -> bridge translates to ACP `session/update` -> stdout JSON-RPC -> ACP client renders.
+
+## JSONL Session File Format
+
+**Claude Code:** `~/.claude/projects/<escaped-cwd>/<session-uuid>.jsonl` -- one JSON object per line. Key `type` values: `"user"`, `"assistant"`, `"system"`, `"progress"`, `"attachment"`, `"permission-mode"`. Messages live in the `message` field with `role` and `content` (string or array of content blocks: text, thinking, tool_use, tool_result).
+
+## Important Patterns
+
+The `Events()` channel is created eagerly in `New()` and bridged from the tailer in `Start()`. This avoids a race where consumers call `Events()` before `Start()` completes.
+
+Tailers use poll-based tailing (200ms intervals) rather than fsnotify, since the JSONL files are append-only and poll is simpler and more reliable across filesystems.
+
+tmux sessions are named `allagent-<session-id>`. Each ACP session gets its own tmux session to support concurrent sessions.
+
+Turn completion detection uses an idle timer: after receiving assistant text with no pending tool calls, if no new events arrive within 3 seconds, the turn is considered complete.
