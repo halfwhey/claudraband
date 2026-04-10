@@ -63,7 +63,11 @@ export class ClaudeWrapper implements Wrapper {
   async startResume(claudeSessionId: string, signal: AbortSignal): Promise<void> {
     this._claudeSessionId = claudeSessionId;
     this._signal = signal;
-    const cmd = this.buildCmd("--resume", claudeSessionId);
+    // Use --resume if the JSONL file exists, otherwise --session-id for a fresh start.
+    const jsonlPath = sessionPath(this.cfg.workingDir, claudeSessionId);
+    const cmd = existsSync(jsonlPath)
+      ? this.buildCmd("--resume", claudeSessionId)
+      : this.buildCmd("--session-id", claudeSessionId);
     await this.spawnAndTail(signal, cmd);
   }
 
@@ -115,6 +119,9 @@ export class ClaudeWrapper implements Wrapper {
       cmd,
     );
 
+    // Wait for Claude Code to be ready (showing INSERT mode or ❯ prompt)
+    await this.waitForReady(signal);
+
     const jsonlPath = sessionPath(this.cfg.workingDir, this._claudeSessionId);
     this.tailer = new Tailer(jsonlPath);
     this.eventIterable = this.tailer.events();
@@ -127,6 +134,29 @@ export class ClaudeWrapper implements Wrapper {
       tailer.close();
       await tmux.kill().catch(() => {});
     }, { once: true });
+  }
+
+  /**
+   * Poll the tmux pane until Claude Code is ready to accept input.
+   * Looks for "INSERT" in the status bar, which indicates the TUI has loaded.
+   */
+  private async waitForReady(signal: AbortSignal): Promise<void> {
+    const MAX_WAIT_MS = 15_000;
+    const POLL_MS = 300;
+    const start = Date.now();
+
+    while (Date.now() - start < MAX_WAIT_MS) {
+      if (signal.aborted) return;
+      try {
+        const pane = await this.tmux!.capturePane();
+        if (pane.includes("INSERT") || pane.includes("NORMAL")) {
+          return;
+        }
+      } catch {
+        // pane not ready yet
+      }
+      await new Promise((r) => setTimeout(r, POLL_MS));
+    }
   }
 
   async stop(): Promise<void> {

@@ -32,7 +32,7 @@ import type { ClaudeWrapper } from "../clients/claude";
 import type { Event } from "../wrap/event";
 import { EventKind } from "../wrap/event";
 import { mapToolKind, parseAskUserQuestion, extractLocations } from "./toolmap";
-import { readdir, readFile } from "node:fs/promises";
+import { readdir, readFile, stat } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join } from "node:path";
 
@@ -222,8 +222,7 @@ export class Bridge implements Agent {
   // -------------------------------------------------------------------------
 
   async newSession(params: NewSessionRequest): Promise<NewSessionResponse> {
-    const sid = randomID();
-    const tmuxName = "allagent-" + sid.slice(0, 12);
+    const tmuxName = "allagent-" + randomID().slice(0, 12);
 
     const { ClaudeWrapper } = await import("../clients/claude");
     const permissionMode = "default";
@@ -237,6 +236,10 @@ export class Bridge implements Agent {
     });
 
     await w.start(this.conn.signal);
+
+    // Use the Claude Code UUID as the ACP session ID so that clients
+    // (acpx, toad) can reconnect after a process restart via loadSession.
+    const sid = w.claudeSessionId;
     this.sessions.set(sid, {
       id: sid,
       wrapper: w,
@@ -244,7 +247,7 @@ export class Bridge implements Agent {
       cwd: params.cwd,
       model: this.model,
       permissionMode,
-      claudeSessionId: w.claudeSessionId,
+      claudeSessionId: sid,
     });
 
     this.log.info(
@@ -264,9 +267,8 @@ export class Bridge implements Agent {
   }
 
   async loadSession(params: LoadSessionRequest): Promise<LoadSessionResponse> {
-    const claudeSessionId = params.sessionId;
-    const sid = randomID();
-    const tmuxName = "allagent-" + sid.slice(0, 12);
+    const sid = params.sessionId; // This is the Claude Code UUID
+    const tmuxName = "allagent-" + randomID().slice(0, 12);
 
     const { ClaudeWrapper } = await import("../clients/claude");
     const permissionMode = "default";
@@ -280,9 +282,9 @@ export class Bridge implements Agent {
     });
 
     // Replay existing JSONL events as session updates before starting.
-    await this.replayHistory(sid, params.cwd, claudeSessionId);
+    await this.replayHistory(sid, params.cwd, sid);
 
-    await w.startResume(claudeSessionId, this.conn.signal);
+    await w.startResume(sid, this.conn.signal);
     this.sessions.set(sid, {
       id: sid,
       wrapper: w,
@@ -290,18 +292,10 @@ export class Bridge implements Agent {
       cwd: params.cwd,
       model: this.model,
       permissionMode,
-      claudeSessionId,
+      claudeSessionId: sid,
     });
 
-    this.log.info(
-      "session loaded",
-      "sid",
-      sid,
-      "claudeSessionId",
-      claudeSessionId,
-      "cwd",
-      params.cwd,
-    );
+    this.log.info("session loaded", "sid", sid, "cwd", params.cwd);
     return {
       configOptions: buildConfigOptions(this.model, permissionMode),
       modes: buildModes(permissionMode),
@@ -529,6 +523,10 @@ export class Bridge implements Agent {
   ): Promise<"end_turn" | "cancelled"> {
     let pendingTools = 0;
     let gotResponse = false;
+    // Track the most recent pending tool call so we can include its
+    // input (file content, command, etc.) in native permission prompts.
+    let lastPendingTool: { name: string; id: string; input: string } | null =
+      null;
 
     const iter = w.events();
 
@@ -565,7 +563,11 @@ export class Bridge implements Agent {
           // When tools are pending and we're idle, check if Claude Code is
           // showing a native permission prompt in the terminal.
           if (pendingTools > 0) {
-            const handled = await this.pollNativePermission(sid, w);
+            const handled = await this.pollNativePermission(
+              sid,
+              w,
+              lastPendingTool,
+            );
             if (handled) {
               this.log.info("native permission handled", "sid", sid);
             }
@@ -614,11 +616,19 @@ export class Bridge implements Agent {
           },
         });
 
-        if (
-          ev.kind === EventKind.ToolCall &&
-          ev.toolName === "AskUserQuestion"
-        ) {
-          await this.handleUserQuestion(sid, ev, w);
+        if (ev.kind === EventKind.ToolCall) {
+          if (ev.toolName === "AskUserQuestion") {
+            await this.handleUserQuestion(sid, ev, w);
+          } else {
+            lastPendingTool = {
+              name: ev.toolName,
+              id: ev.toolID,
+              input: ev.toolInput,
+            };
+          }
+        }
+        if (ev.kind === EventKind.ToolResult) {
+          lastPendingTool = null;
         }
 
         // Queue next pull immediately so it's ready when we loop back to race.
@@ -775,6 +785,7 @@ export class Bridge implements Agent {
   private async pollNativePermission(
     sid: string,
     w: ClaudeWrapper,
+    pendingTool: { name: string; id: string; input: string } | null,
   ): Promise<boolean> {
     let paneText: string;
     try {
@@ -804,19 +815,34 @@ export class Bridge implements Agent {
       name: opt.label,
     }));
 
-    const content: ToolCallContent[] = [
-      {
-        type: "content",
-        content: { type: "text", text: prompt.question },
-      } as ToolCallContent,
-    ];
+    // Build content blocks: include the tool input (file content, command, etc.)
+    // so the ACP client can display what's being requested.
+    const content: ToolCallContent[] = [];
+    if (pendingTool) {
+      const detail = formatToolDetail(pendingTool.name, pendingTool.input);
+      if (detail) {
+        content.push({
+          type: "content",
+          content: { type: "text", text: detail },
+        } as ToolCallContent);
+      }
+    }
+    content.push({
+      type: "content",
+      content: { type: "text", text: prompt.question },
+    } as ToolCallContent);
+
+    const toolCallId = pendingTool?.id ?? `native-perm-${Date.now()}`;
+    const kind = pendingTool ? mapToolKind(pendingTool.name) : "other";
 
     const resp = await this.conn.requestPermission({
       sessionId: sid,
       toolCall: {
-        toolCallId: `native-perm-${Date.now()}`,
-        title: prompt.question,
-        kind: "other",
+        toolCallId,
+        title: pendingTool
+          ? `${pendingTool.name}: ${prompt.question}`
+          : prompt.question,
+        kind,
         status: "pending",
         content,
       },
@@ -938,45 +964,70 @@ export class Bridge implements Agent {
 // Session discovery (for listSessions)
 // ---------------------------------------------------------------------------
 
-interface ClaudeSessionMeta {
-  pid: number;
-  sessionId: string;
-  cwd: string;
-  startedAt: number;
-  name?: string;
-}
-
+/**
+ * Discover sessions by scanning JSONL files in ~/.claude/projects/<escaped-cwd>/.
+ * Extracts the first user message as a title and uses file mtime for sorting.
+ */
 async function discoverSessions(
   cwdFilter?: string,
 ): Promise<ListSessionsResponse["sessions"]> {
-  const sessionsDir = join(homedir(), ".claude", "sessions");
-  let files: string[];
-  try {
-    files = await readdir(sessionsDir);
-  } catch {
-    return [];
+  const home = homedir();
+  const projectsDir = join(home, ".claude", "projects");
+
+  // If cwd filter provided, only scan that directory.
+  // Otherwise scan all project directories.
+  const cwdDirs: { dir: string; cwd: string }[] = [];
+
+  if (cwdFilter) {
+    const escaped = cwdFilter.replace(/\//g, "-");
+    cwdDirs.push({ dir: join(projectsDir, escaped), cwd: cwdFilter });
+  } else {
+    try {
+      const entries = await readdir(projectsDir);
+      for (const entry of entries) {
+        // Reverse the escaping to get the original cwd
+        const cwd = entry.replace(/^-/, "/").replace(/-/g, "/");
+        cwdDirs.push({ dir: join(projectsDir, entry), cwd });
+      }
+    } catch {
+      return [];
+    }
   }
 
   const results: ListSessionsResponse["sessions"] = [];
 
-  for (const f of files) {
-    if (!f.endsWith(".json")) continue;
+  for (const { dir, cwd } of cwdDirs) {
+    let files: string[];
     try {
-      const raw = await readFile(join(sessionsDir, f), "utf-8");
-      const meta: ClaudeSessionMeta = JSON.parse(raw);
-      if (!meta.sessionId || !meta.cwd) continue;
-      if (cwdFilter && meta.cwd !== cwdFilter) continue;
-
-      results.push({
-        sessionId: meta.sessionId,
-        cwd: meta.cwd,
-        title: meta.name ?? undefined,
-        updatedAt: meta.startedAt
-          ? new Date(meta.startedAt).toISOString()
-          : undefined,
-      });
+      files = await readdir(dir);
     } catch {
       continue;
+    }
+
+    for (const f of files) {
+      if (!f.endsWith(".jsonl")) continue;
+      const sessionId = f.replace(/\.jsonl$/, "");
+      // Must look like a UUID
+      if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(sessionId)) continue;
+
+      const filePath = join(dir, f);
+      try {
+        const fileStat = await stat(filePath);
+        // Skip tiny files (no real content)
+        if (fileStat.size < 100) continue;
+
+        // Read the first few lines to find the first user message as title
+        const title = await extractSessionTitle(filePath);
+
+        results.push({
+          sessionId,
+          cwd,
+          title: title ?? undefined,
+          updatedAt: fileStat.mtime.toISOString(),
+        });
+      } catch {
+        continue;
+      }
     }
   }
 
@@ -988,6 +1039,46 @@ async function discoverSessions(
   });
 
   return results;
+}
+
+/**
+ * Read the first few lines of a JSONL file to find the first user message,
+ * which serves as the session title.
+ */
+async function extractSessionTitle(filePath: string): Promise<string | null> {
+  let data: string;
+  try {
+    // Read just the first 4KB to find the first user message quickly
+    const buf = Buffer.alloc(4096);
+    const { open } = await import("node:fs/promises");
+    const fh = await open(filePath, "r");
+    const { bytesRead } = await fh.read(buf, 0, 4096, 0);
+    await fh.close();
+    data = buf.toString("utf-8", 0, bytesRead);
+  } catch {
+    return null;
+  }
+
+  for (const line of data.split("\n")) {
+    if (!line.trim()) continue;
+    try {
+      const obj = JSON.parse(line);
+      if (obj.type === "user" && obj.message?.content) {
+        const content = typeof obj.message.content === "string"
+          ? obj.message.content
+          : obj.message.content
+              .filter((b: { type: string }) => b.type === "text")
+              .map((b: { text: string }) => b.text)
+              .join(" ");
+        // Truncate to a reasonable title length
+        return content.length > 80 ? content.slice(0, 77) + "..." : content;
+      }
+    } catch {
+      continue;
+    }
+  }
+
+  return null;
 }
 
 // ---------------------------------------------------------------------------
@@ -1010,6 +1101,45 @@ function randomID(): string {
   return (
     "sess_" + Array.from(bytes, (b) => b.toString(16).padStart(2, "0")).join("")
   );
+}
+
+// ---------------------------------------------------------------------------
+// Tool detail formatting for permission prompts
+// ---------------------------------------------------------------------------
+
+/**
+ * Format tool input into a human-readable string for display in ACP
+ * permission dialogs. Shows file content for Write, command for Bash, etc.
+ */
+function formatToolDetail(toolName: string, toolInput: string): string | null {
+  let parsed: Record<string, unknown>;
+  try {
+    parsed = JSON.parse(toolInput);
+  } catch {
+    return null;
+  }
+
+  switch (toolName) {
+    case "Write": {
+      const filePath = parsed.file_path ?? parsed.path ?? "";
+      const content = parsed.content ?? "";
+      return `**${filePath}**\n\`\`\`\n${content}\n\`\`\``;
+    }
+    case "Edit": {
+      const filePath = parsed.file_path ?? parsed.path ?? "";
+      const oldStr = parsed.old_string ?? "";
+      const newStr = parsed.new_string ?? "";
+      return `**${filePath}**\n\`\`\`diff\n- ${String(oldStr).split("\n").join("\n- ")}\n+ ${String(newStr).split("\n").join("\n+ ")}\n\`\`\``;
+    }
+    case "Bash": {
+      const command = parsed.command ?? "";
+      return `\`\`\`bash\n${command}\n\`\`\``;
+    }
+    default: {
+      // Generic: show the raw JSON input
+      return `\`\`\`json\n${JSON.stringify(parsed, null, 2)}\n\`\`\``;
+    }
+  }
 }
 
 // ---------------------------------------------------------------------------
