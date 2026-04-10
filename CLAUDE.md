@@ -5,16 +5,16 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## Build & Test
 
 ```bash
-make build          # go build -o allagent .
-make test           # go test ./... -count=1 -timeout=30s
-make vet            # go vet ./...
-make run            # build + run with default model (sonnet)
+bun run build       # compile standalone binary -> ./allagent
+bun test            # run all tests
+bun run typecheck   # tsc --noEmit
+bun run run         # run with default model (sonnet)
 
-# Run a single test
-go test ./pkg/clients/claude/ -run TestTailerReadsExistingLines -v
+# Run a single test file
+bun test src/clients/claude/parser.test.ts
 
-# Run tests for one package
-go test ./pkg/tmuxctl/ -v -count=1 -timeout=15s
+# Run tests matching a pattern
+bun test --test-name-pattern "Tailer"
 ```
 
 ## Architecture
@@ -23,18 +23,18 @@ allagent is an ACP (Agent Client Protocol) agent server that wraps Claude Code. 
 
 Two layers:
 
-**Layer 1 -- Reusable wrapper packages (`pkg/`)**
+**Layer 1 -- Reusable wrapper packages (`src/`)**
 
-- `pkg/wrap` defines the `Wrapper` interface and `Event` types. This is the contract between backends and any consumer.
-- `pkg/clients/claude` implements `Wrapper`. It spawns Claude in tmux via `pkg/tmuxctl`, then tails the on-disk JSONL session file to emit structured `Event`s on a channel.
-- `pkg/tmuxctl` wraps tmux CLI operations (new-session, send-keys, capture-pane, kill-session).
+- `src/wrap` defines the `Wrapper` interface and `Event` types. This is the contract between backends and any consumer.
+- `src/clients/claude` implements `Wrapper`. It spawns Claude in tmux via `src/tmuxctl`, then tails the on-disk JSONL session file to emit structured `Event`s via an async generator.
+- `src/tmuxctl` wraps tmux CLI operations (new-session, send-keys, capture-pane, kill-session).
 
-**Layer 2 -- ACP bridge (`pkg/acpbridge/`)**
+**Layer 2 -- ACP bridge (`src/acpbridge/`)**
 
-- `pkg/acpbridge` implements `acp.Agent` from `github.com/coder/acp-go-sdk`. It bridges ACP JSON-RPC to `wrap.Wrapper`: translating `session/prompt` into `Wrapper.Send()`, and streaming `wrap.Event`s back as `session/update` notifications.
-- `internal/config` is a factory that constructs a Claude `Wrapper`.
+- `src/acpbridge` implements `acp.Agent` from `@agentclientprotocol/sdk`. It bridges ACP JSON-RPC to `wrap.Wrapper`: translating `session/prompt` into `Wrapper.send()`, and streaming `wrap.Event`s back as `session/update` notifications.
+- `src/internal/config` is a factory that constructs a Claude `Wrapper`.
 
-**Key data flow:** ACP client -> `session/prompt` (stdin JSON-RPC) -> `Wrapper.Send()` -> tmux send-keys -> Claude CLI processes it -> writes JSONL to disk -> tailer parses it -> `Event` on channel -> bridge translates to ACP `session/update` -> stdout JSON-RPC -> ACP client renders.
+**Key data flow:** ACP client -> `session/prompt` (stdin JSON-RPC) -> `Wrapper.send()` -> tmux send-keys -> Claude CLI processes it -> writes JSONL to disk -> tailer parses it -> `Event` from async generator -> bridge translates to ACP `session/update` -> stdout JSON-RPC -> ACP client renders.
 
 ## JSONL Session File Format
 
@@ -42,7 +42,7 @@ Two layers:
 
 ## Important Patterns
 
-The `Events()` channel is created eagerly in `New()` and bridged from the tailer in `Start()`. This avoids a race where consumers call `Events()` before `Start()` completes.
+The `Tailer` creates its async generator eagerly in the constructor and starts polling in the background. This avoids a race where consumers call `events()` before the tailer is ready.
 
 Tailers use poll-based tailing (200ms intervals) rather than fsnotify, since the JSONL files are append-only and poll is simpler and more reliable across filesystems.
 

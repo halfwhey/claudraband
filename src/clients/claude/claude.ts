@@ -1,0 +1,170 @@
+import { homedir } from "node:os";
+import { join } from "node:path";
+import { randomUUID } from "node:crypto";
+import { existsSync } from "node:fs";
+import { Session } from "../../tmuxctl";
+import { Tailer } from "./parser";
+import type { Event } from "../../wrap/event";
+import type { Wrapper } from "../../wrap/wrapper";
+
+export interface ClaudeConfig {
+  model: string;
+  permissionMode: string;
+  workingDir: string;
+  tmuxSession: string;
+  paneWidth: number;
+  paneHeight: number;
+}
+
+function sessionPath(cwd: string, sessionID: string): string {
+  const home = homedir();
+  const escaped = cwd.replace(/\//g, "-");
+  return join(home, ".claude", "projects", escaped, `${sessionID}.jsonl`);
+}
+
+export class ClaudeWrapper implements Wrapper {
+  private cfg: ClaudeConfig;
+  private tmux: Session | null = null;
+  private tailer: Tailer | null = null;
+  private _claudeSessionId = "";
+  private _signal: AbortSignal | null = null;
+  private abortController: AbortController | null = null;
+  private eventIterable: AsyncGenerator<Event> | null = null;
+
+  constructor(cfg: ClaudeConfig) {
+    this.cfg = cfg;
+  }
+
+  name(): string {
+    return "claude";
+  }
+
+  model(): string {
+    return this.cfg.model;
+  }
+
+  setPermissionMode(mode: string): void {
+    this.cfg.permissionMode = mode;
+  }
+
+  /** The Claude Code session UUID used for the JSONL file. */
+  get claudeSessionId(): string {
+    return this._claudeSessionId;
+  }
+
+  async start(signal: AbortSignal): Promise<void> {
+    this._claudeSessionId = randomUUID();
+    this._signal = signal;
+    const cmd = this.buildCmd("--session-id", this._claudeSessionId);
+    await this.spawnAndTail(signal, cmd);
+  }
+
+  /** Resume an existing Claude Code session by its UUID. */
+  async startResume(claudeSessionId: string, signal: AbortSignal): Promise<void> {
+    this._claudeSessionId = claudeSessionId;
+    this._signal = signal;
+    const cmd = this.buildCmd("--resume", claudeSessionId);
+    await this.spawnAndTail(signal, cmd);
+  }
+
+  /**
+   * Restart Claude Code with updated config (e.g. after a permission mode
+   * change). Kills the current tmux session and re-spawns with --resume.
+   */
+  async restart(): Promise<void> {
+    if (!this._signal) throw new Error("claude: not started");
+    // Close tailer and kill tmux, but don't abort the outer controller.
+    this.tailer?.close();
+    if (this.tmux) {
+      await this.tmux.kill().catch(() => {});
+    }
+    this.tmux = null;
+    this.tailer = null;
+    this.eventIterable = null;
+
+    // Use --resume if the JSONL file exists (session has been used),
+    // otherwise --session-id to create a fresh session with the same UUID.
+    const jsonlPath = sessionPath(this.cfg.workingDir, this._claudeSessionId);
+    const cmd = existsSync(jsonlPath)
+      ? this.buildCmd("--resume", this._claudeSessionId)
+      : this.buildCmd("--session-id", this._claudeSessionId);
+    await this.spawnAndTail(this._signal, cmd);
+  }
+
+  private buildCmd(...extra: string[]): string[] {
+    const cmd = ["claude", "--model", this.cfg.model];
+    if (this.cfg.permissionMode && this.cfg.permissionMode !== "default") {
+      cmd.push("--permission-mode", this.cfg.permissionMode);
+    }
+    cmd.push(...extra);
+    return cmd;
+  }
+
+  private async spawnAndTail(signal: AbortSignal, cmd: string[]): Promise<void> {
+    this.abortController = new AbortController();
+
+    signal.addEventListener("abort", () => {
+      this.abortController?.abort();
+    });
+
+    this.tmux = await Session.newSession(
+      this.cfg.tmuxSession,
+      this.cfg.paneWidth,
+      this.cfg.paneHeight,
+      this.cfg.workingDir,
+      cmd,
+    );
+
+    const jsonlPath = sessionPath(this.cfg.workingDir, this._claudeSessionId);
+    this.tailer = new Tailer(jsonlPath);
+    this.eventIterable = this.tailer.events();
+
+    const ac = this.abortController;
+    const tmux = this.tmux;
+    const tailer = this.tailer;
+
+    ac.signal.addEventListener("abort", async () => {
+      tailer.close();
+      await tmux.kill().catch(() => {});
+    }, { once: true });
+  }
+
+  async stop(): Promise<void> {
+    this.abortController?.abort();
+    if (this.tmux) {
+      await this.tmux.kill();
+    }
+  }
+
+  async send(input: string): Promise<void> {
+    if (!this.tmux) throw new Error("claude: not started");
+    await this.tmux.sendLine(input);
+  }
+
+  async interrupt(): Promise<void> {
+    if (!this.tmux) throw new Error("claude: not started");
+    await this.tmux.interrupt();
+  }
+
+  /** Capture the current visible content of the tmux pane. */
+  async capturePane(): Promise<string> {
+    if (!this.tmux) throw new Error("claude: not started");
+    return this.tmux.capturePane();
+  }
+
+  /** Send a special key (e.g. "1", "Enter") to the tmux pane. */
+  async sendSpecial(...keys: string[]): Promise<void> {
+    if (!this.tmux) throw new Error("claude: not started");
+    await this.tmux.sendSpecial(...keys);
+  }
+
+  alive(): boolean {
+    return this.tmux !== null && this.tmux.isAlive;
+  }
+
+  async *events(): AsyncGenerator<Event> {
+    if (this.eventIterable) {
+      yield* this.eventIterable;
+    }
+  }
+}

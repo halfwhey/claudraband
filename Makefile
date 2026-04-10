@@ -1,19 +1,18 @@
-.PHONY: build test vet clean
+.PHONY: build test typecheck clean run
 
 BIN := allagent
 
 build:
-	go build -o $(BIN) .
+	bun build src/main.ts --compile --outfile $(BIN)
 
 test:
-	go test ./... -count=1 -timeout=30s
+	bun test
 
-vet:
-	go vet ./...
+typecheck:
+	tsc --noEmit
 
 clean:
 	rm -f $(BIN)
-	go clean -testcache
 
 run: build
-	./$(BIN) --model sonnet
+	./$(BIN)
