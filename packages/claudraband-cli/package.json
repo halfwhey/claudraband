@@ -3,16 +3,21 @@
   "version": "0.1.0",
   "type": "module",
   "main": "./dist/main.js",
+  "files": [
+    "dist"
+  ],
   "bin": {
     "claudraband": "dist/main.js"
   },
   "scripts": {
-    "build": "bun build src/main.ts --target node --packages external --outdir dist",
+    "clean": "rm -rf dist",
+    "build": "bun run clean && bun build src/main.ts --target node --packages external --outdir dist",
+    "prepack": "bun run build",
     "test": "bun test src",
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
-    "claudraband-core": "workspace:*"
+    "claudraband-core": "^0.1.0"
   },
   "devDependencies": {
     "@types/bun": "^1.2.0",

@@ -3,6 +3,11 @@
     "target": "ESNext",
     "module": "ESNext",
     "moduleResolution": "bundler",
+    "baseUrl": ".",
+    "paths": {
+      "claudraband-core": ["../claudraband-core/src/index.ts"]
+    },
+    "tsBuildInfoFile": "./tsconfig.tsbuildinfo",
     "esModuleInterop": true,
     "strict": true,
     "skipLibCheck": true,

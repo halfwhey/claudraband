@@ -3,21 +3,30 @@
   "version": "0.1.0",
   "type": "module",
   "main": "./dist/index.js",
-  "types": "./src/index.ts",
+  "types": "./dist/index.d.ts",
+  "files": [
+    "dist"
+  ],
   "exports": {
     ".": {
-      "types": "./src/index.ts",
+      "types": "./dist/index.d.ts",
       "default": "./dist/index.js"
     }
   },
   "scripts": {
-    "build": "bun build src/index.ts --target node --packages external --outdir dist",
+    "clean": "rm -rf dist",
+    "build:js": "bun build src/index.ts --target node --packages external --outdir dist",
+    "build:types": "tsc -p tsconfig.build.json --emitDeclarationOnly",
+    "build": "bun run clean && bun run build:js && bun run build:types",
+    "prepack": "bun run build",
     "test": "bun test src",
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
     "@xterm/addon-serialize": "^0.13.0",
-    "@xterm/headless": "^5.5.0",
+    "@xterm/headless": "^5.5.0"
+  },
+  "optionalDependencies": {
     "node-pty": "^1.0.0"
   },
   "devDependencies": {

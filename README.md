@@ -6,6 +6,52 @@
 - Doesn't bypass Claude Code.
 - Doesn't intercept Oauth tokens.
 
+## Examples
+
+### Toad
+
+![Toad driving Claude Code](assets/toad-example.png)
+
+*Using [toad](https://github.com/batrachianai/toad) as the TUI while claudraband drives the real Claude Code session underneath.*
+
+### Self-interrogate
+
+![Self interrogation example](assets/self-interrogate.png)
+
+*I have hooks that associate Claude session IDs with commits (right pane). Claude can resume itself with claudraband to explain why it made certain decisions. This works as an introspection workflow for Claude itself, Codex, or any other harness that wants to ask the original Claude session what happened.*
+
+### Zed
+
+![Zed driving Claude Code through claudraband](assets/zed-example.png)
+
+*Same idea as the toad setup, but inside the Zed editor through the ACP adapter.*
+
+## Quick Start
+
+```sh
+# Build everything
+make build
+
+# Ask Claude Code something directly
+./claudraband "audit the last commit and tell me what looks risky"
+
+# Start a REPL
+./claudraband -i
+
+# List resumable Claude sessions for the current repo
+./claudraband sessions
+
+# Resume one later
+./claudraband resume <session-id> "continue from where we left off"
+
+# Force the headless backend if you don't want tmux
+./claudraband --terminal-backend xterm "review the staged diff"
+
+# Start the ACP adapter
+./claudraband-acp --model opus
+```
+
+
 We wrap the full Claue Code TUI in a terminal and drive that terminal.
 
 The repo is split into three packages:
@@ -14,14 +60,14 @@ The repo is split into three packages:
 - `claudraband-acp`: an ACP adapter built on top of that library
 - `claudraband-cli`: the first-party terminal client built on top of that library
 
-## What You Get
+## Features
 
 - `claudraband-core`: reusable TypeScript library for starting, resuming, replaying, prompting, and interrupting Claude Code sessions
 - `claudraband-acp`: an ACP server that wraps your local Claude Code install
 - `claudraband-cli`: direct first-party CLI for local terminal use
 - resumable sessions backed by Claude's real session IDs (which addresses the `claude -p` limitation of not being resumable)
 - optional terminal backends:
-  - `tmux` for detached terminal sessions
+  - `tmux` for detached terminal sessions 
   - `xterm` for headless PTY-backed sessions
 
 ## Why This Exists
@@ -66,29 +112,4 @@ You can also build each package separately:
 make build-lib
 make build-acp
 make build-cli
-```
-
-## Quick Start
-
-```sh
-# Build everything
-make build
-
-# Ask Claude Code something directly
-./claudraband "audit the last commit and tell me what looks risky"
-
-# Start a REPL
-./claudraband -i
-
-# List resumable Claude sessions for the current repo
-./claudraband sessions
-
-# Resume one later
-./claudraband resume <session-id> "continue from where we left off"
-
-# Force the headless backend if you don't want tmux
-./claudraband --terminal-backend xterm "review the staged diff"
-
-# Start the ACP adapter
-./claudraband-acp --model opus
 ```

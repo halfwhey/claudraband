@@ -2,6 +2,7 @@ import { spawnSync } from "node:child_process";
 import { Session } from "../tmuxctl";
 import type { Terminal as HeadlessTerminal } from "@xterm/headless";
 import type { SerializeAddon } from "@xterm/addon-serialize";
+import type { IPty } from "node-pty";
 
 export type TerminalBackend = "auto" | "tmux" | "xterm";
 export type ResolvedTerminalBackend = Exclude<TerminalBackend, "auto">;
@@ -249,12 +250,7 @@ async function createPtyTransport(): Promise<PtyTransport> {
 }
 
 class NodePtyTransport implements PtyTransport {
-  private pty: {
-    write(data: string): void;
-    kill(): void;
-    onData(cb: (data: string) => void): void;
-    onExit(cb: () => void): void;
-  } | null = null;
+  private pty: IPty | null = null;
   private aliveFlag = false;
 
   async start(
@@ -266,8 +262,16 @@ class NodePtyTransport implements PtyTransport {
     if (command.length === 0) {
       throw new Error("xterm terminal requires a command");
     }
-    const ptyModule = await import("node-pty");
-    const pty = getModuleExports(ptyModule);
+    let ptyModule: typeof import("node-pty");
+    try {
+      ptyModule = await import("node-pty");
+    } catch (error) {
+      throw new Error(
+        "xterm backend under Node requires the optional dependency 'node-pty'. Install it or run with Bun so Bun.Terminal can be used instead.",
+        { cause: error },
+      );
+    }
+    const pty = getModuleExports(ptyModule) as typeof import("node-pty");
     const [file, ...args] = command;
     this.pty = pty.spawn(file, args, {
       name: "xterm-256color",
