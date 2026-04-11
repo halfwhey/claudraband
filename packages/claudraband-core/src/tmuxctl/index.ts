@@ -1,2 +1,2 @@
-export { Session, killSession, hasSession } from "./tmux";
-export type { CaptureOpts } from "./tmux";
+export { Session, killSession, hasSession, listWindows } from "./tmux";
+export type { CaptureOpts, TmuxWindowSummary } from "./tmux";

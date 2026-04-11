@@ -6,19 +6,11 @@ export interface DaemonSessionListItem {
   hasPendingPermission: boolean;
 }
 
-export interface LocalSessionListItem {
-  session: SessionSummary;
-  isLive: boolean;
-}
-
-export function formatLocalSessionLine(
-  session: SessionSummary,
-  isLive: boolean,
-): string {
+export function formatLocalSessionLine(session: SessionSummary): string {
   const date = session.updatedAt ? new Date(session.updatedAt).toLocaleString() : "";
   return [
     session.sessionId,
-    `status=${isLive ? "live" : "saved"}`,
+    `status=${session.alive ? "live" : "saved"}`,
     date,
     session.title ?? "(untitled)",
   ].filter(Boolean).join("  ");
@@ -34,16 +26,14 @@ export function formatDaemonSessionLine(
   ].join("  ");
 }
 
-export function formatLocalSessionList(
-  sessions: LocalSessionListItem[],
-): string[] {
+export function formatLocalSessionList(sessions: SessionSummary[]): string[] {
   return formatGroupedSessionLines(
     sessions,
-    (item) => item.isLive,
-    (item) => formatLocalSessionLine(item.session, item.isLive),
+    (item) => item.alive,
+    (item) => formatLocalSessionLine(item),
     (left, right) =>
-      (right.session.updatedAt ?? "").localeCompare(left.session.updatedAt ?? "") ||
-      left.session.sessionId.localeCompare(right.session.sessionId),
+      (right.updatedAt ?? "").localeCompare(left.updatedAt ?? "") ||
+      left.sessionId.localeCompare(right.sessionId),
   );
 }
 

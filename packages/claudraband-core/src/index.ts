@@ -3,7 +3,6 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import {
   ClaudeWrapper,
-  createTerminalHost,
   hasPendingNativePrompt,
   hasPendingQuestion,
   parseClaudeArgs,
@@ -13,6 +12,11 @@ import {
   sessionPath,
   type TerminalBackend,
 } from "./claude";
+import {
+  createTerminalBackendDriver,
+  type ResolvedTerminalBackend,
+  type TerminalBackendDriver,
+} from "./terminal";
 import type { Event as ClaudrabandEvent } from "./wrap/event";
 import { EventKind } from "./wrap/event";
 import type { Wrapper } from "./wrap/wrapper";
@@ -30,16 +34,23 @@ export { resolveTerminalBackend };
 export { sessionPath };
 export type { ClaudrabandEvent };
 export type { TerminalBackend };
+export type { ResolvedTerminalBackend };
 
 const SHARED_TMUX_SESSION_NAME = "claudraband-working-session";
 
 /** Check if a Claude Code session has a live tmux process. */
 export async function hasLiveProcess(sessionId: string): Promise<boolean> {
-  return ClaudeWrapper.hasLiveProcess(SHARED_TMUX_SESSION_NAME, sessionId);
+  return createTerminalBackendDriver({
+    backend: "tmux",
+    tmuxSessionName: SHARED_TMUX_SESSION_NAME,
+  }).hasLiveSession(sessionId);
 }
 
 export async function closeLiveProcess(sessionId: string): Promise<boolean> {
-  return ClaudeWrapper.stopLiveProcess(SHARED_TMUX_SESSION_NAME, sessionId);
+  return createTerminalBackendDriver({
+    backend: "tmux",
+    tmuxSessionName: SHARED_TMUX_SESSION_NAME,
+  }).closeLiveSession(sessionId);
 }
 
 export type PermissionMode =
@@ -114,6 +125,9 @@ export interface SessionSummary {
   cwd: string;
   title?: string;
   updatedAt?: string;
+  backend: ResolvedTerminalBackend;
+  alive: boolean;
+  reattachable: boolean;
 }
 
 export interface PromptResult {
@@ -123,11 +137,13 @@ export interface PromptResult {
 export interface ClaudrabandSession {
   readonly sessionId: string;
   readonly cwd: string;
+  readonly backend: ResolvedTerminalBackend;
   readonly model: string;
   readonly permissionMode: PermissionMode;
   events(): AsyncIterable<ClaudrabandEvent>;
   prompt(text: string): Promise<PromptResult>;
   awaitTurn(): Promise<PromptResult>;
+  sendAndAwaitTurn(text: string): Promise<PromptResult>;
   send(text: string): Promise<void>;
   interrupt(): Promise<void>;
   stop(): Promise<void>;
@@ -135,6 +151,7 @@ export interface ClaudrabandSession {
   detach(): Promise<void>;
   isProcessAlive(): boolean;
   capturePane(): Promise<string>;
+  hasPendingInput(): Promise<{ pending: boolean; source: "none" | "terminal" }>;
   setModel(model: string): Promise<void>;
   setPermissionMode(mode: PermissionMode): Promise<void>;
 }
@@ -146,6 +163,8 @@ export interface Claudraband {
     options?: ClaudrabandOptions,
   ): Promise<ClaudrabandSession>;
   listSessions(cwd?: string): Promise<SessionSummary[]>;
+  inspectSession(sessionId: string, cwd?: string): Promise<SessionSummary | null>;
+  closeSession(sessionId: string): Promise<boolean>;
   replaySession(sessionId: string, cwd: string): Promise<ClaudrabandEvent[]>;
 }
 
@@ -205,6 +224,8 @@ interface PromptWaiter {
   matchedUserEcho: boolean;
   pendingTools: number;
   gotResponse: boolean;
+  turnEnded: boolean;
+  inputDeferred: boolean;
   lastPendingTool: PendingTool | null;
   waiters: Set<() => void>;
 }
@@ -292,6 +313,7 @@ class ClaudrabandRuntime implements Claudraband {
 
   async startSession(options?: ClaudrabandOptions): Promise<ClaudrabandSession> {
     const cfg = normalizeOptions(this.defaults, options);
+    const backend = resolveTerminalBackend(cfg.terminalBackend);
     const wrapper = new ClaudeWrapper({
       model: cfg.model,
       claudeArgs: cfg.claudeArgs,
@@ -308,6 +330,7 @@ class ClaudrabandRuntime implements Claudraband {
       wrapper,
       wrapper.claudeSessionId,
       cfg.cwd,
+      backend,
       cfg.model,
       cfg.permissionMode,
       cfg.allowTextResponses,
@@ -322,6 +345,7 @@ class ClaudrabandRuntime implements Claudraband {
     options?: ClaudrabandOptions,
   ): Promise<ClaudrabandSession> {
     const cfg = normalizeOptions(this.defaults, options);
+    const backend = resolveTerminalBackend(cfg.terminalBackend);
     const wrapper = new ClaudeWrapper({
       model: cfg.model,
       claudeArgs: cfg.claudeArgs,
@@ -338,6 +362,7 @@ class ClaudrabandRuntime implements Claudraband {
       wrapper,
       sessionId,
       cfg.cwd,
+      backend,
       cfg.model,
       cfg.permissionMode,
       cfg.allowTextResponses,
@@ -348,7 +373,15 @@ class ClaudrabandRuntime implements Claudraband {
   }
 
   listSessions(cwd?: string): Promise<SessionSummary[]> {
-    return discoverSessions(cwd);
+    return discoverSessions(this.resolveBackendDriver(), cwd);
+  }
+
+  inspectSession(sessionId: string, cwd?: string): Promise<SessionSummary | null> {
+    return inspectSession(this.resolveBackendDriver(), sessionId, cwd);
+  }
+
+  closeSession(sessionId: string): Promise<boolean> {
+    return this.resolveBackendDriver().closeLiveSession(sessionId);
   }
 
   async replaySession(
@@ -368,6 +401,14 @@ class ClaudrabandRuntime implements Claudraband {
       events.push(...parseLineEvents(line));
     }
     return events;
+  }
+
+  private resolveBackendDriver() {
+    const cfg = normalizeOptions(this.defaults, undefined);
+    return createTerminalBackendDriver({
+      backend: cfg.terminalBackend,
+      tmuxSessionName: SHARED_TMUX_SESSION,
+    });
   }
 }
 
@@ -400,6 +441,7 @@ class ClaudrabandSessionImpl implements ClaudrabandSession {
     wrapper: SessionWrapper,
     readonly sessionId: string,
     readonly cwd: string,
+    readonly backend: ResolvedTerminalBackend,
     model: string,
     permissionMode: PermissionMode,
     allowTextResponses: boolean,
@@ -496,6 +538,41 @@ class ClaudrabandSessionImpl implements ClaudrabandSession {
     }
   }
 
+  async sendAndAwaitTurn(text: string): Promise<PromptResult> {
+    if (this.promptAbortController) {
+      this.promptAbortController.abort();
+    }
+
+    const controller = new AbortController();
+    this.promptAbortController = controller;
+
+    const prompt = this.newPromptWaiter("");
+    prompt.matchedUserEcho = true;
+    this.activePrompt = prompt;
+
+    this.logger.info("sendAndAwaitTurn", "sid", this.sessionId, "length", text.length);
+    await this.wrapper.send(text);
+
+    try {
+      const stopReason = await this.waitForPromptCompletion(prompt, controller.signal);
+      this.logger.info(
+        "sendAndAwaitTurn completed",
+        "sid",
+        this.sessionId,
+        "stop_reason",
+        stopReason,
+      );
+      return { stopReason };
+    } finally {
+      if (this.activePrompt === prompt) {
+        this.activePrompt = null;
+      }
+      if (this.promptAbortController === controller) {
+        this.promptAbortController = null;
+      }
+    }
+  }
+
   send(text: string): Promise<void> {
     return this.wrapper.send(text);
   }
@@ -528,6 +605,19 @@ class ClaudrabandSessionImpl implements ClaudrabandSession {
 
   capturePane(): Promise<string> {
     return this.wrapper.capturePane();
+  }
+
+  async hasPendingInput(): Promise<{ pending: boolean; source: "none" | "terminal" }> {
+    const jsonlPath = sessionPath(this.cwd, this.sessionId);
+    const pendingQuestion = await hasPendingQuestion(jsonlPath);
+    const pendingNativePrompt = hasPendingNativePrompt(
+      await this.wrapper.capturePane().catch(() => ""),
+    );
+
+    return {
+      pending: pendingQuestion || pendingNativePrompt,
+      source: pendingQuestion || pendingNativePrompt ? "terminal" : "none",
+    };
   }
 
   async setModel(model: string): Promise<void> {
@@ -589,6 +679,8 @@ class ClaudrabandSessionImpl implements ClaudrabandSession {
       matchedUserEcho: false,
       pendingTools: 0,
       gotResponse: false,
+      turnEnded: false,
+      inputDeferred: false,
       lastPendingTool: null,
       waiters: new Set(),
     };
@@ -625,7 +717,6 @@ class ClaudrabandSessionImpl implements ClaudrabandSession {
         resolver({ value: undefined, done: true } as IteratorResult<ClaudrabandEvent>);
       }
       subscriber.resolvers = [];
-      subscriber.queue = [];
     }
     this.subscribers.clear();
   }
@@ -649,7 +740,7 @@ class ClaudrabandSessionImpl implements ClaudrabandSession {
       case EventKind.ToolCall:
         prompt.pendingTools++;
         if (ev.toolName === "AskUserQuestion") {
-          await this.handleUserQuestion(ev);
+          prompt.inputDeferred = await this.handleUserQuestion(ev);
           prompt.pendingTools = Math.max(0, prompt.pendingTools - 1);
           prompt.gotResponse = true;
         } else {
@@ -663,6 +754,11 @@ class ClaudrabandSessionImpl implements ClaudrabandSession {
       case EventKind.ToolResult:
         prompt.pendingTools = Math.max(0, prompt.pendingTools - 1);
         prompt.lastPendingTool = null;
+        prompt.gotResponse = true;
+        break;
+      case EventKind.TurnEnd:
+        prompt.gotResponse = true;
+        prompt.turnEnded = true;
         break;
       default:
         break;
@@ -727,6 +823,12 @@ class ClaudrabandSessionImpl implements ClaudrabandSession {
         }
         return "end_turn";
       }
+      if (prompt.inputDeferred) {
+        return "end_turn";
+      }
+      if (prompt.turnEnded && prompt.pendingTools <= 0) {
+        return "end_turn";
+      }
 
       const result = await this.waitForPromptUpdate(
         prompt,
@@ -742,7 +844,10 @@ class ClaudrabandSessionImpl implements ClaudrabandSession {
         if (!prompt.matchedUserEcho) {
           continue;
         }
-        if (prompt.gotResponse && prompt.pendingTools <= 0) {
+        if (prompt.inputDeferred) {
+          return "end_turn";
+        }
+        if (prompt.turnEnded && prompt.pendingTools <= 0) {
           return "end_turn";
         }
         if (prompt.pendingTools > 0) {
@@ -821,7 +926,7 @@ class ClaudrabandSessionImpl implements ClaudrabandSession {
     return true;
   }
 
-  private async handleUserQuestion(ev: ClaudrabandEvent): Promise<void> {
+  private async handleUserQuestion(ev: ClaudrabandEvent): Promise<boolean> {
     const parsed = parseAskUserQuestion(ev.toolInput);
     if (!parsed) {
       this.logger.warn(
@@ -830,7 +935,7 @@ class ClaudrabandSessionImpl implements ClaudrabandSession {
         this.sessionId,
       );
       await this.wrapper.send("1");
-      return;
+      return false;
     }
 
     for (const question of parsed.questions) {
@@ -846,27 +951,28 @@ class ClaudrabandSessionImpl implements ClaudrabandSession {
 
       if (decision.outcome === "deferred") {
         // Leave the question pending — caller can resume later with --select.
-        return;
+        return true;
       }
 
       if (decision.outcome === "cancelled") {
         await this.wrapper.interrupt();
-        return;
+        return false;
       }
 
       if (decision.outcome === "text") {
         await this.wrapper.send(decision.text);
-        return;
+        return false;
       }
 
       // outcome === "selected"
       if (decision.optionId === "0") {
         await this.wrapper.interrupt();
-        return;
+        return false;
       }
 
       await this.wrapper.send(decision.optionId);
     }
+    return false;
   }
 
   private async resolvePermission(
@@ -887,12 +993,12 @@ class ClaudrabandSessionImpl implements ClaudrabandSession {
 
 export const __test = {
   buildAskUserQuestionOptions,
-  createTerminalHost,
   createSession(
     wrapper: SessionWrapper,
     options: {
       sessionId?: string;
       cwd?: string;
+      backend?: ResolvedTerminalBackend;
       model?: string;
       permissionMode?: PermissionMode;
       allowTextResponses?: boolean;
@@ -905,6 +1011,7 @@ export const __test = {
       wrapper,
       options.sessionId ?? "test-session",
       options.cwd ?? "/tmp",
+      options.backend ?? "tmux",
       options.model ?? "sonnet",
       options.permissionMode ?? "default",
       options.allowTextResponses ?? false,
@@ -941,7 +1048,10 @@ function buildAskUserQuestionOptions(
   ];
 }
 
-async function discoverSessions(cwdFilter?: string): Promise<SessionSummary[]> {
+async function discoverSessions(
+  backendDriver: TerminalBackendDriver,
+  cwdFilter?: string,
+): Promise<SessionSummary[]> {
   const projectsDir = join(homedir(), ".claude", "projects");
   const cwdDirs: { dir: string; cwd: string }[] = [];
 
@@ -964,7 +1074,7 @@ async function discoverSessions(cwdFilter?: string): Promise<SessionSummary[]> {
     }
   }
 
-  const results: SessionSummary[] = [];
+  const results = new Map<string, SessionSummary>();
 
   for (const { dir, cwd } of cwdDirs) {
     let files: string[];
@@ -989,11 +1099,14 @@ async function discoverSessions(cwdFilter?: string): Promise<SessionSummary[]> {
       try {
         const fileStat = await stat(filePath);
         if (fileStat.size < 100) continue;
-        results.push({
+        results.set(sessionId, {
           sessionId,
           cwd,
           title: (await extractSessionTitle(filePath)) ?? undefined,
           updatedAt: fileStat.mtime.toISOString(),
+          backend: backendDriver.backend,
+          alive: false,
+          reattachable: backendDriver.supportsLiveReconnect(),
         });
       } catch {
         continue;
@@ -1001,8 +1114,71 @@ async function discoverSessions(cwdFilter?: string): Promise<SessionSummary[]> {
     }
   }
 
-  results.sort((a, b) => (b.updatedAt ?? "").localeCompare(a.updatedAt ?? ""));
-  return results;
+  for (const session of await discoverLiveSessions(backendDriver, cwdFilter)) {
+    const existing = results.get(session.sessionId);
+    results.set(
+      session.sessionId,
+      existing
+        ? {
+            ...existing,
+            ...session,
+            title: existing.title ?? session.title,
+            updatedAt: existing.updatedAt ?? session.updatedAt,
+          }
+        : session,
+    );
+  }
+
+  return [...results.values()].sort((a, b) =>
+    (b.updatedAt ?? "").localeCompare(a.updatedAt ?? ""),
+  );
+}
+
+async function inspectSession(
+  backendDriver: TerminalBackendDriver,
+  sessionId: string,
+  cwd?: string,
+): Promise<SessionSummary | null> {
+  const sessions = await discoverSessions(backendDriver, cwd);
+  return sessions.find((session) => session.sessionId === sessionId) ?? null;
+}
+
+async function discoverLiveSessions(
+  backendDriver: TerminalBackendDriver,
+  cwdFilter?: string,
+): Promise<SessionSummary[]> {
+  try {
+    const windows = await backendDriver.listLiveSessions();
+    const results: SessionSummary[] = [];
+
+    for (const window of windows) {
+      const sessionId = window.sessionId;
+      if (
+        !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(
+          sessionId,
+        )
+      ) {
+        continue;
+      }
+
+      const cwd = window.cwd;
+      if (!cwd) continue;
+      if (cwdFilter && cwd !== cwdFilter) continue;
+
+      results.push({
+        sessionId,
+        cwd,
+        updatedAt: window.updatedAt,
+        backend: backendDriver.backend,
+        alive: true,
+        reattachable: backendDriver.supportsLiveReconnect(),
+      });
+    }
+
+    return results;
+  } catch {
+    return [];
+  }
 }
 
 async function extractSessionTitle(filePath: string): Promise<string | null> {

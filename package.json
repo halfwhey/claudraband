@@ -2,6 +2,9 @@
   "name": "claudraband-monorepo",
   "private": true,
   "workspaces": ["packages/*"],
+  "dependencies": {
+    "claudraband": "workspace:packages/claudraband-cli"
+  },
   "scripts": {
     "build": "bun run --filter claudraband-core build && bun run --filter claudraband build",
     "test": "bun test packages/claudraband-core/src packages/claudraband-cli/src",

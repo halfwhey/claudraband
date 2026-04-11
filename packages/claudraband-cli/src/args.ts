@@ -21,8 +21,9 @@ export interface CliConfig {
   command: "prompt" | "sessions" | "session-close" | "acp" | "serve";
   prompt: string;
   sessionId: string;
-  closeAll: boolean;
+  globalSessions: boolean;
   cwd: string;
+  hasExplicitCwd: boolean;
   debug: boolean;
   interactive: boolean;
   acp: boolean;
@@ -30,6 +31,7 @@ export interface CliConfig {
   hasExplicitClaudeArgs: boolean;
   hasExplicitModel: boolean;
   hasExplicitPermissionMode: boolean;
+  hasExplicitTerminalBackend: boolean;
   model: string;
   permissionMode: PermissionMode;
   terminalBackend: TerminalBackend;
@@ -43,8 +45,9 @@ export function parseArgs(argv: string[], io: ParseIo = defaultIo): CliConfig {
     command: "prompt",
     prompt: "",
     sessionId: "",
-    closeAll: false,
+    globalSessions: false,
     cwd: process.cwd(),
+    hasExplicitCwd: false,
     debug: false,
     interactive: false,
     acp: false,
@@ -52,6 +55,7 @@ export function parseArgs(argv: string[], io: ParseIo = defaultIo): CliConfig {
     hasExplicitClaudeArgs: false,
     hasExplicitModel: false,
     hasExplicitPermissionMode: false,
+    hasExplicitTerminalBackend: false,
     model: "sonnet",
     permissionMode: "default",
     terminalBackend: "auto",
@@ -70,6 +74,7 @@ export function parseArgs(argv: string[], io: ParseIo = defaultIo): CliConfig {
       io.exit(0);
     } else if (arg === "--cwd" && i + 1 < argv.length) {
       config.cwd = argv[++i];
+      config.hasExplicitCwd = true;
     } else if ((arg === "--claude" || arg === "-c") && i + 1 < argv.length) {
       try {
         config.claudeArgs.push(...splitShellWords(argv[++i]));
@@ -80,6 +85,7 @@ export function parseArgs(argv: string[], io: ParseIo = defaultIo): CliConfig {
       }
     } else if (arg === "--terminal-backend" && i + 1 < argv.length) {
       config.terminalBackend = argv[++i] as TerminalBackend;
+      config.hasExplicitTerminalBackend = true;
     } else if (arg === "--debug") {
       config.debug = true;
     } else if (arg === "--interactive" || arg === "-i") {
@@ -88,8 +94,8 @@ export function parseArgs(argv: string[], io: ParseIo = defaultIo): CliConfig {
       config.sessionId = argv[++i];
     } else if (arg === "--select" && i + 1 < argv.length) {
       config.select = argv[++i];
-    } else if (arg === "--all") {
-      config.closeAll = true;
+    } else if (arg === "--global") {
+      config.globalSessions = true;
     } else if (arg === "--server" && i + 1 < argv.length) {
       config.server = argv[++i];
     } else if (arg === "--port" && i + 1 < argv.length) {
@@ -126,14 +132,11 @@ export function parseArgs(argv: string[], io: ParseIo = defaultIo): CliConfig {
       io.exit(1);
     }
     config.command = "acp";
-  } else if (positional[0] === "sessions") {
-    config.command = "sessions";
-  } else if (positional[0] === "session" && positional[1] === "close") {
+  } else if (positional[0] === "sessions" && positional[1] === "close") {
     config.command = "session-close";
     config.sessionId = positional[2] ?? "";
-  } else if (positional[0] === "close") {
-    config.command = "session-close";
-    config.sessionId = positional[1] ?? "";
+  } else if (positional[0] === "sessions") {
+    config.command = "sessions";
   } else if (positional[0] === "serve") {
     config.command = "serve";
   } else {
@@ -148,20 +151,27 @@ export function parseArgs(argv: string[], io: ParseIo = defaultIo): CliConfig {
     io.exit(1);
   }
 
-  if (config.closeAll && config.command !== "session-close") {
-    io.stderr("error: --all is only valid with 'session close'.\n");
-    io.exit(1);
+  if (config.command === "session-close") {
+    const bulkScopeCount =
+      (config.globalSessions ? 1 : 0) +
+      (config.hasExplicitCwd ? 1 : 0);
+    if (config.sessionId && bulkScopeCount > 0) {
+      io.stderr("error: 'sessions close' accepts either <id>, --global, or --cwd <dir>.\n");
+      io.exit(1);
+    }
+    if (!config.sessionId && bulkScopeCount === 0) {
+      io.stderr("error: sessions close requires a session ID, --global, or --cwd <dir>.\n");
+      io.exit(1);
+    }
+    if (bulkScopeCount > 1) {
+      io.stderr("error: 'sessions close' accepts only one bulk scope: --global or --cwd <dir>.\n");
+      io.exit(1);
+    }
   }
 
-  if (config.command === "session-close") {
-    if (config.closeAll && config.sessionId) {
-      io.stderr("error: 'session close' accepts either <id> or --all, not both.\n");
-      io.exit(1);
-    }
-    if (!config.closeAll && !config.sessionId) {
-      io.stderr("error: session close requires a session ID or --all.\n");
-      io.exit(1);
-    }
+  if (config.command === "sessions" && config.globalSessions && config.hasExplicitCwd) {
+    io.stderr("error: 'sessions' accepts either --global or --cwd <dir>, not both.\n");
+    io.exit(1);
   }
 
   if (config.sessionId && !config.prompt && !config.select && !config.interactive
@@ -213,9 +223,10 @@ export const USAGE = `Usage: claudraband [options] <prompt...>
        claudraband -s <id> <prompt...>
        claudraband -s <id> --select <n>
        claudraband -s <id> -i
-       claudraband session close <sessionId>
-       claudraband session close --all
-       claudraband sessions [--cwd <dir>]
+       claudraband sessions close <sessionId>
+       claudraband sessions close --global
+       claudraband sessions close --cwd <dir>
+       claudraband sessions [--cwd <dir>] [--global]
        claudraband serve [--port <n>]
        claudraband --acp [options]
 
@@ -224,7 +235,7 @@ Options:
   -s, --session <id>             Target an existing session
   -i, --interactive              Start interactive REPL mode
   --select <n>                   Auto-select option <n> for a pending question (requires -s)
-  --all                          Apply 'session close' to all live sessions
+  --global                       Use all local sessions across every cwd for 'sessions' commands
   --acp                          Run as an ACP server over stdio
   --cwd <dir>                    Working directory (default: cwd)
   -c, --claude <flags>           Claude CLI flags, e.g. '--model sonnet --effort high'
@@ -239,8 +250,10 @@ Examples:
   claudraband -s abc-123 "continue the refactor"
   claudraband -s abc-123 --select 2
   claudraband -s abc-123 -i
-  claudraband session close abc-123
-  claudraband session close --all
+  claudraband sessions --global
+  claudraband sessions close abc-123
+  claudraband sessions close --global
+  claudraband sessions close --cwd /my/project
   claudraband --acp --claude "--model opus"
   claudraband sessions
   claudraband serve --port 7842

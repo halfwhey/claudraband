@@ -12,10 +12,12 @@ describe("session list formatting", () => {
       {
         sessionId: "abc-123",
         cwd: "/repo",
+        backend: "tmux",
+        alive: true,
+        reattachable: true,
         title: "review the diff",
         updatedAt: "2026-04-11T12:34:56.000Z",
       },
-      true,
     );
 
     expect(line).toContain("abc-123");
@@ -28,10 +30,12 @@ describe("session list formatting", () => {
       {
         sessionId: "def-456",
         cwd: "/repo",
+        backend: "xterm",
+        alive: false,
+        reattachable: false,
         title: undefined,
         updatedAt: undefined,
       },
-      false,
     );
 
     expect(line).toBe("def-456  status=saved  (untitled)");
@@ -50,31 +54,31 @@ describe("session list formatting", () => {
   test("groups local sessions with live ones at the bottom", () => {
     const lines = formatLocalSessionList([
       {
-        session: {
-          sessionId: "live-1",
-          cwd: "/repo",
-          title: "live session",
-          updatedAt: "2026-04-11T12:00:00.000Z",
-        },
-        isLive: true,
+        sessionId: "live-1",
+        cwd: "/repo",
+        backend: "tmux",
+        alive: true,
+        reattachable: true,
+        title: "live session",
+        updatedAt: "2026-04-11T12:00:00.000Z",
       },
       {
-        session: {
-          sessionId: "saved-2",
-          cwd: "/repo",
-          title: "older saved",
-          updatedAt: "2026-04-11T10:00:00.000Z",
-        },
-        isLive: false,
+        sessionId: "saved-2",
+        cwd: "/repo",
+        backend: "tmux",
+        alive: false,
+        reattachable: true,
+        title: "older saved",
+        updatedAt: "2026-04-11T10:00:00.000Z",
       },
       {
-        session: {
-          sessionId: "saved-1",
-          cwd: "/repo",
-          title: "newer saved",
-          updatedAt: "2026-04-11T11:00:00.000Z",
-        },
-        isLive: false,
+        sessionId: "saved-1",
+        cwd: "/repo",
+        backend: "tmux",
+        alive: false,
+        reattachable: true,
+        title: "newer saved",
+        updatedAt: "2026-04-11T11:00:00.000Z",
       },
     ]);
 

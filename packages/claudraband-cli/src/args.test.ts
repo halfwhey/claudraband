@@ -11,11 +11,13 @@ describe("claudraband cli args", () => {
   test("defaults terminal backend to auto", () => {
     const args = parseArgs(["hello"]);
     expect(args.terminalBackend).toBe("auto");
+    expect(args.hasExplicitTerminalBackend).toBe(false);
   });
 
   test("parses explicit terminal backend", () => {
     const args = parseArgs(["--terminal-backend", "xterm", "-c", "--dangerously-skip-permissions", "hello"]);
     expect(args.terminalBackend).toBe("xterm");
+    expect(args.hasExplicitTerminalBackend).toBe(true);
     expect(args.prompt).toBe("hello");
   });
 
@@ -59,21 +61,40 @@ describe("claudraband cli args", () => {
     expect(args.select).toBe("2");
   });
 
-  test("session close command", () => {
-    const args = parseArgs(["session", "close", "abc-123"]);
+  test("sessions close command", () => {
+    const args = parseArgs(["sessions", "close", "abc-123"]);
     expect(args.command).toBe("session-close");
     expect(args.sessionId).toBe("abc-123");
   });
 
-  test("session close --all", () => {
-    const args = parseArgs(["session", "close", "--all"]);
+  test("sessions close --global", () => {
+    const args = parseArgs(["sessions", "close", "--global"]);
     expect(args.command).toBe("session-close");
-    expect(args.closeAll).toBe(true);
+    expect(args.globalSessions).toBe(true);
     expect(args.sessionId).toBe("");
   });
 
-  test("session close requires an id or --all", () => {
-    expect(() => parseArgs(["session", "close"], noopIo as never)).toThrow("exit(1)");
+  test("parses --global for session listing", () => {
+    const args = parseArgs(["sessions", "--global"]);
+    expect(args.command).toBe("sessions");
+    expect(args.globalSessions).toBe(true);
+  });
+
+  test("sessions close --cwd targets bulk close by cwd", () => {
+    const args = parseArgs(["sessions", "close", "--cwd", "/tmp/demo"]);
+    expect(args.command).toBe("session-close");
+    expect(args.sessionId).toBe("");
+    expect(args.cwd).toBe("/tmp/demo");
+    expect(args.hasExplicitCwd).toBe(true);
+  });
+
+  test("sessions close requires an id, --global, or --cwd", () => {
+    expect(() => parseArgs(["sessions", "close"], noopIo as never)).toThrow("exit(1)");
+  });
+
+  test("sessions close rejects mixed bulk scopes", () => {
+    expect(() => parseArgs(["sessions", "close", "--global", "--cwd", "/tmp"], noopIo as never))
+      .toThrow("exit(1)");
   });
 
   test("serve command", () => {

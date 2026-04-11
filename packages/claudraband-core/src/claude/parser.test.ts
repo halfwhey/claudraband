@@ -24,6 +24,15 @@ describe("parser", () => {
     expect(events[0].text).toBe("Hi there!");
   });
 
+  test("parseLineEvents emits turn end for assistant end_turn messages", () => {
+    const events = parseLineEvents(
+      `{"type":"","timestamp":"2026-01-01T00:00:01Z","message":{"role":"assistant","content":[{"type":"text","text":"Hi there!"}],"stop_reason":"end_turn"}}`,
+    );
+    expect(events).toHaveLength(2);
+    expect(events[0].kind).toBe(EventKind.AssistantText);
+    expect(events[1].kind).toBe(EventKind.TurnEnd);
+  });
+
   test("parseLineEvents handles tool use", () => {
     const events = parseLineEvents(
       `{"type":"","timestamp":"2026-01-01T00:00:02Z","message":{"role":"assistant","content":[{"type":"tool_use","id":"t1","name":"Read","input":{"path":"/tmp/x"}}]}}`,

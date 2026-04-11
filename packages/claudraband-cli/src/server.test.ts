@@ -7,8 +7,9 @@ function makeConfig(overrides: Partial<CliConfig> = {}): CliConfig {
     command: "serve",
     prompt: "",
     sessionId: "",
-    closeAll: false,
+    globalSessions: false,
     cwd: "/daemon-cwd",
+    hasExplicitCwd: false,
     debug: false,
     interactive: false,
     acp: false,
@@ -16,6 +17,7 @@ function makeConfig(overrides: Partial<CliConfig> = {}): CliConfig {
     hasExplicitClaudeArgs: true,
     hasExplicitModel: true,
     hasExplicitPermissionMode: true,
+    hasExplicitTerminalBackend: false,
     model: "sonnet",
     permissionMode: "default",
     terminalBackend: "auto",
@@ -27,6 +29,18 @@ function makeConfig(overrides: Partial<CliConfig> = {}): CliConfig {
 }
 
 describe("daemon server helpers", () => {
+  test("defaults daemon backend to xterm unless explicitly requested", () => {
+    expect(__test.resolveServerTerminalBackend(makeConfig())).toBe("xterm");
+    expect(
+      __test.resolveServerTerminalBackend(
+        makeConfig({
+          terminalBackend: "tmux",
+          hasExplicitTerminalBackend: true,
+        }),
+      ),
+    ).toBe("tmux");
+  });
+
   test("resolves per-request session overrides", () => {
     const resolved = __test.resolveSessionConfig(makeConfig(), {
       cwd: "/repo",

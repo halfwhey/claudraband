@@ -25,56 +25,32 @@ Control the real local Claude Code CLI from other interfaces by extracting an AP
 - Supports `tmux` for detached local sessions and `xterm` for headless PTY-backed sessions
 - Lets other tools reuse an already-authenticated Claude Code install without touching auth tokens
 
-> **Terminal abuse**: `claudraband` exists because Claude Code did not expose the interface I wanted. So this project gets one by running the real TUI in a terminal and treating that terminal as the API surface. It is slightly cursed, but practical.
+> **NOTE**: `claudraband` does NOT intercept OAuth tokens or bypass Claude Code in any shape or form. Anyone you run a single command, claude code is run fully. Persistent sessions with tmux or the xterm daemon mitigate the latency.
 
 ## Getting started
 
 ### Requirements
 
-- A working local `claude` CLI install with an authenticated Claude Code session
+- A working authenitcated local `claude` CLI 
 - Node.js or Bun
-- `tmux` if you want persistent detached local sessions
-- `node-pty` only when running the `xterm` backend under Node instead of Bun
+- `tmux` if you want visible persistent detached local sessions
 
 <details>
 <summary>Current runtime model</summary>
 
 - `tmux`: best local persistence story, since the Claude Code process stays attached to a live tmux pane
-- `xterm` under Bun: headless PTY via `Bun.Terminal`
-- `xterm` under Node: headless PTY via optional `node-pty`
-- `serve`: keeps `xterm` sessions alive in a daemon so clients can reconnect later
+- `direct xterm` runs headless, but only works permission bypass (because this mode has no way to prompt the user)
+- `daemon xterm`: keeps `xterm` sessions alive in a daemon so clients can reconnect later, supports everything in the tmux runtime but the sessions are not visible
 
 </details>
 
 ### Installation
 
-Build from source:
-
-```sh
-make build
-```
-
-That builds:
-
-- `packages/claudraband-core/dist/index.js`
-- `packages/claudraband-cli/dist/index.js`
-- `packages/claudraband-cli/dist/bin.js`
-
-If you are using the published CLI instead of this repo checkout:
-
-```sh
-npx claudraband --help
-```
+TODO: fill with npx instructions
 
 ### Quick start
 
 ```sh
-# build from source
-make build
-
-# published CLI
-npx claudraband --help
-
 # ask Claude Code something directly
 claudraband "audit the last commit and tell me what looks risky"
 
@@ -84,6 +60,15 @@ claudraband -i
 # list resumable sessions
 claudraband sessions
 
+# list local sessions across every cwd
+claudraband sessions --global
+
+# close live local sessions across every cwd
+claudraband sessions close --global
+
+# close live local sessions for one cwd
+claudraband sessions close --cwd /my/project
+
 # resume a session
 claudraband -s <session-id> "continue from where we left off"
 
@@ -92,6 +77,8 @@ claudraband -s <session-id> --select 1
 
 # run as an ACP server over stdio
 claudraband --acp --claude "--model opus"
+# For exmaple if you want to use it toad (https://github.com/batrachianai/toad): 
+uvx --from batrachian-toad toad acp 'claudraband --acp -c "--model haiku"'
 
 # start the daemon for persistent headless xterm sessions
 claudraband serve --port 7842
@@ -108,6 +95,12 @@ claudraband --terminal-backend xterm -c "--dangerously-skip-permissions" "run wi
 See [docs/options.md][options] for the command reference, backend behavior, daemon mode, and library surface.
 
 ## Examples
+
+Runnable TypeScript examples live in [`examples/`](examples):
+
+- [`examples/code-review.ts`](examples/code-review.ts) — start a session, ask for a code review, and print the result
+- [`examples/multi-session.ts`](examples/multi-session.ts) — run multiple Claude sessions in parallel
+- [`examples/session-journal.ts`](examples/session-journal.ts) — resume a session and write a simple session journal
 
 ### Toad
 
@@ -132,6 +125,8 @@ Same basic idea, but through ACP inside Zed.
 ```sh
 claudraband "review the staged diff"
 claudraband sessions
+claudraband sessions --global
+claudraband sessions close --cwd /my/project
 claudraband -s <session-id> "keep going"
 ```
 
@@ -163,6 +158,11 @@ claudraband --terminal-backend xterm -c "--dangerously-skip-permissions" "run wi
 
 - `claudraband-core`: TypeScript runtime for controlling local Claude Code sessions through a real terminal
 - `claudraband`: CLI package exposing direct mode, ACP mode, and daemon mode
+
+## Roadmap
+
+- **Session rewinding** -- roll a session back to a specific event or decision point and continue from there, discarding everything after
+- **Session forking** -- replay a session up to a chosen point, then branch into a new session with different choices (e.g. "what if Claude had picked the SQL approach instead of the ORM?")
 
 ## Troubleshooting
 

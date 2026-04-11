@@ -1,0 +1,21 @@
+{
+  "compilerOptions": {
+    "target": "ESNext",
+    "module": "ESNext",
+    "moduleResolution": "bundler",
+    "esModuleInterop": true,
+    "strict": true,
+    "skipLibCheck": true,
+    "noEmit": true,
+    "typeRoots": [
+      "../node_modules/.bun/node_modules/@types",
+      "../packages/claudraband-cli/node_modules/@types",
+      "../node_modules/.bun/node_modules"
+    ],
+    "types": ["node", "bun-types"],
+    "paths": {
+      "claudraband": ["../packages/claudraband-core/src/index.ts"]
+    }
+  },
+  "include": ["."]
+}

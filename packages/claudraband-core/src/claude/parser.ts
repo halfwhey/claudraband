@@ -14,6 +14,7 @@ interface Envelope {
 interface Message {
   role: string;
   content: unknown;
+  stop_reason?: string | null;
 }
 
 interface ContentBlock {
@@ -65,12 +66,21 @@ function parseProgress(env: Envelope, ts: Date): Event | null {
 function parseMessageLineEvents(env: Envelope, ts: Date): Event[] {
   if (!env.message) return [];
   const msg = env.message as Message;
-  if (!msg.content) return [];
+  if (!msg.content) {
+    return msg.role === "assistant" && msg.stop_reason === "end_turn"
+      ? [makeEvent({ kind: EventKind.TurnEnd, time: ts, role: "assistant" })]
+      : [];
+  }
 
   if (typeof msg.content === "string") {
     const kind =
       msg.role === "assistant" ? EventKind.AssistantText : EventKind.UserMessage;
-    return [makeEvent({ kind, time: ts, text: msg.content, role: msg.role })];
+    return [
+      makeEvent({ kind, time: ts, text: msg.content, role: msg.role }),
+      ...(msg.role === "assistant" && msg.stop_reason === "end_turn"
+        ? [makeEvent({ kind: EventKind.TurnEnd, time: ts, role: "assistant" })]
+        : []),
+    ];
   }
 
   if (!Array.isArray(msg.content)) return [];
@@ -128,6 +138,9 @@ function parseMessageLineEvents(env: Envelope, ts: Date): Event[] {
         break;
       }
     }
+  }
+  if (msg.role === "assistant" && msg.stop_reason === "end_turn") {
+    events.push(makeEvent({ kind: EventKind.TurnEnd, time: ts, role: "assistant" }));
   }
   return events;
 }

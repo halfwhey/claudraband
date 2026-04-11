@@ -1,9 +1,6 @@
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import {
   createClaudraband,
-  hasPendingNativePrompt,
-  hasPendingQuestion,
-  sessionPath,
   type ClaudrabandEvent,
   type ClaudrabandLogger,
   type ClaudrabandPermissionDecision,
@@ -52,6 +49,10 @@ function shouldReuseSession(
   return ds !== null && ds.session.isProcessAlive();
 }
 
+function resolveServerTerminalBackend(config: CliConfig): CliConfig["terminalBackend"] {
+  return config.hasExplicitTerminalBackend ? config.terminalBackend : "xterm";
+}
+
 export async function startServer(config: CliConfig): Promise<void> {
   const logger: ClaudrabandLogger = {
     info: (msg, ...args) => process.stderr.write(`info: ${msg} ${args.join(" ")}\n`),
@@ -66,7 +67,7 @@ export async function startServer(config: CliConfig): Promise<void> {
     claudeArgs: config.claudeArgs,
     model: config.model,
     permissionMode: config.permissionMode,
-    terminalBackend: "xterm",
+    terminalBackend: resolveServerTerminalBackend(config),
     logger,
   });
 
@@ -147,7 +148,10 @@ export async function startServer(config: CliConfig): Promise<void> {
         };
         sessions.set(session.sessionId, ds);
         attachEventStream(ds);
-        json(res, 200, { sessionId: session.sessionId });
+        json(res, 200, {
+          sessionId: session.sessionId,
+          backend: session.backend,
+        });
         return;
       }
 
@@ -180,8 +184,12 @@ export async function startServer(config: CliConfig): Promise<void> {
         const body = JSON.parse(await readBody(req)) as SessionRequestBody;
         const sessionConfig = resolveSessionConfig(config, body);
         const ds = getSession(sessionId);
-        if (shouldReuseSession(ds)) {
-          json(res, 200, { sessionId, reattached: true });
+        if (ds && shouldReuseSession(ds)) {
+          json(res, 200, {
+            sessionId,
+            reattached: true,
+            backend: ds.session.backend,
+          });
           return;
         }
         if (ds) {
@@ -213,7 +221,11 @@ export async function startServer(config: CliConfig): Promise<void> {
         };
         sessions.set(sessionId, newDs);
         attachEventStream(newDs);
-        json(res, 200, { sessionId, reattached: false });
+        json(res, 200, {
+          sessionId,
+          reattached: false,
+          backend: session.backend,
+        });
         return;
       }
 
@@ -269,6 +281,14 @@ export async function startServer(config: CliConfig): Promise<void> {
         return;
       }
 
+      // POST /sessions/:id/send-and-await-turn
+      if (method === "POST" && action === "send-and-await-turn") {
+        const body = JSON.parse(await readBody(req)) as { text: string };
+        const result = await ds.session.sendAndAwaitTurn(body.text);
+        json(res, 200, result);
+        return;
+      }
+
       // POST /sessions/:id/interrupt
       if (method === "POST" && action === "interrupt") {
         await ds.session.interrupt();
@@ -310,19 +330,14 @@ export async function startServer(config: CliConfig): Promise<void> {
 
       // GET /sessions/:id/pending-question
       if (method === "GET" && action === "pending-question") {
-        const jsonlPath = sessionPath(ds.session.cwd, sessionId);
-        const pendingQuestion = await hasPendingQuestion(jsonlPath);
         if (ds.pendingPermission !== null) {
           json(res, 200, { pending: true, source: "permission_request" });
           return;
         }
-        const pendingNativePrompt = hasPendingNativePrompt(
-          await ds.session.capturePane().catch(() => ""),
-        );
-        const pending = pendingQuestion || pendingNativePrompt;
+        const pendingState = await ds.session.hasPendingInput();
         json(res, 200, {
-          pending,
-          source: pending ? "terminal" : "none",
+          pending: pendingState.pending,
+          source: pendingState.source,
         });
         return;
       }
@@ -359,6 +374,7 @@ export async function startServer(config: CliConfig): Promise<void> {
 
 export const __test = {
   resolveSessionConfig,
+  resolveServerTerminalBackend,
   shouldReuseSession,
 };
 

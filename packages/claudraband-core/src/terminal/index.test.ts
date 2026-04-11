@@ -2,6 +2,8 @@ import { describe, expect, test } from "bun:test";
 import { randomUUID } from "node:crypto";
 import { hasSession, killSession } from "../tmuxctl";
 import {
+  __test,
+  createTerminalBackendDriver,
   createTerminalHost,
   resolveTerminalBackend,
   resolveXtermTransportKind,
@@ -81,5 +83,51 @@ describe("terminal backend selection", () => {
       await second.stop().catch(() => {});
       await killSession(sessionName).catch(() => {});
     }
+  });
+
+  test("backend drivers expose reconnect capability", async () => {
+    const tmuxDriver = createTerminalBackendDriver({
+      backend: "tmux",
+      tmuxSessionName: `claudraband-terminal-${randomUUID()}`,
+    });
+    const xtermDriver = createTerminalBackendDriver({
+      backend: "xterm",
+      tmuxSessionName: "unused",
+    });
+
+    expect(tmuxDriver.backend).toBe("tmux");
+    expect(tmuxDriver.supportsLiveReconnect()).toBe(true);
+    expect(xtermDriver.backend).toBe("xterm");
+    expect(xtermDriver.supportsLiveReconnect()).toBe(false);
+    expect(await xtermDriver.listLiveSessions()).toEqual([]);
+  });
+
+  test("xterm host sends user input through the terminal emulator", async () => {
+    const host = __test.createXtermTerminalHost() as unknown as {
+      send(input: string): Promise<void>;
+      interrupt(): Promise<void>;
+      transport: { write(data: string): void } | null;
+      terminal: { input(data: string): void } | null;
+    };
+
+    const transportWrites: string[] = [];
+    const terminalInputs: string[] = [];
+
+    host.transport = {
+      write(data: string) {
+        transportWrites.push(data);
+      },
+    };
+    host.terminal = {
+      input(data: string) {
+        terminalInputs.push(data);
+      },
+    };
+
+    await host.send("2");
+    await host.interrupt();
+
+    expect(terminalInputs).toEqual(["2", "\r", "\u0003"]);
+    expect(transportWrites).toEqual([]);
   });
 });

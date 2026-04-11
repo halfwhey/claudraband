@@ -7,8 +7,9 @@ function makeConfig(overrides: Partial<CliConfig> = {}): CliConfig {
     command: "prompt",
     prompt: "",
     sessionId: "",
-    closeAll: false,
+    globalSessions: false,
     cwd: "/repo",
+    hasExplicitCwd: false,
     debug: false,
     interactive: false,
     acp: false,
@@ -16,6 +17,7 @@ function makeConfig(overrides: Partial<CliConfig> = {}): CliConfig {
     hasExplicitClaudeArgs: true,
     hasExplicitModel: true,
     hasExplicitPermissionMode: true,
+    hasExplicitTerminalBackend: false,
     model: "opus",
     permissionMode: "bypassPermissions",
     terminalBackend: "auto",
@@ -56,11 +58,8 @@ describe("daemon client helpers", () => {
   test("sends deferred selections before awaiting the turn", async () => {
     const calls: string[] = [];
     const session = {
-      async send(text: string): Promise<void> {
-        calls.push(`send:${text}`);
-      },
-      async awaitTurn() {
-        calls.push("await");
+      async sendAndAwaitTurn(text: string) {
+        calls.push(`send-and-await:${text}`);
         return { stopReason: "end_turn" as const };
       },
     };
@@ -68,6 +67,6 @@ describe("daemon client helpers", () => {
     const result = await __test.answerPendingSelection(session, "2");
 
     expect(result).toEqual({ stopReason: "end_turn" });
-    expect(calls).toEqual(["send:2", "await"]);
+    expect(calls).toEqual(["send-and-await:2"]);
   });
 });

@@ -20,15 +20,19 @@ Answers a pending question in a live session by selecting option `n`.
 
 ### `claudraband sessions`
 
-Lists known resumable sessions. Local mode shows on-disk sessions for the current repo. `--server` lists daemon-managed live sessions instead.
+Lists known resumable sessions. Local mode shows on-disk sessions for the current repo by default. Use `--global` to list local sessions across every cwd. `--server` lists daemon-managed live sessions instead.
 
-### `claudraband session close <id>`
+### `claudraband sessions close <id>`
 
 Stops a live local session by session ID.
 
-### `claudraband session close --all`
+### `claudraband sessions close --global`
 
-Stops all live local sessions.
+Stops all live local sessions across every cwd.
+
+### `claudraband sessions close --cwd <dir>`
+
+Stops all live local sessions for the given cwd.
 
 ### `claudraband --acp`
 
@@ -46,7 +50,7 @@ Starts the daemon used for persistent headless `xterm` sessions.
 | `-s`, `--session <id>` | string | empty | Target an existing session |
 | `-i`, `--interactive` | flag | `false` | Run REPL mode |
 | `--select <n>` | string | empty | Auto-select option `n` for a pending question; requires `--session` |
-| `--all` | flag | `false` | Used with `session close --all` |
+| `--global` | flag | `false` | Use all local sessions across every cwd for `sessions` commands |
 | `--acp` | flag | `false` | Run as ACP server over stdio |
 | `--cwd <dir>` | string | current working directory | Working directory for new/resumed sessions |
 | `-c`, `--claude <flags>` | string | empty | Claude CLI flags passed through after parsing known model and permission flags |

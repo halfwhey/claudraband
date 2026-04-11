@@ -7,6 +7,7 @@ import type {
   ClaudrabandSession,
   PermissionMode,
   PromptResult,
+  ResolvedTerminalBackend,
 } from "claudraband-core";
 import { EventKind } from "claudraband-core";
 import type { CliConfig } from "./args";
@@ -17,6 +18,7 @@ import { formatDaemonSessionList } from "./session-format";
 interface DaemonSessionInfo {
   sessionId: string;
   reattached?: boolean;
+  backend: ResolvedTerminalBackend;
 }
 
 interface DaemonSessionRequestBody {
@@ -119,11 +121,10 @@ function buildSessionRequestBody(
 }
 
 async function answerPendingSelection(
-  session: Pick<ClaudrabandSession, "send" | "awaitTurn">,
+  session: Pick<ClaudrabandSession, "sendAndAwaitTurn">,
   optionId: string,
 ): Promise<PromptResult> {
-  await session.send(optionId);
-  return session.awaitTurn();
+  return session.sendAndAwaitTurn(optionId);
 }
 
 function connectSSE(
@@ -196,6 +197,7 @@ function connectSSE(
 class DaemonSessionProxy implements ClaudrabandSession {
   readonly sessionId: string;
   readonly cwd: string;
+  readonly backend: ResolvedTerminalBackend;
   readonly model: string;
   readonly permissionMode: PermissionMode;
 
@@ -212,6 +214,7 @@ class DaemonSessionProxy implements ClaudrabandSession {
     server: string,
     sessionId: string,
     cwd: string,
+    backend: ResolvedTerminalBackend,
     model: string,
     permissionMode: PermissionMode,
     permissionHandler?: (
@@ -221,6 +224,7 @@ class DaemonSessionProxy implements ClaudrabandSession {
     this.server = server;
     this.sessionId = sessionId;
     this.cwd = cwd;
+    this.backend = backend;
     this.model = model;
     this.permissionMode = permissionMode;
     this.permissionHandler = permissionHandler;
@@ -300,6 +304,15 @@ class DaemonSessionProxy implements ClaudrabandSession {
     return result as PromptResult;
   }
 
+  async sendAndAwaitTurn(text: string): Promise<PromptResult> {
+    const result = await daemonPost(
+      this.server,
+      `/sessions/${this.sessionId}/send-and-await-turn`,
+      { text },
+    );
+    return result as PromptResult;
+  }
+
   async send(text: string): Promise<void> {
     await daemonPost(this.server, `/sessions/${this.sessionId}/send`, { text });
   }
@@ -326,6 +339,17 @@ class DaemonSessionProxy implements ClaudrabandSession {
 
   async capturePane(): Promise<string> {
     return "";
+  }
+
+  async hasPendingInput(): Promise<{ pending: boolean; source: "none" | "terminal" }> {
+    const result = (await daemonGet(
+      this.server,
+      `/sessions/${this.sessionId}/pending-question`,
+    )) as PendingQuestionResponse;
+    return {
+      pending: result.pending,
+      source: result.source === "none" ? "none" : "terminal",
+    };
   }
 
   async setModel(_model: string): Promise<void> {
@@ -358,7 +382,13 @@ export async function runWithDaemon(
   }
 
   if (config.command === "session-close") {
-    if (config.closeAll) {
+    if (!config.sessionId) {
+      if (config.hasExplicitCwd) {
+        process.stderr.write(
+          "error: daemon session management does not support --cwd. Use --global or a session ID.\n",
+        );
+        process.exit(1);
+      }
       const result = (await daemonGet(config.server, "/sessions")) as {
         sessions: Array<{ sessionId: string; alive: boolean; hasPendingPermission: boolean }>;
       };
@@ -386,6 +416,7 @@ export async function runWithDaemon(
     }, request);
 
   let sessionId: string;
+  let sessionBackend: ResolvedTerminalBackend;
 
   if (config.sessionId) {
     // Resume existing session on daemon.
@@ -399,18 +430,21 @@ export async function runWithDaemon(
       process.exit(1);
     }
     sessionId = config.sessionId;
+    sessionBackend = result.backend;
   } else {
     // Create new session on daemon.
     const result = (await daemonPost(config.server, "/sessions", {
       ...buildSessionRequestBody(config),
     })) as DaemonSessionInfo;
     sessionId = result.sessionId;
+    sessionBackend = result.backend;
   }
 
   const session = new DaemonSessionProxy(
     config.server,
     sessionId,
     config.cwd,
+    sessionBackend,
     config.model,
     config.permissionMode,
     permissionHandler,

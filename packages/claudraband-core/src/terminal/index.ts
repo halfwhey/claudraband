@@ -1,5 +1,5 @@
 import { spawnSync } from "node:child_process";
-import { Session } from "../tmuxctl";
+import { Session, listWindows } from "../tmuxctl";
 import type { Terminal as HeadlessTerminal } from "@xterm/headless";
 import type { SerializeAddon } from "@xterm/addon-serialize";
 import type { IPty } from "node-pty";
@@ -36,6 +36,26 @@ export interface CreateTerminalHostOptions {
   backend: TerminalBackend;
   tmuxSessionName: string;
   tmuxWindowName: string;
+}
+
+export interface CreateTerminalBackendDriverOptions {
+  backend: TerminalBackend;
+  tmuxSessionName: string;
+}
+
+export interface LiveTerminalSessionSummary {
+  sessionId: string;
+  cwd?: string;
+  updatedAt?: string;
+}
+
+export interface TerminalBackendDriver {
+  readonly backend: ResolvedTerminalBackend;
+  createHost(windowName: string): TerminalHost;
+  listLiveSessions(): Promise<LiveTerminalSessionSummary[]>;
+  hasLiveSession(sessionId: string): Promise<boolean>;
+  closeLiveSession(sessionId: string): Promise<boolean>;
+  supportsLiveReconnect(): boolean;
 }
 
 type TmuxDetector = () => boolean;
@@ -100,11 +120,87 @@ export function resolveTerminalBackend(
 export function createTerminalHost(
   options: CreateTerminalHostOptions,
 ): TerminalHost {
+  return createTerminalBackendDriver({
+    backend: options.backend,
+    tmuxSessionName: options.tmuxSessionName,
+  }).createHost(options.tmuxWindowName);
+}
+
+export function createTerminalBackendDriver(
+  options: CreateTerminalBackendDriverOptions,
+): TerminalBackendDriver {
   const backend = resolveTerminalBackend(options.backend);
   if (backend === "tmux") {
-    return new TmuxTerminalHost(options.tmuxSessionName, options.tmuxWindowName);
+    return new TmuxTerminalBackendDriver(options.tmuxSessionName);
   }
-  return new XtermTerminalHost();
+  return new XtermTerminalBackendDriver();
+}
+
+class TmuxTerminalBackendDriver implements TerminalBackendDriver {
+  readonly backend = "tmux" as const;
+
+  constructor(private readonly sessionName: string) {}
+
+  createHost(windowName: string): TerminalHost {
+    return new TmuxTerminalHost(this.sessionName, windowName);
+  }
+
+  async listLiveSessions(): Promise<LiveTerminalSessionSummary[]> {
+    const windows = await listWindows(this.sessionName);
+    return windows.map((window) => ({
+      sessionId: window.windowName,
+      cwd: window.paneCurrentPath,
+      updatedAt: parseTmuxActivity(window.windowActivity),
+    }));
+  }
+
+  async hasLiveSession(sessionId: string): Promise<boolean> {
+    return (await Session.find(this.sessionName, sessionId)) !== null;
+  }
+
+  async closeLiveSession(sessionId: string): Promise<boolean> {
+    const found = await Session.find(this.sessionName, sessionId);
+    if (!found) return false;
+    await found.kill();
+    return true;
+  }
+
+  supportsLiveReconnect(): boolean {
+    return true;
+  }
+}
+
+class XtermTerminalBackendDriver implements TerminalBackendDriver {
+  readonly backend = "xterm" as const;
+
+  createHost(_windowName: string): TerminalHost {
+    return new XtermTerminalHost();
+  }
+
+  async listLiveSessions(): Promise<LiveTerminalSessionSummary[]> {
+    return [];
+  }
+
+  async hasLiveSession(_sessionId: string): Promise<boolean> {
+    return false;
+  }
+
+  async closeLiveSession(_sessionId: string): Promise<boolean> {
+    return false;
+  }
+
+  supportsLiveReconnect(): boolean {
+    return false;
+  }
+}
+
+function parseTmuxActivity(activity?: string): string | undefined {
+  if (!activity) return undefined;
+  const epochSeconds = Number.parseInt(activity, 10);
+  if (!Number.isFinite(epochSeconds) || epochSeconds <= 0) {
+    return undefined;
+  }
+  return new Date(epochSeconds * 1000).toISOString();
 }
 
 class TmuxTerminalHost implements TerminalHost {
@@ -254,15 +350,22 @@ class XtermTerminalHost implements TerminalHost {
 
   async send(input: string): Promise<void> {
     if (!this.transport) throw new Error("xterm terminal is not started");
+    if (!this.terminal) throw new Error("xterm terminal is not started");
+    await this.outputDrain.catch(() => {});
     if (input) {
-      this.transport.write(input);
+      for (const char of input) {
+        this.terminal.input(char);
+      }
+      await new Promise((resolve) => setTimeout(resolve, 10));
     }
-    this.transport.write("\r");
+    this.terminal.input("\r");
   }
 
   async interrupt(): Promise<void> {
     if (!this.transport) throw new Error("xterm terminal is not started");
-    this.transport.write("\u0003");
+    if (!this.terminal) throw new Error("xterm terminal is not started");
+    await this.outputDrain.catch(() => {});
+    this.terminal.input("\u0003");
   }
 
   async capture(): Promise<string> {
@@ -425,3 +528,9 @@ class BunTerminalTransport implements PtyTransport {
     return this.terminal !== null && !this.terminal.closed && this.aliveFlag;
   }
 }
+
+export const __test = {
+  createXtermTerminalHost() {
+    return new XtermTerminalHost();
+  },
+};

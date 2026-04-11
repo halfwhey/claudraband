@@ -19,8 +19,8 @@
   },
   "scripts": {
     "clean": "rm -rf dist",
-    "build:bin": "bun build src/bin.ts --target node --external '@agentclientprotocol/*' --external '@xterm/*' --external 'node-pty' --outdir dist",
-    "build:lib": "bun build ../claudraband-core/src/index.ts --target node --packages external --outdir dist --entry-naming index.js",
+    "build:bin": "bun build src/bin.ts --target node --external '@agentclientprotocol/*' --external 'node-pty' --outdir dist",
+    "build:lib": "bun build ../claudraband-core/src/index.ts --target node --external 'node-pty' --outdir dist --entry-naming index.js",
     "build:types": "tsc -p tsconfig.build.json --emitDeclarationOnly",
     "build": "bun run clean && bun run build:bin && bun run build:lib && bun run build:types",
     "prepack": "bun run build",

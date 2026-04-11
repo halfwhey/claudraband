@@ -1,8 +1,16 @@
-import { spawn, execSync } from "child_process";
+import { spawn, spawnSync } from "child_process";
+
+export interface TmuxWindowSummary {
+  windowId: string;
+  paneId: string;
+  windowName: string;
+  paneCurrentPath?: string;
+  windowActivity?: string;
+}
 
 async function tmux(...args: string[]): Promise<{ stdout: string; stderr: string }> {
   return new Promise((resolve, reject) => {
-    const proc = spawn("tmux", args);
+    const proc = spawn("bash", ["-lc", shellCommand("tmux", ...args)]);
     const out: string[] = [];
     const err: string[] = [];
     proc.stdout.on("data", (d: Buffer) => out.push(d.toString()));
@@ -22,27 +30,64 @@ async function tmux(...args: string[]): Promise<{ stdout: string; stderr: string
   });
 }
 
+function shellCommand(...args: string[]): string {
+  return args.map(shellQuote).join(" ");
+}
+
+function shellQuote(arg: string): string {
+  return `'${arg.replace(/'/g, "'\\''")}'`;
+}
+
 export function hasSession(name: string): boolean {
-  try {
-    execSync(`tmux has-session -t ${name}`, { stdio: "pipe" });
-    return true;
-  } catch {
-    return false;
-  }
+  return (
+    spawnSync("bash", ["-lc", shellCommand("tmux", "has-session", "-t", name)], {
+      stdio: "pipe",
+    }).status === 0
+  );
 }
 
 function hasPane(id: string): boolean {
-  try {
-    execSync(`tmux display-message -p -t ${id} '#{pane_id}'`, { stdio: "pipe" });
-    return true;
-  } catch {
-    return false;
-  }
+  return (
+    spawnSync(
+      "bash",
+      ["-lc", shellCommand("tmux", "display-message", "-p", "-t", id, "#{pane_id}")],
+      { stdio: "pipe" },
+    ).status === 0
+  );
 }
 
 export async function killSession(name: string): Promise<void> {
   if (!hasSession(name)) return;
   await tmux("kill-session", "-t", name);
+}
+
+export async function listWindows(name: string): Promise<TmuxWindowSummary[]> {
+  if (!hasSession(name)) return [];
+
+  const result = await tmux(
+    "list-windows",
+    "-t",
+    name,
+    "-F",
+    "#{window_id}\t#{pane_id}\t#{window_name}\t#{pane_current_path}\t#{window_activity}",
+  );
+
+  return result.stdout
+    .trim()
+    .split("\n")
+    .filter(Boolean)
+    .map((line) => {
+      const [windowId, paneId, windowName, paneCurrentPath, windowActivity] =
+        line.split("\t", 5);
+      return {
+        windowId,
+        paneId,
+        windowName,
+        paneCurrentPath: paneCurrentPath || undefined,
+        windowActivity: windowActivity || undefined,
+      };
+    })
+    .filter((window) => window.windowId && window.paneId && window.windowName);
 }
 
 export interface CaptureOpts {
