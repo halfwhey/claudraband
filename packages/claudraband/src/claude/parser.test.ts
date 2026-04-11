@@ -3,7 +3,7 @@ import { writeFileSync, mkdirSync, appendFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { Tailer, parseLineEvents } from "./parser";
-import { EventKind } from "../../wrap/event";
+import { EventKind } from "../wrap/event";
 
 describe("parser", () => {
   test("parseLineEvents handles user message", () => {
@@ -52,7 +52,7 @@ describe("parser", () => {
 
 describe("Tailer", () => {
   test("reads existing lines", async () => {
-    const dir = join(tmpdir(), `allagent-test-${Date.now()}`);
+    const dir = join(tmpdir(), `claudraband-test-${Date.now()}`);
     mkdirSync(dir, { recursive: true });
     const path = join(dir, "test.jsonl");
 
@@ -65,7 +65,7 @@ describe("Tailer", () => {
 
     const tl = new Tailer(path);
     try {
-      const got: import("../../wrap/event").Event[] = [];
+      const got: import("../wrap/event").Event[] = [];
       const timeout = setTimeout(() => {
         tl.close();
       }, 3000);
@@ -87,7 +87,7 @@ describe("Tailer", () => {
   });
 
   test("waits for file to appear", async () => {
-    const dir = join(tmpdir(), `allagent-test-wait-${Date.now()}`);
+    const dir = join(tmpdir(), `claudraband-test-wait-${Date.now()}`);
     mkdirSync(dir, { recursive: true });
     const path = join(dir, "delayed.jsonl");
 
@@ -116,7 +116,7 @@ describe("Tailer", () => {
   });
 
   test("reads appended lines", async () => {
-    const dir = join(tmpdir(), `allagent-test-append-${Date.now()}`);
+    const dir = join(tmpdir(), `claudraband-test-append-${Date.now()}`);
     mkdirSync(dir, { recursive: true });
     const path = join(dir, "append.jsonl");
 
@@ -159,7 +159,7 @@ describe("Tailer", () => {
   });
 
   test("emits multiple content blocks", async () => {
-    const dir = join(tmpdir(), `allagent-test-multi-${Date.now()}`);
+    const dir = join(tmpdir(), `claudraband-test-multi-${Date.now()}`);
     mkdirSync(dir, { recursive: true });
     const path = join(dir, "multi.jsonl");
 
@@ -170,7 +170,7 @@ describe("Tailer", () => {
 
     const tl = new Tailer(path);
     try {
-      const got: import("../../wrap/event").Event[] = [];
+      const got: import("../wrap/event").Event[] = [];
       const timeout = setTimeout(() => {
         tl.close();
       }, 3000);

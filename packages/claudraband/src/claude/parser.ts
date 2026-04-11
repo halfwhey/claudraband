@@ -1,6 +1,6 @@
 import { stat, open } from "node:fs/promises";
-import type { Event } from "../../wrap/event";
-import { EventKind, makeEvent } from "../../wrap/event";
+import type { Event } from "../wrap/event";
+import { EventKind, makeEvent } from "../wrap/event";
 
 interface Envelope {
   type: string;
@@ -25,6 +25,12 @@ interface ContentBlock {
   input?: unknown;
   tool_use_id?: string;
   content?: unknown;
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => {
+    setTimeout(resolve, ms);
+  });
 }
 
 function truncate(s: string, n: number): string {
@@ -192,8 +198,11 @@ export class Tailer {
   private resolvers: ((value: IteratorResult<Event>) => void)[] = [];
   private done = false;
 
-  constructor(path: string) {
+  private startOffset: number;
+
+  constructor(path: string, startOffset = 0) {
     this.path = path;
+    this.startOffset = startOffset;
     this.abortController = new AbortController();
     this.run();
   }
@@ -257,7 +266,7 @@ export class Tailer {
         await stat(this.path);
         break;
       } catch {
-        await Bun.sleep(250);
+        await sleep(250);
         if (signal.aborted) {
           this.finish();
           return;
@@ -265,7 +274,7 @@ export class Tailer {
       }
     }
 
-    let offset = 0;
+    let offset = this.startOffset;
     let pending = "";
 
     while (!signal.aborted) {
@@ -276,7 +285,7 @@ export class Tailer {
         pending = this.emitCompleteLines(pending);
       }
 
-      await Bun.sleep(200);
+      await sleep(200);
     }
 
     this.finish();

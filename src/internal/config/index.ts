@@ -1,1 +1,0 @@
-export { newClaudeWrapper } from "./config";

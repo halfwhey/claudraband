@@ -1,18 +1,28 @@
-.PHONY: build test typecheck clean run
+.PHONY: build build-lib build-acp build-cli build-launchers test typecheck clean
 
-BIN := allagent
+build: build-lib build-acp build-cli build-launchers
 
-build:
-	bun build src/main.ts --compile --outfile $(BIN)
+build-lib:
+	cd packages/claudraband && bun run build
+
+build-acp:
+	cd packages/claudraband-acp && bun run build
+
+build-cli:
+	cd packages/claudraband-cli && bun run build
+
+build-launchers:
+	chmod +x claudraband claudraband-acp
 
 test:
-	bun test
+	bun test packages/claudraband/src packages/claudraband-acp/src packages/claudraband-cli/src
 
 typecheck:
-	tsc --noEmit
+	packages/claudraband-acp/node_modules/.bin/tsc -p packages/claudraband/tsconfig.json --noEmit
+	packages/claudraband-acp/node_modules/.bin/tsc -p packages/claudraband-acp/tsconfig.json --noEmit
+	packages/claudraband-acp/node_modules/.bin/tsc -p packages/claudraband-cli/tsconfig.json --noEmit
 
 clean:
-	rm -f $(BIN)
-
-run: build
-	./$(BIN)
+	rm -rf packages/claudraband/dist
+	rm -rf packages/claudraband-acp/dist
+	rm -rf packages/claudraband-cli/dist

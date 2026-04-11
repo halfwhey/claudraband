@@ -2,23 +2,11 @@
 import { openSync, mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import * as acp from "@agentclientprotocol/sdk";
+import { parseArgs } from "./args";
 import { Bridge } from "./acpbridge";
 
-function parseArgs(args: string[]): { model: string; debug: boolean } {
-  let model = "sonnet";
-  let debug = false;
-  for (let i = 0; i < args.length; i++) {
-    if (args[i] === "--model" && i + 1 < args.length) {
-      model = args[++i];
-    } else if (args[i] === "--debug") {
-      debug = true;
-    }
-  }
-  return { model, debug };
-}
-
 function openLogFile(): number {
-  const dir = "/tmp/allagent";
+  const dir = "/tmp/claudraband";
   mkdirSync(dir, { recursive: true });
   const now = new Date();
   const name = now.toISOString().replace(/[T:]/g, "-").replace(/\.\d+Z$/, "");
@@ -26,7 +14,7 @@ function openLogFile(): number {
   return openSync(path, "a");
 }
 
-const { model, debug } = parseArgs(process.argv.slice(2));
+const { model, debug, terminalBackend } = parseArgs(process.argv.slice(2));
 
 const logFd = openLogFile();
 
@@ -46,9 +34,15 @@ const logger = {
   error: (msg: string, ...args: unknown[]) => log("ERROR", msg, ...args),
 };
 
-logger.info("allagent starting", "transport=stdio", `model=${model}`, `pid=${process.pid}`);
+logger.info(
+  "claudraband starting",
+  "transport=stdio",
+  `model=${model}`,
+  `terminal_backend=${terminalBackend}`,
+  `pid=${process.pid}`,
+);
 
-const bridge = new Bridge(model);
+const bridge = new Bridge(model, terminalBackend);
 bridge.setLogger(logger);
 
 const input = new WritableStream({

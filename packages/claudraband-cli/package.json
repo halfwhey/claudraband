@@ -1,0 +1,22 @@
+{
+  "name": "claudraband-cli",
+  "version": "0.1.0",
+  "type": "module",
+  "main": "./dist/main.js",
+  "bin": {
+    "claudraband": "dist/main.js"
+  },
+  "scripts": {
+    "build": "bun build src/main.ts --target node --packages external --outdir dist",
+    "test": "bun test src",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "claudraband": "workspace:*"
+  },
+  "devDependencies": {
+    "@types/bun": "^1.2.0",
+    "@types/node": "^24.6.0",
+    "typescript": "^5.8.0"
+  }
+}

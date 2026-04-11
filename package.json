@@ -1,22 +1,10 @@
 {
-  "name": "allagent",
-  "version": "0.1.0",
-  "type": "module",
-  "bin": {
-    "allagent": "src/main.ts"
-  },
+  "name": "claudraband-monorepo",
+  "private": true,
+  "workspaces": ["packages/*"],
   "scripts": {
-    "build": "bun build src/main.ts --compile --outfile allagent",
-    "test": "bun test",
-    "run": "bun src/main.ts",
-    "typecheck": "tsc --noEmit",
-    "lint": "tsc --noEmit"
-  },
-  "dependencies": {
-    "@agentclientprotocol/sdk": "^0.18.0"
-  },
-  "devDependencies": {
-    "@types/bun": "^1.2.0",
-    "typescript": "^5.8.0"
+    "build": "bun run --filter '*' build",
+    "test": "bun test packages/claudraband/src packages/claudraband-acp/src packages/claudraband-cli/src",
+    "typecheck": "tsc -b"
   }
 }
