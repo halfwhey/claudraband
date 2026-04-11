@@ -7,11 +7,20 @@ import type {
   ClaudrabandPermissionRequest,
   ClaudrabandSession,
 } from "claudraband-core";
-import { createClaudraband } from "claudraband-core";
+import {
+  closeLiveProcess,
+  createClaudraband,
+  hasPendingNativePrompt,
+  hasPendingQuestion,
+  hasLiveProcess,
+  resolveTerminalBackend,
+  sessionPath,
+} from "claudraband-core";
 import { Bridge } from "./acpbridge";
 import { parseArgs } from "./args";
 import { requestPermission } from "./client";
 import { Renderer } from "./render";
+import { formatLocalSessionList } from "./session-format";
 
 function readLine(): Promise<string> {
   return new Promise((resolve) => {
@@ -160,9 +169,54 @@ async function listSessions(cwd: string, logger: ClaudrabandLogger): Promise<voi
     process.stderr.write("no sessions found\n");
     return;
   }
-  for (const session of sessions) {
-    const date = session.updatedAt ? new Date(session.updatedAt).toLocaleString() : "";
-    process.stdout.write(`${session.sessionId}  ${date}  ${session.title ?? "(untitled)"}\n`);
+  const withStatus = await Promise.all(
+    sessions.map(async (session) => ({
+      session,
+      isLive: await hasLiveProcess(session.sessionId).catch(() => false),
+    })),
+  );
+  for (const line of formatLocalSessionList(withStatus)) {
+    process.stdout.write(`${line}\n`);
+  }
+}
+
+async function closeLocalSessions(
+  cwd: string,
+  logger: ClaudrabandLogger,
+  sessionId: string,
+  closeAll: boolean,
+): Promise<void> {
+  if (!closeAll) {
+    const closed = await closeLiveProcess(sessionId);
+    if (!closed) {
+      process.stderr.write(
+        `error: session ${sessionId} is not running locally.\n`,
+      );
+      process.exit(1);
+    }
+    process.stderr.write(`session ${sessionId} closed\n`);
+    return;
+  }
+
+  const runtime = createClaudraband({ logger });
+  const sessions = await runtime.listSessions(cwd);
+  const liveSessions = (
+    await Promise.all(
+      sessions.map(async (session) => ({
+        sessionId: session.sessionId,
+        isLive: await hasLiveProcess(session.sessionId).catch(() => false),
+      })),
+    )
+  ).filter((session) => session.isLive);
+
+  if (liveSessions.length === 0) {
+    process.stderr.write("no live sessions found\n");
+    return;
+  }
+
+  for (const session of liveSessions) {
+    await closeLiveProcess(session.sessionId);
+    process.stderr.write(`session ${session.sessionId} closed\n`);
   }
 }
 
@@ -196,11 +250,29 @@ export async function runCli(argv: string[] = process.argv.slice(2)): Promise<vo
     return;
   }
 
+  if (config.command === "serve") {
+    const { startServer } = await import("./server");
+    await startServer(config);
+    return;
+  }
+
   const renderer = new Renderer();
   const logger = makeLogger(config.debug);
 
+  // --- server mode: delegate everything to daemon ---
+  if (config.server) {
+    const { runWithDaemon } = await import("./daemon-client");
+    await runWithDaemon(config, renderer, logger);
+    return;
+  }
+
   if (config.command === "sessions") {
     await listSessions(config.cwd, logger);
+    return;
+  }
+
+  if (config.command === "session-close") {
+    await closeLocalSessions(config.cwd, logger, config.sessionId, config.closeAll);
     return;
   }
 
@@ -214,16 +286,23 @@ export async function runCli(argv: string[] = process.argv.slice(2)): Promise<vo
 
   let session: ClaudrabandSession | null = null;
   let promptActive = false;
+  let sigintCount = 0;
 
   process.on("SIGINT", async () => {
+    sigintCount++;
     if (!session) {
+      process.exit(0);
+    }
+    if (sigintCount >= 2) {
+      // Force kill on second SIGINT.
+      await session.stop().catch(() => {});
       process.exit(0);
     }
     if (promptActive) {
       await session.interrupt().catch(() => {});
       promptActive = false;
     } else {
-      await session.stop().catch(() => {});
+      await session.detach().catch(() => {});
       process.exit(0);
     }
   });
@@ -234,19 +313,36 @@ export async function runCli(argv: string[] = process.argv.slice(2)): Promise<vo
       claudeArgs: config.claudeArgs,
       model: config.model,
       permissionMode: config.permissionMode,
-      terminalBackend: config.terminalBackend,
       allowTextResponses: true,
+      terminalBackend: config.terminalBackend,
       logger,
       onPermissionRequest: (request: ClaudrabandPermissionRequest) =>
         requestPermission(renderer, {
-          approveAll: config.approveAll,
           interactive: config.interactive,
           select: config.select,
           promptText: config.prompt,
         }, request),
     };
 
-    session = config.command === "resume"
+    // --select only works against a live persistent session.
+    if (config.select && config.sessionId) {
+      const backend = resolveTerminalBackend(config.terminalBackend);
+      if (backend !== "tmux") {
+        process.stderr.write(
+          "error: local --select requires a live tmux session. Use --server for daemon-backed xterm sessions.\n",
+        );
+        process.exit(1);
+      }
+      const alive = await hasLiveProcess(config.sessionId);
+      if (!alive) {
+        process.stderr.write(
+          `error: session ${config.sessionId} has no live process. Cannot answer a pending question.\n`,
+        );
+        process.exit(1);
+      }
+    }
+
+    session = config.sessionId
       ? await runtime.resumeSession(config.sessionId, sessionOptions)
       : await runtime.startSession(sessionOptions);
 
@@ -258,6 +354,7 @@ export async function runCli(argv: string[] = process.argv.slice(2)): Promise<vo
 
     if (config.prompt) {
       promptActive = true;
+      sigintCount = 0;
       const result = await session.prompt(config.prompt);
       promptActive = false;
       renderer.ensureNewline();
@@ -265,9 +362,22 @@ export async function runCli(argv: string[] = process.argv.slice(2)): Promise<vo
         process.stderr.write(`stop: ${result.stopReason}\n`);
       }
     } else if (config.select) {
-      // --select without a prompt: drain the pending turn to handle
-      // any waiting question/permission.
+      const jsonlPath = sessionPath(session.cwd, config.sessionId);
+      const pendingQuestion = await hasPendingQuestion(jsonlPath);
+      const paneText = await session.capturePane().catch(() => "");
+      const pendingNativePrompt = hasPendingNativePrompt(paneText);
+      if (!pendingQuestion && !pendingNativePrompt) {
+        await session.detach().catch(() => {});
+        process.stderr.write(
+          `error: session ${config.sessionId} has no pending question or permission prompt.\n`,
+        );
+        process.exit(1);
+      }
+
+      // Send the selection directly to the live Claude TUI.
       promptActive = true;
+      sigintCount = 0;
+      await session.send(config.select);
       const result = await session.awaitTurn();
       promptActive = false;
       renderer.ensureNewline();
@@ -280,7 +390,7 @@ export async function runCli(argv: string[] = process.argv.slice(2)): Promise<vo
       await repl(session, renderer);
     }
 
-    await session.stop();
+    await session.detach();
     await eventPump.catch(() => {});
   } catch (err: unknown) {
     const msg = err instanceof Error ? err.message : JSON.stringify(err);

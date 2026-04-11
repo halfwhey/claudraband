@@ -19,6 +19,13 @@ export interface TerminalHost {
   readonly backend: ResolvedTerminalBackend;
   start(command: string[], options: TerminalStartOptions): Promise<void>;
   stop(): Promise<void>;
+  /** Disconnect without killing the process. For tmux the window stays alive. */
+  detach(): Promise<void>;
+  /**
+   * Reattach to an existing terminal by window name (tmux) or id.
+   * Returns true if an existing process was found, false otherwise.
+   */
+  reattach(windowName: string): Promise<boolean>;
   send(input: string): Promise<void>;
   interrupt(): Promise<void>;
   capture(): Promise<string>;
@@ -127,6 +134,18 @@ class TmuxTerminalHost implements TerminalHost {
     this.session = null;
   }
 
+  async detach(): Promise<void> {
+    // Drop the reference without killing the tmux window.
+    this.session = null;
+  }
+
+  async reattach(windowName: string): Promise<boolean> {
+    const existing = await Session.find(this.sessionName, windowName);
+    if (!existing) return false;
+    this.session = existing;
+    return true;
+  }
+
   async send(input: string): Promise<void> {
     if (!this.session) throw new Error("tmux terminal is not started");
     await this.session.sendLine(input);
@@ -221,6 +240,16 @@ class XtermTerminalHost implements TerminalHost {
     this.serializeAddon = null;
     this.exited = true;
     await this.outputDrain.catch(() => {});
+  }
+
+  async detach(): Promise<void> {
+    // xterm PTYs are in-process; detach is the same as stop.
+    await this.stop();
+  }
+
+  async reattach(_windowName: string): Promise<boolean> {
+    // xterm PTYs can't outlive the process. Reattach only works via the daemon.
+    return false;
   }
 
   async send(input: string): Promise<void> {

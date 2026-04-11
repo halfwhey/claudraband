@@ -136,6 +136,36 @@ export class Session {
     return new Session(name, command, windowId, paneId);
   }
 
+  /**
+   * Find an existing tmux window by session name and window name.
+   * Returns a Session if the window is alive, null otherwise.
+   */
+  static async find(
+    sessionName: string,
+    windowName: string,
+  ): Promise<Session | null> {
+    if (!hasSession(sessionName)) return null;
+    try {
+      const result = await tmux(
+        "list-windows",
+        "-t",
+        sessionName,
+        "-F",
+        "#{window_id}\t#{pane_id}\t#{window_name}",
+      );
+      for (const line of result.stdout.trim().split("\n")) {
+        const [windowId, paneId, name] = line.split("\t", 3);
+        if (name === windowName && windowId && paneId) {
+          const session = new Session(sessionName, [], windowId, paneId);
+          if (session.isAlive) return session;
+        }
+      }
+    } catch {
+      // Session might not exist or list-windows failed.
+    }
+    return null;
+  }
+
   async kill(): Promise<void> {
     if (!this.isAlive) return;
     await tmux("kill-window", "-t", this.windowId);

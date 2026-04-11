@@ -1,5 +1,6 @@
 import {
   parseClaudeArgs,
+  resolveTerminalBackend,
   type PermissionMode,
   type TerminalBackend,
 } from "claudraband-core";
@@ -17,19 +18,24 @@ const defaultIo: ParseIo = {
 };
 
 export interface CliConfig {
-  command: "prompt" | "sessions" | "resume" | "acp";
+  command: "prompt" | "sessions" | "session-close" | "acp" | "serve";
   prompt: string;
   sessionId: string;
+  closeAll: boolean;
   cwd: string;
   debug: boolean;
-  approveAll: boolean;
   interactive: boolean;
   acp: boolean;
   claudeArgs: string[];
+  hasExplicitClaudeArgs: boolean;
+  hasExplicitModel: boolean;
+  hasExplicitPermissionMode: boolean;
   model: string;
   permissionMode: PermissionMode;
   terminalBackend: TerminalBackend;
   select: string;
+  server: string;
+  port: number;
 }
 
 export function parseArgs(argv: string[], io: ParseIo = defaultIo): CliConfig {
@@ -37,16 +43,21 @@ export function parseArgs(argv: string[], io: ParseIo = defaultIo): CliConfig {
     command: "prompt",
     prompt: "",
     sessionId: "",
+    closeAll: false,
     cwd: process.cwd(),
     debug: false,
-    approveAll: false,
     interactive: false,
     acp: false,
     claudeArgs: [],
+    hasExplicitClaudeArgs: false,
+    hasExplicitModel: false,
+    hasExplicitPermissionMode: false,
     model: "sonnet",
     permissionMode: "default",
     terminalBackend: "auto",
     select: "",
+    server: "",
+    port: 7842,
   };
 
   const positional: string[] = [];
@@ -71,12 +82,18 @@ export function parseArgs(argv: string[], io: ParseIo = defaultIo): CliConfig {
       config.terminalBackend = argv[++i] as TerminalBackend;
     } else if (arg === "--debug") {
       config.debug = true;
-    } else if (arg === "--approve-all") {
-      config.approveAll = true;
     } else if (arg === "--interactive" || arg === "-i") {
       config.interactive = true;
+    } else if ((arg === "--session" || arg === "-s") && i + 1 < argv.length) {
+      config.sessionId = argv[++i];
     } else if (arg === "--select" && i + 1 < argv.length) {
       config.select = argv[++i];
+    } else if (arg === "--all") {
+      config.closeAll = true;
+    } else if (arg === "--server" && i + 1 < argv.length) {
+      config.server = argv[++i];
+    } else if (arg === "--port" && i + 1 < argv.length) {
+      config.port = parseInt(argv[++i], 10);
     } else if (arg === "--acp") {
       config.acp = true;
     } else if (arg === "--claude" || arg === "-c") {
@@ -95,9 +112,13 @@ export function parseArgs(argv: string[], io: ParseIo = defaultIo): CliConfig {
 
   const parsedClaudeArgs = parseClaudeArgs(config.claudeArgs);
   config.claudeArgs = parsedClaudeArgs.passthroughArgs;
+  config.hasExplicitClaudeArgs = parsedClaudeArgs.passthroughArgs.length > 0;
+  config.hasExplicitModel = parsedClaudeArgs.model !== undefined;
+  config.hasExplicitPermissionMode = parsedClaudeArgs.permissionMode !== undefined;
   config.model = parsedClaudeArgs.model ?? "sonnet";
   config.permissionMode = (parsedClaudeArgs.permissionMode as PermissionMode | undefined) ?? "default";
 
+  // Route positional commands.
   if (config.acp) {
     if (positional.length > 0) {
       io.stderr("error: --acp does not accept positional arguments.\n");
@@ -107,55 +128,124 @@ export function parseArgs(argv: string[], io: ParseIo = defaultIo): CliConfig {
     config.command = "acp";
   } else if (positional[0] === "sessions") {
     config.command = "sessions";
-  } else if (positional[0] === "resume") {
-    if (!positional[1]) {
-      io.stderr("error: resume requires a session ID.\n");
-      io.exit(1);
-    }
-    config.command = "resume";
-    config.sessionId = positional[1];
-    config.prompt = positional.slice(2).join(" ");
+  } else if (positional[0] === "session" && positional[1] === "close") {
+    config.command = "session-close";
+    config.sessionId = positional[2] ?? "";
+  } else if (positional[0] === "close") {
+    config.command = "session-close";
+    config.sessionId = positional[1] ?? "";
+  } else if (positional[0] === "serve") {
+    config.command = "serve";
   } else {
     config.command = "prompt";
     config.prompt = positional.join(" ");
   }
 
-  if (!config.prompt && !config.interactive && config.command === "prompt") {
+  // Validation.
+
+  if (config.select && !config.sessionId) {
+    io.stderr("error: --select requires --session <id>.\n");
+    io.exit(1);
+  }
+
+  if (config.closeAll && config.command !== "session-close") {
+    io.stderr("error: --all is only valid with 'session close'.\n");
+    io.exit(1);
+  }
+
+  if (config.command === "session-close") {
+    if (config.closeAll && config.sessionId) {
+      io.stderr("error: 'session close' accepts either <id> or --all, not both.\n");
+      io.exit(1);
+    }
+    if (!config.closeAll && !config.sessionId) {
+      io.stderr("error: session close requires a session ID or --all.\n");
+      io.exit(1);
+    }
+  }
+
+  if (config.sessionId && !config.prompt && !config.select && !config.interactive
+      && config.command === "prompt") {
+    io.stderr("error: --session requires a prompt, --select, or --interactive.\n");
+    io.exit(1);
+  }
+
+  if (!config.prompt && !config.interactive && !config.select
+      && config.command === "prompt" && !config.sessionId) {
     io.stderr("error: no prompt provided. Use --interactive / -i for REPL mode.\n");
     io.stderr(USAGE);
     io.exit(1);
   }
 
+  // xterm guard: local xterm without daemon requires dangerous permission mode.
+  if (config.command === "prompt" && !config.server) {
+    let resolved: "tmux" | "xterm";
+    try {
+      resolved = resolveTerminalBackend(config.terminalBackend);
+    } catch {
+      // resolveTerminalBackend throws if tmux backend is requested but
+      // tmux isn't installed. Treat that as xterm for the guard.
+      resolved = "xterm";
+    }
+    if (resolved === "xterm" && !isDangerousPermissionMode(config)) {
+      io.stderr(
+        "error: local xterm backend requires dangerous permission settings.\n" +
+        "  Either:\n" +
+        "    --server <host:port>   (use a claudraband daemon)\n" +
+        "    --terminal-backend tmux\n" +
+        '    -c "--dangerously-skip-permissions"\n',
+      );
+      io.exit(1);
+    }
+  }
+
   return config;
 }
 
+function isDangerousPermissionMode(config: CliConfig): boolean {
+  if (config.permissionMode === "bypassPermissions") return true;
+  if (config.permissionMode === "dontAsk") return true;
+  if (config.claudeArgs.includes("--dangerously-skip-permissions")) return true;
+  return false;
+}
+
 export const USAGE = `Usage: claudraband [options] <prompt...>
-       claudraband -i
-       claudraband --acp [options]
+       claudraband -s <id> <prompt...>
+       claudraband -s <id> --select <n>
+       claudraband -s <id> -i
+       claudraband session close <sessionId>
+       claudraband session close --all
        claudraband sessions [--cwd <dir>]
-       claudraband resume <sessionId> [options] [prompt...]
+       claudraband serve [--port <n>]
+       claudraband --acp [options]
 
 Options:
   -h, --help                     Show this help
+  -s, --session <id>             Target an existing session
   -i, --interactive              Start interactive REPL mode
+  --select <n>                   Auto-select option <n> for a pending question (requires -s)
+  --all                          Apply 'session close' to all live sessions
   --acp                          Run as an ACP server over stdio
   --cwd <dir>                    Working directory (default: cwd)
   -c, --claude <flags>           Claude CLI flags, e.g. '--model sonnet --effort high'
   --terminal-backend <backend>   auto | tmux | xterm (default: auto)
+  --server <host:port>           Connect to a claudraband daemon instead of running locally
+  --port <n>                     Port for the serve command (default: 7842)
   --debug                        Show debug logging
-  --approve-all                  Auto-approve the first permission option
-  --select <n>                   Auto-select option <n> for questions/permissions
 
 Examples:
   claudraband "what changed in this repo?"
   claudraband -i
+  claudraband -s abc-123 "continue the refactor"
+  claudraband -s abc-123 --select 2
+  claudraband -s abc-123 -i
+  claudraband session close abc-123
+  claudraband session close --all
   claudraband --acp --claude "--model opus"
   claudraband sessions
-  claudraband resume abc-123 "continue the refactor"
-  claudraband --claude "--model sonnet --effort high --bypass-all-permissions" "write the tests"
-  claudraband --terminal-backend xterm "run without tmux"
-  claudraband resume abc-123 --select 1
-  claudraband resume abc-123 --select 3 "my typed response"
+  claudraband serve --port 7842
+  claudraband --server localhost:7842 "hello"
+  claudraband --terminal-backend xterm -c "--dangerously-skip-permissions" "run without tmux"
 `;
 
 export function splitShellWords(input: string): string[] {

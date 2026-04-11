@@ -1,0 +1,9 @@
+{
+  "extends": "../claudraband-core/tsconfig.build.json",
+  "compilerOptions": {
+    "rootDir": "../claudraband-core/src",
+    "outDir": "dist"
+  },
+  "include": ["../claudraband-core/src"],
+  "exclude": ["node_modules", "dist", "../claudraband-core/src/**/*.test.ts"]
+}

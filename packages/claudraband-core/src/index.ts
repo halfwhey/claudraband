@@ -4,8 +4,12 @@ import { join } from "node:path";
 import {
   ClaudeWrapper,
   createTerminalHost,
+  hasPendingNativePrompt,
+  hasPendingQuestion,
   parseClaudeArgs,
   parseLineEvents,
+  parseNativePermissionPrompt,
+  resolveTerminalBackend,
   sessionPath,
   type TerminalBackend,
 } from "./claude";
@@ -19,9 +23,24 @@ const IDLE_TIMEOUT_MS = 3000;
 const SHARED_TMUX_SESSION = "claudraband-working-session";
 
 export { EventKind };
+export { hasPendingNativePrompt };
+export { hasPendingQuestion };
 export { parseClaudeArgs };
+export { resolveTerminalBackend };
+export { sessionPath };
 export type { ClaudrabandEvent };
 export type { TerminalBackend };
+
+const SHARED_TMUX_SESSION_NAME = "claudraband-working-session";
+
+/** Check if a Claude Code session has a live tmux process. */
+export async function hasLiveProcess(sessionId: string): Promise<boolean> {
+  return ClaudeWrapper.hasLiveProcess(SHARED_TMUX_SESSION_NAME, sessionId);
+}
+
+export async function closeLiveProcess(sessionId: string): Promise<boolean> {
+  return ClaudeWrapper.stopLiveProcess(SHARED_TMUX_SESSION_NAME, sessionId);
+}
 
 export type PermissionMode =
   | "default"
@@ -80,8 +99,8 @@ export interface ClaudrabandOptions {
   claudeArgs?: string[];
   model?: string;
   permissionMode?: PermissionMode;
-  terminalBackend?: TerminalBackend;
   allowTextResponses?: boolean;
+  terminalBackend?: TerminalBackend;
   paneWidth?: number;
   paneHeight?: number;
   logger?: ClaudrabandLogger;
@@ -112,6 +131,9 @@ export interface ClaudrabandSession {
   send(text: string): Promise<void>;
   interrupt(): Promise<void>;
   stop(): Promise<void>;
+  /** Disconnect without killing the process. */
+  detach(): Promise<void>;
+  isProcessAlive(): boolean;
   capturePane(): Promise<string>;
   setModel(model: string): Promise<void>;
   setPermissionMode(mode: PermissionMode): Promise<void>;
@@ -209,11 +231,6 @@ interface AskUserQuestion {
   questions: AskUserQuestionItem[];
 }
 
-interface NativePermissionPrompt {
-  question: string;
-  options: { number: string; label: string }[];
-}
-
 function makeDefaultLogger(): ClaudrabandLogger {
   const noop = () => {};
   return {
@@ -246,9 +263,11 @@ function normalizeOptions(
       (parsedClaudeArgs.permissionMode as PermissionMode | undefined) ??
       defaults.permissionMode ??
       "default",
-    terminalBackend: options?.terminalBackend ?? defaults.terminalBackend ?? "auto",
     allowTextResponses:
-      options?.allowTextResponses ?? defaults.allowTextResponses ?? false,
+      options?.allowTextResponses ??
+      defaults.allowTextResponses ??
+      false,
+    terminalBackend: options?.terminalBackend ?? defaults.terminalBackend ?? "auto",
     paneWidth: options?.paneWidth ?? defaults.paneWidth ?? DEFAULT_PANE_WIDTH,
     paneHeight:
       options?.paneHeight ?? defaults.paneHeight ?? DEFAULT_PANE_HEIGHT,
@@ -357,6 +376,8 @@ interface SessionWrapper extends Wrapper {
   setModel(model: string): void;
   setPermissionMode(mode: string): void;
   restart(): Promise<void>;
+  detach(): Promise<void>;
+  isProcessAlive(): boolean;
 }
 
 class ClaudrabandSessionImpl implements ClaudrabandSession {
@@ -491,6 +512,18 @@ class ClaudrabandSessionImpl implements ClaudrabandSession {
     await this.wrapper.stop().catch(() => {});
     await this.pumpPromise.catch(() => {});
     this.closeSubscribers();
+  }
+
+  async detach(): Promise<void> {
+    this.stopped = true;
+    this.promptAbortController?.abort();
+    await this.wrapper.detach();
+    await this.pumpPromise.catch(() => {});
+    this.closeSubscribers();
+  }
+
+  isProcessAlive(): boolean {
+    return this.wrapper.isProcessAlive();
   }
 
   capturePane(): Promise<string> {
@@ -884,7 +917,7 @@ export const __test = {
 
 function buildAskUserQuestionOptions(
   question: AskUserQuestionItem,
-  allowTextResponses: boolean,
+  allowTextResponses = false,
 ): ClaudrabandPermissionOption[] {
   return [
     ...question.options.map((opt, i) => ({
@@ -894,11 +927,11 @@ function buildAskUserQuestionOptions(
     })),
     ...(allowTextResponses
       ? [{
-          kind: "allow_once" as const,
-          optionId: String(question.options.length + 1),
-          name: "Type a response",
-          textInput: true,
-        }]
+        kind: "allow_once" as const,
+        optionId: String(question.options.length + 1),
+        name: "Type a response",
+        textInput: true,
+      }]
       : []),
     {
       kind: "reject_once" as const,
@@ -1081,25 +1114,4 @@ function parseAskUserQuestion(rawInput: string): AskUserQuestion | null {
   } catch {
     return null;
   }
-}
-
-function parseNativePermissionPrompt(
-  paneText: string,
-): NativePermissionPrompt | null {
-  const questionMatch = paneText.match(/(?:^|\n)\s*(Do you want to [^\n]+\?)/);
-  if (!questionMatch) return null;
-
-  const afterQuestion = paneText.slice(
-    paneText.indexOf(questionMatch[1]) + questionMatch[1].length,
-  );
-  const optionRegex = /(?:❯\s*)?(\d+)\.\s+(.+)/g;
-  const options: NativePermissionPrompt["options"] = [];
-
-  let match: RegExpExecArray | null;
-  while ((match = optionRegex.exec(afterQuestion)) !== null) {
-    options.push({ number: match[1], label: match[2].trim() });
-  }
-
-  if (options.length === 0) return null;
-  return { question: questionMatch[1], options };
 }

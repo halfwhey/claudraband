@@ -140,8 +140,8 @@ export class Bridge implements Agent {
 
   shutdown(): void {
     for (const [sid, entry] of this.sessions) {
-      this.log.info("stopping session", sid);
-      entry.session.stop().catch(() => {});
+      this.log.info("detaching session", sid);
+      entry.session.detach().catch(() => {});
     }
     this.sessions.clear();
   }
@@ -387,7 +387,9 @@ export class Bridge implements Agent {
       content: block as unknown as ContentBlock,
     })) as ToolCallContent[];
 
-    const options: PermissionOption[] = request.options.map((option) => ({
+    const options: PermissionOption[] = request.options
+      .filter((option) => !option.textInput)
+      .map((option) => ({
       kind: option.kind,
       optionId: option.optionId,
       name: option.name,

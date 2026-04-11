@@ -1,4 +1,4 @@
-.PHONY: build build-lib build-cli test typecheck clean
+.PHONY: build build-lib build-cli test typecheck clean publish
 
 build: build-lib build-cli
 
@@ -18,3 +18,6 @@ typecheck:
 clean:
 	rm -rf packages/claudraband-core/dist
 	rm -rf packages/claudraband-cli/dist
+
+publish: build
+	cd packages/claudraband-cli && npm publish --access restricted

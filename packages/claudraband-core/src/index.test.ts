@@ -77,6 +77,14 @@ class FakeWrapper implements Wrapper {
   setPermissionMode(_mode: string): void {}
 
   async restart(): Promise<void> {}
+
+  async detach(): Promise<void> {
+    this.close();
+  }
+
+  isProcessAlive(): boolean {
+    return !this.done;
+  }
 }
 
 function ev(partial: Partial<Event> & { kind: EventKind }): Event {
@@ -201,7 +209,7 @@ describe("claudraband session runtime", () => {
     await session.stop();
   });
 
-  test("does not offer free-form AskUserQuestion responses unless enabled", () => {
+  test("does not include Type a response option for AskUserQuestion by default", () => {
     const question = {
       question: "What should I do?",
       header: "Claude has a question",
@@ -212,21 +220,33 @@ describe("claudraband session runtime", () => {
       ],
     };
 
-    const acpOptions = __test.buildAskUserQuestionOptions(question, false);
-    expect(acpOptions.map((option) => option.name)).toEqual([
+    const options = __test.buildAskUserQuestionOptions(question);
+    expect(options.map((option) => option.name)).toEqual([
       "Yes — Proceed",
       "No — Stop",
       "Cancel",
     ]);
-    expect(acpOptions.some((option) => option.textInput)).toBe(false);
+    expect(options.find((option) => option.textInput)).toBeUndefined();
+  });
 
-    const cliOptions = __test.buildAskUserQuestionOptions(question, true);
-    expect(cliOptions.map((option) => option.name)).toEqual([
+  test("includes Type a response option when enabled", () => {
+    const question = {
+      question: "What should I do?",
+      header: "Claude has a question",
+      multiSelect: false,
+      options: [
+        { label: "Yes", description: "Proceed" },
+        { label: "No", description: "Stop" },
+      ],
+    };
+
+    const options = __test.buildAskUserQuestionOptions(question, true);
+    expect(options.map((option) => option.name)).toEqual([
       "Yes — Proceed",
       "No — Stop",
       "Type a response",
       "Cancel",
     ]);
-    expect(cliOptions.find((option) => option.textInput)?.name).toBe("Type a response");
+    expect(options.find((option) => option.textInput)?.name).toBe("Type a response");
   });
 });

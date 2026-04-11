@@ -73,8 +73,42 @@ export class ClaudeWrapper implements Wrapper {
   async startResume(claudeSessionId: string, signal: AbortSignal): Promise<void> {
     this._claudeSessionId = claudeSessionId;
     this._signal = signal;
+
+    // Try to reattach to a still-running tmux window first.
+    const terminal = createTerminalHost({
+      backend: this.cfg.terminalBackend,
+      tmuxSessionName: this.cfg.tmuxSession,
+      tmuxWindowName: claudeSessionId,
+    });
+    const reattached = await terminal.reattach(claudeSessionId);
+
+    if (reattached) {
+      // The process is still alive in tmux. Just reconnect the tailer.
+      this.terminal = terminal;
+      this.abortController = new AbortController();
+      signal.addEventListener("abort", () => {
+        this.abortController?.abort();
+      });
+      const jsonlPath = sessionPath(this.cfg.workingDir, claudeSessionId);
+      let tailOffset = 0;
+      if (existsSync(jsonlPath)) {
+        tailOffset = statSync(jsonlPath).size;
+      }
+      this.tailer = new Tailer(jsonlPath, tailOffset);
+      this.eventIterable = this.tailer.events();
+
+      const ac = this.abortController;
+      const tailer = this.tailer;
+      const term = this.terminal;
+      ac.signal.addEventListener("abort", async () => {
+        tailer.close();
+        await term?.stop().catch(() => {});
+      }, { once: true });
+      return;
+    }
+
+    // No live process -- spawn a new Claude Code with --resume.
     const jsonlPath = sessionPath(this.cfg.workingDir, claudeSessionId);
-    // Capture current file size so the tailer skips already-replayed history.
     let tailOffset = 0;
     if (existsSync(jsonlPath)) {
       tailOffset = statSync(jsonlPath).size;
@@ -186,6 +220,46 @@ export class ClaudeWrapper implements Wrapper {
     if (this.terminal) {
       await this.terminal.stop();
     }
+  }
+
+  /** Disconnect without killing the process. The terminal stays alive. */
+  async detach(): Promise<void> {
+    this.tailer?.close();
+    this.tailer = null;
+    this.eventIterable = null;
+    if (this.terminal) {
+      await this.terminal.detach();
+    }
+    this.terminal = null;
+  }
+
+  /** Check if the underlying terminal process is still running. */
+  isProcessAlive(): boolean {
+    return this.terminal !== null && this.terminal.alive();
+  }
+
+  /**
+   * Check if a Claude Code session has a live process without attaching.
+   * Only meaningful for tmux backend -- xterm processes can't outlive the CLI.
+   */
+  static async hasLiveProcess(
+    tmuxSessionName: string,
+    claudeSessionId: string,
+  ): Promise<boolean> {
+    const { Session } = await import("../tmuxctl");
+    const found = await Session.find(tmuxSessionName, claudeSessionId);
+    return found !== null;
+  }
+
+  static async stopLiveProcess(
+    tmuxSessionName: string,
+    claudeSessionId: string,
+  ): Promise<boolean> {
+    const { Session } = await import("../tmuxctl");
+    const found = await Session.find(tmuxSessionName, claudeSessionId);
+    if (!found) return false;
+    await found.kill();
+    return true;
   }
 
   async send(input: string): Promise<void> {
