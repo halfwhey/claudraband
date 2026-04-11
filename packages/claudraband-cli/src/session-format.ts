@@ -11,6 +11,8 @@ export function formatLocalSessionLine(session: SessionSummary): string {
   return [
     session.sessionId,
     `status=${session.alive ? "live" : "saved"}`,
+    `backend=${session.backend}`,
+    `cwd=${session.cwd}`,
     date,
     session.title ?? "(untitled)",
   ].filter(Boolean).join("  ");
@@ -58,21 +60,21 @@ function formatGroupedSessionLines<T>(
     const leftLive = isLive(left);
     const rightLive = isLive(right);
     if (leftLive !== rightLive) {
-      return leftLive ? 1 : -1;
+      return leftLive ? -1 : 1;
     }
     return compare(left, right);
   });
 
   const lines: string[] = [];
   let sawLive = false;
+  let insertedSeparator = false;
   for (const session of sorted) {
     const live = isLive(session);
-    if (live && !sawLive && lines.length > 0) {
+    if (!live && sawLive && !insertedSeparator && lines.length > 0) {
       lines.push("");
-      sawLive = true;
-    } else if (live) {
-      sawLive = true;
+      insertedSeparator = true;
     }
+    if (live) sawLive = true;
     lines.push(format(session));
   }
   return lines;

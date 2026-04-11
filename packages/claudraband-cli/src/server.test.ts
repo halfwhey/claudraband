@@ -7,7 +7,7 @@ function makeConfig(overrides: Partial<CliConfig> = {}): CliConfig {
     command: "serve",
     prompt: "",
     sessionId: "",
-    globalSessions: false,
+    allSessions: false,
     cwd: "/daemon-cwd",
     hasExplicitCwd: false,
     debug: false,

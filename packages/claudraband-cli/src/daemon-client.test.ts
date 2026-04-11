@@ -7,7 +7,7 @@ function makeConfig(overrides: Partial<CliConfig> = {}): CliConfig {
     command: "prompt",
     prompt: "",
     sessionId: "",
-    globalSessions: false,
+    allSessions: false,
     cwd: "/repo",
     hasExplicitCwd: false,
     debug: false,

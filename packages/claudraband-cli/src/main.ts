@@ -177,6 +177,7 @@ async function closeLocalSessions(
   terminalBackend: "auto" | "tmux" | "xterm",
   logger: ClaudrabandLogger,
   sessionId: string,
+  closeAll: boolean,
 ): Promise<void> {
   const runtime = createClaudraband({ logger, terminalBackend });
 
@@ -201,6 +202,9 @@ async function closeLocalSessions(
   }
 
   for (const session of liveSessions) {
+    if (!closeAll && cwd === undefined) {
+      continue;
+    }
     if (await runtime.closeSession(session.sessionId)) {
       process.stderr.write(`session ${session.sessionId} closed\n`);
     }
@@ -246,7 +250,7 @@ export async function runCli(argv: string[] = process.argv.slice(2)): Promise<vo
   const renderer = new Renderer();
   const logger = makeLogger(config.debug);
 
-  // --- server mode: delegate everything to daemon ---
+  // --- server mode: delegate all commands to daemon ---
   if (config.server) {
     const { runWithDaemon } = await import("./daemon-client");
     await runWithDaemon(config, renderer, logger);
@@ -255,7 +259,7 @@ export async function runCli(argv: string[] = process.argv.slice(2)): Promise<vo
 
   if (config.command === "sessions") {
     await listSessions(
-      config.globalSessions ? undefined : config.cwd,
+      config.hasExplicitCwd ? config.cwd : undefined,
       config.terminalBackend,
       logger,
     );
@@ -264,10 +268,11 @@ export async function runCli(argv: string[] = process.argv.slice(2)): Promise<vo
 
   if (config.command === "session-close") {
     await closeLocalSessions(
-      config.globalSessions ? undefined : config.cwd,
+      config.hasExplicitCwd ? config.cwd : undefined,
       config.terminalBackend,
       logger,
       config.sessionId,
+      config.allSessions,
     );
     return;
   }
@@ -323,7 +328,7 @@ export async function runCli(argv: string[] = process.argv.slice(2)): Promise<vo
     // --select only works against a live persistent session.
     if (config.select && config.sessionId) {
       const existing = await runtime.inspectSession(config.sessionId, config.cwd);
-      if (!existing?.reattachable) {
+      if (!existing || existing.owner.kind !== "local" || existing.backend !== "tmux") {
         process.stderr.write(
           "error: local --select requires a live tmux session. Use --server for daemon-backed xterm sessions.\n",
         );

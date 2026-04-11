@@ -30,6 +30,7 @@ export interface TerminalHost {
   interrupt(): Promise<void>;
   capture(): Promise<string>;
   alive(): boolean;
+  processId(): Promise<number | undefined>;
 }
 
 export interface CreateTerminalHostOptions {
@@ -47,6 +48,7 @@ export interface LiveTerminalSessionSummary {
   sessionId: string;
   cwd?: string;
   updatedAt?: string;
+  pid?: number;
 }
 
 export interface TerminalBackendDriver {
@@ -71,6 +73,7 @@ interface PtyTransport {
   stop(): Promise<void>;
   write(data: string): void;
   alive(): boolean;
+  pid(): number | undefined;
 }
 
 function getModuleExports<T>(mod: T): T {
@@ -151,6 +154,7 @@ class TmuxTerminalBackendDriver implements TerminalBackendDriver {
       sessionId: window.windowName,
       cwd: window.paneCurrentPath,
       updatedAt: parseTmuxActivity(window.windowActivity),
+      pid: window.panePid,
     }));
   }
 
@@ -259,6 +263,11 @@ class TmuxTerminalHost implements TerminalHost {
 
   alive(): boolean {
     return this.session !== null && this.session.isAlive;
+  }
+
+  async processId(): Promise<number | undefined> {
+    if (!this.session) return undefined;
+    return this.session.panePID().catch(() => undefined);
   }
 }
 
@@ -377,6 +386,10 @@ class XtermTerminalHost implements TerminalHost {
   alive(): boolean {
     return this.transport !== null && this.transport.alive() && !this.exited;
   }
+
+  async processId(): Promise<number | undefined> {
+    return this.transport?.pid();
+  }
 }
 
 async function createPtyTransport(): Promise<PtyTransport> {
@@ -448,6 +461,10 @@ class NodePtyTransport implements PtyTransport {
 
   alive(): boolean {
     return this.pty !== null && this.aliveFlag;
+  }
+
+  pid(): number | undefined {
+    return this.pty?.pid;
   }
 }
 
@@ -526,6 +543,10 @@ class BunTerminalTransport implements PtyTransport {
 
   alive(): boolean {
     return this.terminal !== null && !this.terminal.closed && this.aliveFlag;
+  }
+
+  pid(): number | undefined {
+    return (this.process as { pid?: number } | null)?.pid;
   }
 }
 

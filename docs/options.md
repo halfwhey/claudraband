@@ -20,19 +20,19 @@ Answers a pending question in a live session by selecting option `n`.
 
 ### `claudraband sessions`
 
-Lists known resumable sessions. Local mode shows on-disk sessions for the current repo by default. Use `--global` to list local sessions across every cwd. `--server` lists daemon-managed live sessions instead.
+Lists tracked sessions from the canonical registry in `~/.claudraband/`. Use `--cwd <dir>` to filter by working directory.
 
 ### `claudraband sessions close <id>`
 
 Stops a live local session by session ID.
 
-### `claudraband sessions close --global`
+### `claudraband sessions close --all`
 
-Stops all live local sessions across every cwd.
+Stops every live tracked session, regardless of backend.
 
 ### `claudraband sessions close --cwd <dir>`
 
-Stops all live local sessions for the given cwd.
+Stops all live tracked sessions for the given cwd.
 
 ### `claudraband --acp`
 
@@ -50,7 +50,7 @@ Starts the daemon used for persistent headless `xterm` sessions.
 | `-s`, `--session <id>` | string | empty | Target an existing session |
 | `-i`, `--interactive` | flag | `false` | Run REPL mode |
 | `--select <n>` | string | empty | Auto-select option `n` for a pending question; requires `--session` |
-| `--global` | flag | `false` | Use all local sessions across every cwd for `sessions` commands |
+| `--all` | flag | `false` | Close every live tracked session for `sessions close` |
 | `--acp` | flag | `false` | Run as ACP server over stdio |
 | `--cwd <dir>` | string | current working directory | Working directory for new/resumed sessions |
 | `-c`, `--claude <flags>` | string | empty | Claude CLI flags passed through after parsing known model and permission flags |
@@ -92,7 +92,7 @@ Starts the daemon used for persistent headless `xterm` sessions.
 
 ### `serve`
 
-The daemon intentionally forces `xterm` mode and keeps sessions alive in-process. This is the mode to use when you want reconnectable headless sessions without depending on `tmux`.
+The daemon keeps sessions alive in-process and records them in the same `~/.claudraband/` registry as local sessions. It defaults to `xterm` unless `--terminal-backend` is explicitly provided.
 
 ### `--server <host:port>`
 
@@ -133,7 +133,9 @@ Creates a runtime with these top-level options:
 |--------|-------------|
 | `startSession(options?)` | Start a new Claude Code session |
 | `resumeSession(sessionId, options?)` | Resume an existing Claude session ID |
-| `listSessions(cwd?)` | Discover resumable sessions |
+| `listSessions(cwd?)` | Read tracked sessions from the canonical registry |
+| `inspectSession(sessionId, cwd?)` | Inspect one tracked session record |
+| `closeSession(sessionId)` | Close a tracked live session through its recorded owner |
 | `replaySession(sessionId, cwd)` | Replay parsed event history from a session transcript |
 
 ### Session methods

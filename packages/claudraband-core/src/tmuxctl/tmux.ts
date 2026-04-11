@@ -6,6 +6,7 @@ export interface TmuxWindowSummary {
   windowName: string;
   paneCurrentPath?: string;
   windowActivity?: string;
+  panePid?: number;
 }
 
 async function tmux(...args: string[]): Promise<{ stdout: string; stderr: string }> {
@@ -69,7 +70,7 @@ export async function listWindows(name: string): Promise<TmuxWindowSummary[]> {
     "-t",
     name,
     "-F",
-    "#{window_id}\t#{pane_id}\t#{window_name}\t#{pane_current_path}\t#{window_activity}",
+    "#{window_id}\t#{pane_id}\t#{window_name}\t#{pane_current_path}\t#{window_activity}\t#{pane_pid}",
   );
 
   return result.stdout
@@ -77,14 +78,21 @@ export async function listWindows(name: string): Promise<TmuxWindowSummary[]> {
     .split("\n")
     .filter(Boolean)
     .map((line) => {
-      const [windowId, paneId, windowName, paneCurrentPath, windowActivity] =
-        line.split("\t", 5);
+      const [
+        windowId,
+        paneId,
+        windowName,
+        paneCurrentPath,
+        windowActivity,
+        panePid,
+      ] = line.split("\t", 6);
       return {
         windowId,
         paneId,
         windowName,
         paneCurrentPath: paneCurrentPath || undefined,
         windowActivity: windowActivity || undefined,
+        panePid: panePid ? parseInt(panePid, 10) : undefined,
       };
     })
     .filter((window) => window.windowId && window.paneId && window.windowName);

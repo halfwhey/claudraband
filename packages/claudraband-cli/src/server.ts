@@ -1,4 +1,5 @@
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
+import { randomUUID } from "node:crypto";
 import {
   createClaudraband,
   type ClaudrabandEvent,
@@ -54,6 +55,8 @@ function resolveServerTerminalBackend(config: CliConfig): CliConfig["terminalBac
 }
 
 export async function startServer(config: CliConfig): Promise<void> {
+  const serverInstanceId = randomUUID();
+  const serverUrl = `http://127.0.0.1:${config.port}`;
   const logger: ClaudrabandLogger = {
     info: (msg, ...args) => process.stderr.write(`info: ${msg} ${args.join(" ")}\n`),
     debug: (msg, ...args) => {
@@ -138,6 +141,12 @@ export async function startServer(config: CliConfig): Promise<void> {
           permissionMode: sessionConfig.permissionMode as typeof config.permissionMode,
           allowTextResponses: true,
           logger,
+          sessionOwner: {
+            kind: "daemon",
+            serverUrl,
+            serverPid: process.pid,
+            serverInstanceId,
+          },
           onPermissionRequest: (request) =>
             handlePermission(ds, request),
         });
@@ -211,6 +220,12 @@ export async function startServer(config: CliConfig): Promise<void> {
           permissionMode: sessionConfig.permissionMode as typeof config.permissionMode,
           allowTextResponses: true,
           logger,
+          sessionOwner: {
+            kind: "daemon",
+            serverUrl,
+            serverPid: process.pid,
+            serverInstanceId,
+          },
           onPermissionRequest: (request) =>
             handlePermission(newDs, request),
         });
@@ -351,7 +366,10 @@ export async function startServer(config: CliConfig): Promise<void> {
   });
 
   server.listen(config.port, () => {
-    logger.info(`claudraband daemon listening on port ${config.port}`);
+    logger.info(
+      `claudraband daemon listening on port ${config.port}`,
+      `instance=${serverInstanceId}`,
+    );
   });
 
   await new Promise<void>((resolve) => {

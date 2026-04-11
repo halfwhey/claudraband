@@ -1,5 +1,9 @@
-import { describe, expect, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { randomUUID } from "node:crypto";
+import { createServer } from "node:http";
+import { mkdtemp, mkdir, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { createClaudraband, EventKind, __test } from "./index";
 import { Session } from "./tmuxctl";
 import type { Event } from "./wrap/event";
@@ -82,6 +86,10 @@ class FakeSessionWrapper {
     return !this.closed;
   }
 
+  async processId(): Promise<number | undefined> {
+    return 1234;
+  }
+
   protected emit(event: Event): void {
     const resolver = this.resolvers.shift();
     if (resolver) {
@@ -115,6 +123,24 @@ class PromptLifecycleWrapper extends FakeSessionWrapper {
 }
 
 describe("session discovery", () => {
+  let previousRegistryHome: string | undefined;
+  let registryHome: string;
+
+  beforeEach(async () => {
+    previousRegistryHome = process.env.CLAUDRABAND_HOME;
+    registryHome = await mkdtemp(join(tmpdir(), "claudraband-registry-"));
+    process.env.CLAUDRABAND_HOME = registryHome;
+  });
+
+  afterEach(async () => {
+    if (previousRegistryHome === undefined) {
+      delete process.env.CLAUDRABAND_HOME;
+    } else {
+      process.env.CLAUDRABAND_HOME = previousRegistryHome;
+    }
+    await rm(registryHome, { recursive: true, force: true });
+  });
+
   test("lists live tmux sessions before their jsonl file exists", async () => {
     const sessionId = randomUUID();
     let session: Session | undefined;
@@ -173,9 +199,81 @@ describe("session discovery", () => {
     try {
       const closed = await runtime.closeSession(sessionId);
       expect(closed).toBe(true);
-      expect(await runtime.inspectSession(sessionId, "/tmp")).toBeNull();
+      expect((await runtime.inspectSession(sessionId, "/tmp"))?.alive).toBe(false);
     } finally {
       await session?.kill().catch(() => {});
+    }
+  });
+
+  test("lists and closes daemon-owned sessions through the canonical registry", async () => {
+    const sessionId = randomUUID();
+    const deleted: string[] = [];
+    let alive = true;
+    const server = createServer((req, res) => {
+      if (req.method === "GET" && req.url === "/sessions") {
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({
+          sessions: alive ? [{ sessionId, alive: true }] : [],
+        }));
+        return;
+      }
+      if (req.method === "DELETE" && req.url === `/sessions/${sessionId}`) {
+        deleted.push(sessionId);
+        alive = false;
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ ok: true }));
+        return;
+      }
+      res.writeHead(404).end();
+    });
+
+    try {
+      await new Promise<void>((resolve) => server.listen(0, resolve));
+      const address = server.address();
+      if (!address || typeof address === "string") {
+        throw new Error("expected TCP server address");
+      }
+
+      const recordDir = join(registryHome, "sessions");
+      await mkdir(recordDir, { recursive: true });
+      await writeFile(
+        join(recordDir, `${sessionId}.json`),
+        JSON.stringify({
+          version: 1,
+          sessionId,
+          cwd: "/repo",
+          backend: "xterm",
+          title: "daemon session",
+          createdAt: "2026-04-12T00:00:00.000Z",
+          updatedAt: "2026-04-12T00:00:00.000Z",
+          lastKnownAlive: true,
+          reattachable: true,
+          owner: {
+            kind: "daemon",
+            serverUrl: `http://127.0.0.1:${address.port}`,
+            serverPid: process.pid,
+            serverInstanceId: "daemon-test",
+          },
+        }),
+      );
+
+      const runtime = createClaudraband();
+      const sessions = await runtime.listSessions();
+      const found = sessions.find((session) => session.sessionId === sessionId);
+      expect(found?.owner.kind).toBe("daemon");
+      expect(found?.alive).toBe(true);
+
+      const closed = await runtime.closeSession(sessionId);
+      expect(closed).toBe(true);
+      expect(deleted).toEqual([sessionId]);
+      expect((await runtime.inspectSession(sessionId))?.alive).toBe(false);
+    } finally {
+      await new Promise<void>((resolve, reject) =>
+        server.close((err) => (err ? reject(err) : resolve())),
+      );
+      await rm(join(registryHome, "sessions", `${sessionId}.json`), {
+        force: true,
+      });
     }
   });
 

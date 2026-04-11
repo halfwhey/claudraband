@@ -57,16 +57,16 @@ claudraband "audit the last commit and tell me what looks risky"
 # interactive REPL
 claudraband -i
 
-# list resumable sessions
+# list all tracked sessions
 claudraband sessions
 
-# list local sessions across every cwd
-claudraband sessions --global
+# filter tracked sessions by cwd
+claudraband sessions --cwd /my/project
 
-# close live local sessions across every cwd
-claudraband sessions close --global
+# close every live tracked session
+claudraband sessions close --all
 
-# close live local sessions for one cwd
+# close live tracked sessions for one cwd
 claudraband sessions close --cwd /my/project
 
 # resume a session
@@ -125,7 +125,8 @@ Same basic idea, but through ACP inside Zed.
 ```sh
 claudraband "review the staged diff"
 claudraband sessions
-claudraband sessions --global
+claudraband sessions --cwd /my/project
+claudraband sessions close --all
 claudraband sessions close --cwd /my/project
 claudraband -s <session-id> "keep going"
 ```
@@ -145,6 +146,8 @@ claudraband --terminal-backend xterm -c "--dangerously-skip-permissions" "run wi
 ```
 
 ## Session behavior
+
+All sessions are tracked in `~/.claudraband/`, regardless of backend. Session management commands read that registry, so `claudraband sessions` shows the canonical session view and `claudraband sessions close ...` routes each close request through the recorded owner metadata.
 
 - CLI + `tmux`: sessions stay alive as long as the local tmux-hosted Claude process stays alive
 - CLI + local `xterm`: sessions are not truly persistent; resume works by starting `claude --resume <id>`

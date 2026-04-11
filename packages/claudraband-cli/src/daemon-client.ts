@@ -383,12 +383,12 @@ export async function runWithDaemon(
 
   if (config.command === "session-close") {
     if (!config.sessionId) {
-      if (config.hasExplicitCwd) {
-        process.stderr.write(
-          "error: daemon session management does not support --cwd. Use --global or a session ID.\n",
-        );
-        process.exit(1);
-      }
+        if (config.hasExplicitCwd) {
+          process.stderr.write(
+            "error: daemon session management does not support --cwd. Use --all or a session ID.\n",
+          );
+          process.exit(1);
+        }
       const result = (await daemonGet(config.server, "/sessions")) as {
         sessions: Array<{ sessionId: string; alive: boolean; hasPendingPermission: boolean }>;
       };

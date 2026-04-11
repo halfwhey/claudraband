@@ -278,6 +278,10 @@ export class ClaudeWrapper implements Wrapper {
     return this.terminal.capture();
   }
 
+  async processId(): Promise<number | undefined> {
+    return this.terminal?.processId();
+  }
+
   alive(): boolean {
     return this.terminal !== null && this.terminal.alive();
   }

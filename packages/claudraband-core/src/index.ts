@@ -1,6 +1,7 @@
 import { open, readdir, readFile, stat } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join } from "node:path";
+import { request as httpRequest } from "node:http";
 import {
   ClaudeWrapper,
   hasPendingNativePrompt,
@@ -20,6 +21,15 @@ import {
 import type { Event as ClaudrabandEvent } from "./wrap/event";
 import { EventKind } from "./wrap/event";
 import type { Wrapper } from "./wrap/wrapper";
+import {
+  isPidAlive,
+  listSessionRecords,
+  normalizeServerUrl,
+  readSessionRecord,
+  type SessionOwnerRecord,
+  type SessionRecord,
+  writeSessionRecord,
+} from "./session-registry";
 
 const DEFAULT_PANE_WIDTH = 120;
 const DEFAULT_PANE_HEIGHT = 40;
@@ -35,6 +45,7 @@ export { sessionPath };
 export type { ClaudrabandEvent };
 export type { TerminalBackend };
 export type { ResolvedTerminalBackend };
+export type { SessionOwnerRecord };
 
 const SHARED_TMUX_SESSION_NAME = "claudraband-working-session";
 
@@ -118,16 +129,19 @@ export interface ClaudrabandOptions {
   onPermissionRequest?: (
     request: ClaudrabandPermissionRequest,
   ) => Promise<ClaudrabandPermissionDecision>;
+  sessionOwner?: SessionOwnerRecord;
 }
 
 export interface SessionSummary {
   sessionId: string;
   cwd: string;
   title?: string;
+  createdAt: string;
   updatedAt?: string;
   backend: ResolvedTerminalBackend;
   alive: boolean;
   reattachable: boolean;
+  owner: SessionOwnerRecord;
 }
 
 export interface PromptResult {
@@ -265,8 +279,9 @@ function makeDefaultLogger(): ClaudrabandLogger {
 function normalizeOptions(
   defaults: ClaudrabandOptions,
   options: ClaudrabandOptions | undefined,
-): Required<Omit<ClaudrabandOptions, "onPermissionRequest">> & {
+): Required<Omit<ClaudrabandOptions, "onPermissionRequest" | "sessionOwner">> & {
   onPermissionRequest?: ClaudrabandOptions["onPermissionRequest"];
+  sessionOwner?: ClaudrabandOptions["sessionOwner"];
 } {
   const parsedClaudeArgs = parseClaudeArgs(
     options?.claudeArgs ?? defaults.claudeArgs ?? [],
@@ -295,6 +310,11 @@ function normalizeOptions(
     logger: options?.logger ?? defaults.logger ?? makeDefaultLogger(),
     onPermissionRequest:
       options?.onPermissionRequest ?? defaults.onPermissionRequest,
+    ...(
+      options?.sessionOwner ?? defaults.sessionOwner
+        ? { sessionOwner: options?.sessionOwner ?? defaults.sessionOwner }
+        : {}
+    ),
   };
 }
 
@@ -326,7 +346,7 @@ class ClaudrabandRuntime implements Claudraband {
     });
     const lifetime = new AbortController();
     await wrapper.start(lifetime.signal);
-    return new ClaudrabandSessionImpl(
+    const session = new ClaudrabandSessionImpl(
       wrapper,
       wrapper.claudeSessionId,
       cfg.cwd,
@@ -337,7 +357,10 @@ class ClaudrabandRuntime implements Claudraband {
       cfg.logger,
       cfg.onPermissionRequest,
       lifetime,
+      cfg.sessionOwner,
     );
+    await session.syncSessionRecord();
+    return session;
   }
 
   async resumeSession(
@@ -358,7 +381,7 @@ class ClaudrabandRuntime implements Claudraband {
     });
     const lifetime = new AbortController();
     await wrapper.startResume(sessionId, lifetime.signal);
-    return new ClaudrabandSessionImpl(
+    const session = new ClaudrabandSessionImpl(
       wrapper,
       sessionId,
       cfg.cwd,
@@ -369,19 +392,22 @@ class ClaudrabandRuntime implements Claudraband {
       cfg.logger,
       cfg.onPermissionRequest,
       lifetime,
+      cfg.sessionOwner,
     );
+    await session.syncSessionRecord();
+    return session;
   }
 
   listSessions(cwd?: string): Promise<SessionSummary[]> {
-    return discoverSessions(this.resolveBackendDriver(), cwd);
+    return discoverSessions(cwd);
   }
 
   inspectSession(sessionId: string, cwd?: string): Promise<SessionSummary | null> {
-    return inspectSession(this.resolveBackendDriver(), sessionId, cwd);
+    return inspectSession(sessionId, cwd);
   }
 
   closeSession(sessionId: string): Promise<boolean> {
-    return this.resolveBackendDriver().closeLiveSession(sessionId);
+    return closeSessionByRecord(sessionId);
   }
 
   async replaySession(
@@ -402,14 +428,6 @@ class ClaudrabandRuntime implements Claudraband {
     }
     return events;
   }
-
-  private resolveBackendDriver() {
-    const cfg = normalizeOptions(this.defaults, undefined);
-    return createTerminalBackendDriver({
-      backend: cfg.terminalBackend,
-      tmuxSessionName: SHARED_TMUX_SESSION,
-    });
-  }
 }
 
 interface SessionWrapper extends Wrapper {
@@ -419,6 +437,7 @@ interface SessionWrapper extends Wrapper {
   restart(): Promise<void>;
   detach(): Promise<void>;
   isProcessAlive(): boolean;
+  processId(): Promise<number | undefined>;
 }
 
 class ClaudrabandSessionImpl implements ClaudrabandSession {
@@ -436,6 +455,7 @@ class ClaudrabandSessionImpl implements ClaudrabandSession {
   private _model: string;
   private _permissionMode: PermissionMode;
   private allowTextResponses: boolean;
+  private sessionOwner?: SessionOwnerRecord;
 
   constructor(
     wrapper: SessionWrapper,
@@ -448,6 +468,7 @@ class ClaudrabandSessionImpl implements ClaudrabandSession {
     logger: ClaudrabandLogger,
     onPermissionRequest: ClaudrabandOptions["onPermissionRequest"],
     lifetime: AbortController,
+    sessionOwner?: SessionOwnerRecord,
   ) {
     this.wrapper = wrapper;
     this._model = model;
@@ -456,6 +477,7 @@ class ClaudrabandSessionImpl implements ClaudrabandSession {
     this.logger = logger;
     this.onPermissionRequest = onPermissionRequest;
     this.lifetime = lifetime;
+    this.sessionOwner = sessionOwner;
     this.pumpPromise = this.pumpEvents();
   }
 
@@ -589,6 +611,7 @@ class ClaudrabandSessionImpl implements ClaudrabandSession {
     await this.wrapper.stop().catch(() => {});
     await this.pumpPromise.catch(() => {});
     this.closeSubscribers();
+    await this.syncSessionRecord(false);
   }
 
   async detach(): Promise<void> {
@@ -597,6 +620,7 @@ class ClaudrabandSessionImpl implements ClaudrabandSession {
     await this.wrapper.detach();
     await this.pumpPromise.catch(() => {});
     this.closeSubscribers();
+    await this.syncSessionRecord();
   }
 
   isProcessAlive(): boolean {
@@ -605,6 +629,40 @@ class ClaudrabandSessionImpl implements ClaudrabandSession {
 
   capturePane(): Promise<string> {
     return this.wrapper.capturePane();
+  }
+
+  async syncSessionRecord(alive = this.isProcessAlive()): Promise<void> {
+    const existing = await readSessionRecord(this.sessionId);
+    const transcriptPath = sessionPath(this.cwd, this.sessionId);
+    const now = new Date().toISOString();
+    const owner = await this.resolveSessionOwner();
+    await writeSessionRecord({
+      version: 1,
+      sessionId: this.sessionId,
+      cwd: this.cwd,
+      backend: this.backend,
+      title: existing?.title ?? await extractSessionTitle(transcriptPath) ?? undefined,
+      createdAt: existing?.createdAt ?? now,
+      updatedAt: now,
+      lastKnownAlive: alive,
+      reattachable: alive && this.supportsReconnect(owner),
+      transcriptPath,
+      owner,
+    });
+  }
+
+  private async resolveSessionOwner(): Promise<SessionOwnerRecord> {
+    if (this.sessionOwner?.kind === "daemon") {
+      return this.sessionOwner;
+    }
+    return {
+      kind: "local",
+      pid: await this.wrapper.processId().catch(() => undefined),
+    };
+  }
+
+  private supportsReconnect(owner: SessionOwnerRecord): boolean {
+    return owner.kind === "daemon" || this.backend === "tmux";
   }
 
   async hasPendingInput(): Promise<{ pending: boolean; source: "none" | "terminal" }> {
@@ -630,6 +688,7 @@ class ClaudrabandSessionImpl implements ClaudrabandSession {
     this._permissionMode = mode;
     this.wrapper.setPermissionMode(mode);
     await this.wrapper.restart();
+    await this.syncSessionRecord();
   }
 
   async *events(): AsyncGenerator<ClaudrabandEvent> {
@@ -1048,10 +1107,100 @@ function buildAskUserQuestionOptions(
   ];
 }
 
-async function discoverSessions(
-  backendDriver: TerminalBackendDriver,
-  cwdFilter?: string,
-): Promise<SessionSummary[]> {
+async function discoverSessions(cwdFilter?: string): Promise<SessionSummary[]> {
+  await backfillLegacyLocalSessions(cwdFilter);
+  const records = await listSessionRecords();
+  const refreshed = await refreshSessionRecords(records);
+  return refreshed
+    .filter((record) => !cwdFilter || record.cwd === cwdFilter)
+    .map(sessionRecordToSummary)
+    .sort((left, right) =>
+      Number(right.alive) - Number(left.alive) ||
+      (right.updatedAt ?? "").localeCompare(left.updatedAt ?? "") ||
+      left.sessionId.localeCompare(right.sessionId),
+    );
+}
+
+async function inspectSession(
+  sessionId: string,
+  cwd?: string,
+): Promise<SessionSummary | null> {
+  await backfillLegacyLocalSessions(cwd);
+  const record = await readSessionRecord(sessionId);
+  if (!record) return null;
+  if (cwd && record.cwd !== cwd) return null;
+  const refreshed = await refreshSessionRecords([record]);
+  return refreshed[0] ? sessionRecordToSummary(refreshed[0]) : null;
+}
+
+async function closeSessionByRecord(sessionId: string): Promise<boolean> {
+  await backfillLegacyLocalSessions();
+  const record = await readSessionRecord(sessionId);
+  if (!record) return false;
+
+  const [refreshed] = await refreshSessionRecords([record]);
+  if (!refreshed?.lastKnownAlive) {
+    return false;
+  }
+
+  let closed = false;
+  if (refreshed.owner.kind === "daemon") {
+    closed = await closeDaemonSession(refreshed.owner.serverUrl, refreshed.sessionId);
+  } else if (refreshed.backend === "tmux") {
+    closed = await createTerminalBackendDriver({
+      backend: "tmux",
+      tmuxSessionName: SHARED_TMUX_SESSION,
+    }).closeLiveSession(refreshed.sessionId);
+  } else if (isPidAlive(refreshed.owner.pid)) {
+    try {
+      process.kill(refreshed.owner.pid!);
+      closed = true;
+    } catch {
+      closed = false;
+    }
+  }
+
+  if (closed) {
+    await writeSessionRecord({
+      ...refreshed,
+      lastKnownAlive: false,
+      reattachable: false,
+      updatedAt: new Date().toISOString(),
+    });
+  }
+
+  return closed;
+}
+
+async function backfillLegacyLocalSessions(cwdFilter?: string): Promise<void> {
+  const discovered = await discoverLegacyLocalSessions(cwdFilter);
+  for (const session of discovered) {
+    const existing = await readSessionRecord(session.sessionId);
+    const transcriptPath = sessionPath(session.cwd, session.sessionId);
+    await writeSessionRecord({
+      version: 1,
+      sessionId: session.sessionId,
+      cwd: session.cwd,
+      backend: session.backend,
+      title: existing?.title ?? session.title,
+      createdAt: existing?.createdAt ?? session.createdAt,
+      updatedAt: session.updatedAt ?? existing?.updatedAt ?? session.createdAt,
+      lastKnownAlive: session.alive,
+      reattachable: session.reattachable,
+      transcriptPath,
+      owner: {
+        kind: "local",
+        pid: session.owner.kind === "local" ? session.owner.pid : undefined,
+      },
+    });
+  }
+}
+
+async function discoverLegacyLocalSessions(cwdFilter?: string): Promise<SessionSummary[]> {
+  const backendDriver = createTerminalBackendDriver({
+    backend: "tmux",
+    tmuxSessionName: SHARED_TMUX_SESSION,
+  });
   const projectsDir = join(homedir(), ".claude", "projects");
   const cwdDirs: { dir: string; cwd: string }[] = [];
 
@@ -1087,13 +1236,7 @@ async function discoverSessions(
     for (const file of files) {
       if (!file.endsWith(".jsonl")) continue;
       const sessionId = file.replace(/\.jsonl$/, "");
-      if (
-        !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(
-          sessionId,
-        )
-      ) {
-        continue;
-      }
+      if (!isSessionId(sessionId)) continue;
 
       const filePath = join(dir, file);
       try {
@@ -1103,10 +1246,12 @@ async function discoverSessions(
           sessionId,
           cwd,
           title: (await extractSessionTitle(filePath)) ?? undefined,
+          createdAt: fileStat.birthtime.toISOString(),
           updatedAt: fileStat.mtime.toISOString(),
-          backend: backendDriver.backend,
+          backend: "tmux",
           alive: false,
-          reattachable: backendDriver.supportsLiveReconnect(),
+          reattachable: false,
+          owner: { kind: "local" },
         });
       } catch {
         continue;
@@ -1114,36 +1259,21 @@ async function discoverSessions(
     }
   }
 
-  for (const session of await discoverLiveSessions(backendDriver, cwdFilter)) {
-    const existing = results.get(session.sessionId);
-    results.set(
-      session.sessionId,
-      existing
-        ? {
-            ...existing,
-            ...session,
-            title: existing.title ?? session.title,
-            updatedAt: existing.updatedAt ?? session.updatedAt,
-          }
-        : session,
-    );
+  for (const window of await discoverLegacyLiveSessions(backendDriver, cwdFilter)) {
+    const existing = results.get(window.sessionId);
+    results.set(window.sessionId, existing ? {
+      ...existing,
+      ...window,
+      createdAt: existing.createdAt,
+      title: existing.title ?? window.title,
+      updatedAt: existing.updatedAt ?? window.updatedAt,
+    } : window);
   }
 
-  return [...results.values()].sort((a, b) =>
-    (b.updatedAt ?? "").localeCompare(a.updatedAt ?? ""),
-  );
+  return [...results.values()];
 }
 
-async function inspectSession(
-  backendDriver: TerminalBackendDriver,
-  sessionId: string,
-  cwd?: string,
-): Promise<SessionSummary | null> {
-  const sessions = await discoverSessions(backendDriver, cwd);
-  return sessions.find((session) => session.sessionId === sessionId) ?? null;
-}
-
-async function discoverLiveSessions(
+async function discoverLegacyLiveSessions(
   backendDriver: TerminalBackendDriver,
   cwdFilter?: string,
 ): Promise<SessionSummary[]> {
@@ -1152,26 +1282,21 @@ async function discoverLiveSessions(
     const results: SessionSummary[] = [];
 
     for (const window of windows) {
-      const sessionId = window.sessionId;
-      if (
-        !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(
-          sessionId,
-        )
-      ) {
-        continue;
-      }
-
-      const cwd = window.cwd;
-      if (!cwd) continue;
-      if (cwdFilter && cwd !== cwdFilter) continue;
-
+      if (!isSessionId(window.sessionId)) continue;
+      if (!window.cwd) continue;
+      if (cwdFilter && window.cwd !== cwdFilter) continue;
       results.push({
-        sessionId,
-        cwd,
+        sessionId: window.sessionId,
+        cwd: window.cwd,
+        createdAt: window.updatedAt ?? new Date().toISOString(),
         updatedAt: window.updatedAt,
         backend: backendDriver.backend,
         alive: true,
         reattachable: backendDriver.supportsLiveReconnect(),
+        owner: {
+          kind: "local",
+          pid: window.pid,
+        },
       });
     }
 
@@ -1179,6 +1304,183 @@ async function discoverLiveSessions(
   } catch {
     return [];
   }
+}
+
+async function refreshSessionRecords(records: SessionRecord[]): Promise<SessionRecord[]> {
+  const tmuxDriver = createTerminalBackendDriver({
+    backend: "tmux",
+    tmuxSessionName: SHARED_TMUX_SESSION,
+  });
+  const tmuxWindows = await tmuxDriver.listLiveSessions().catch(() => []);
+  const tmuxById = new Map(tmuxWindows.map((window) => [window.sessionId, window]));
+  const daemonByUrl = new Map<string, Map<string, boolean> | null>();
+  const refreshed: SessionRecord[] = [];
+
+  for (const record of records) {
+    const metadata = await readRecordMetadata(record);
+    let next: SessionRecord = {
+      ...record,
+      transcriptPath: metadata.transcriptPath,
+      title: metadata.title,
+      updatedAt: metadata.updatedAt ?? record.updatedAt,
+    };
+
+    if (record.owner.kind === "daemon") {
+      const serverUrl = normalizeServerUrl(record.owner.serverUrl);
+      if (!daemonByUrl.has(serverUrl)) {
+        daemonByUrl.set(
+          serverUrl,
+          isPidAlive(record.owner.serverPid)
+            ? await fetchDaemonSessionStates(serverUrl)
+            : null,
+        );
+      }
+      const daemonSessions = daemonByUrl.get(serverUrl);
+      const alive = daemonSessions?.get(record.sessionId) ?? false;
+      next = {
+        ...next,
+        owner: {
+          ...record.owner,
+          serverUrl,
+        },
+        lastKnownAlive: alive,
+        reattachable: alive,
+      };
+    } else if (record.backend === "tmux") {
+      const liveWindow = tmuxById.get(record.sessionId);
+      next = {
+        ...next,
+        owner: {
+          kind: "local",
+          pid: liveWindow?.pid ?? record.owner.pid,
+        },
+        lastKnownAlive: liveWindow !== undefined,
+        reattachable: liveWindow !== undefined,
+      };
+    } else {
+      const alive = isPidAlive(record.owner.pid);
+      next = {
+        ...next,
+        lastKnownAlive: alive,
+        reattachable: false,
+      };
+    }
+
+    if (!sessionRecordsEqual(record, next)) {
+      await writeSessionRecord(next);
+    }
+    refreshed.push(next);
+  }
+
+  return refreshed;
+}
+
+async function readRecordMetadata(record: SessionRecord): Promise<{
+  transcriptPath: string;
+  title?: string;
+  updatedAt?: string;
+}> {
+  const transcriptPath = record.transcriptPath ?? sessionPath(record.cwd, record.sessionId);
+  try {
+    const transcriptStat = await stat(transcriptPath);
+    return {
+      transcriptPath,
+      title: record.title ?? await extractSessionTitle(transcriptPath) ?? undefined,
+      updatedAt: transcriptStat.mtime.toISOString(),
+    };
+  } catch {
+    return {
+      transcriptPath,
+      title: record.title,
+      updatedAt: record.updatedAt,
+    };
+  }
+}
+
+function sessionRecordToSummary(record: SessionRecord): SessionSummary {
+  return {
+    sessionId: record.sessionId,
+    cwd: record.cwd,
+    title: record.title,
+    createdAt: record.createdAt,
+    updatedAt: record.updatedAt,
+    backend: record.backend,
+    alive: record.lastKnownAlive,
+    reattachable: record.reattachable,
+    owner: record.owner,
+  };
+}
+
+function sessionRecordsEqual(left: SessionRecord, right: SessionRecord): boolean {
+  return JSON.stringify(left) === JSON.stringify(right);
+}
+
+function isSessionId(value: string): boolean {
+  return /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(value);
+}
+
+async function fetchDaemonSessionStates(serverUrl: string): Promise<Map<string, boolean> | null> {
+  try {
+    const result = await daemonRequest(serverUrl, "GET", "/sessions") as {
+      sessions?: Array<{ sessionId: string; alive: boolean }>;
+    };
+    const sessions = new Map<string, boolean>();
+    for (const session of result.sessions ?? []) {
+      sessions.set(session.sessionId, session.alive);
+    }
+    return sessions;
+  } catch {
+    return null;
+  }
+}
+
+async function closeDaemonSession(serverUrl: string, sessionId: string): Promise<boolean> {
+  try {
+    await daemonRequest(serverUrl, "DELETE", `/sessions/${sessionId}`);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function daemonRequest(
+  serverUrl: string,
+  method: "GET" | "DELETE",
+  path: string,
+): Promise<unknown> {
+  const url = new URL(path, normalizeServerUrl(serverUrl));
+  return new Promise((resolve, reject) => {
+    const req = httpRequest(
+      {
+        hostname: url.hostname,
+        port: url.port,
+        path: url.pathname,
+        method,
+      },
+      (res) => {
+        const chunks: Buffer[] = [];
+        res.on("data", (chunk: Buffer) => chunks.push(chunk));
+        res.on("end", () => {
+          const text = Buffer.concat(chunks).toString();
+          if ((res.statusCode ?? 500) >= 400) {
+            reject(new Error(text || `request failed with status ${res.statusCode}`));
+            return;
+          }
+          if (!text) {
+            resolve({});
+            return;
+          }
+          try {
+            resolve(JSON.parse(text));
+          } catch {
+            resolve(text);
+          }
+        });
+      },
+    );
+    req.on("error", reject);
+    req.end();
+  });
 }
 
 async function extractSessionTitle(filePath: string): Promise<string | null> {

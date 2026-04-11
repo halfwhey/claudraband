@@ -21,7 +21,7 @@ export interface CliConfig {
   command: "prompt" | "sessions" | "session-close" | "acp" | "serve";
   prompt: string;
   sessionId: string;
-  globalSessions: boolean;
+  allSessions: boolean;
   cwd: string;
   hasExplicitCwd: boolean;
   debug: boolean;
@@ -45,7 +45,7 @@ export function parseArgs(argv: string[], io: ParseIo = defaultIo): CliConfig {
     command: "prompt",
     prompt: "",
     sessionId: "",
-    globalSessions: false,
+    allSessions: false,
     cwd: process.cwd(),
     hasExplicitCwd: false,
     debug: false,
@@ -94,8 +94,8 @@ export function parseArgs(argv: string[], io: ParseIo = defaultIo): CliConfig {
       config.sessionId = argv[++i];
     } else if (arg === "--select" && i + 1 < argv.length) {
       config.select = argv[++i];
-    } else if (arg === "--global") {
-      config.globalSessions = true;
+    } else if (arg === "--all") {
+      config.allSessions = true;
     } else if (arg === "--server" && i + 1 < argv.length) {
       config.server = argv[++i];
     } else if (arg === "--port" && i + 1 < argv.length) {
@@ -153,24 +153,24 @@ export function parseArgs(argv: string[], io: ParseIo = defaultIo): CliConfig {
 
   if (config.command === "session-close") {
     const bulkScopeCount =
-      (config.globalSessions ? 1 : 0) +
+      (config.allSessions ? 1 : 0) +
       (config.hasExplicitCwd ? 1 : 0);
     if (config.sessionId && bulkScopeCount > 0) {
-      io.stderr("error: 'sessions close' accepts either <id>, --global, or --cwd <dir>.\n");
+      io.stderr("error: 'sessions close' accepts either <id>, --all, or --cwd <dir>.\n");
       io.exit(1);
     }
     if (!config.sessionId && bulkScopeCount === 0) {
-      io.stderr("error: sessions close requires a session ID, --global, or --cwd <dir>.\n");
+      io.stderr("error: sessions close requires a session ID, --all, or --cwd <dir>.\n");
       io.exit(1);
     }
     if (bulkScopeCount > 1) {
-      io.stderr("error: 'sessions close' accepts only one bulk scope: --global or --cwd <dir>.\n");
+      io.stderr("error: 'sessions close' accepts only one bulk scope: --all or --cwd <dir>.\n");
       io.exit(1);
     }
   }
 
-  if (config.command === "sessions" && config.globalSessions && config.hasExplicitCwd) {
-    io.stderr("error: 'sessions' accepts either --global or --cwd <dir>, not both.\n");
+  if (config.command === "sessions" && config.allSessions) {
+    io.stderr("error: 'sessions' does not accept --all. Use 'sessions close --all' to bulk close.\n");
     io.exit(1);
   }
 
@@ -224,9 +224,9 @@ export const USAGE = `Usage: claudraband [options] <prompt...>
        claudraband -s <id> --select <n>
        claudraband -s <id> -i
        claudraband sessions close <sessionId>
-       claudraband sessions close --global
+       claudraband sessions close --all
        claudraband sessions close --cwd <dir>
-       claudraband sessions [--cwd <dir>] [--global]
+       claudraband sessions [--cwd <dir>]
        claudraband serve [--port <n>]
        claudraband --acp [options]
 
@@ -235,7 +235,7 @@ Options:
   -s, --session <id>             Target an existing session
   -i, --interactive              Start interactive REPL mode
   --select <n>                   Auto-select option <n> for a pending question (requires -s)
-  --global                       Use all local sessions across every cwd for 'sessions' commands
+  --all                          Close every live tracked session for 'sessions close'
   --acp                          Run as an ACP server over stdio
   --cwd <dir>                    Working directory (default: cwd)
   -c, --claude <flags>           Claude CLI flags, e.g. '--model sonnet --effort high'
@@ -250,12 +250,11 @@ Examples:
   claudraband -s abc-123 "continue the refactor"
   claudraband -s abc-123 --select 2
   claudraband -s abc-123 -i
-  claudraband sessions --global
+  claudraband sessions
   claudraband sessions close abc-123
-  claudraband sessions close --global
+  claudraband sessions close --all
   claudraband sessions close --cwd /my/project
   claudraband --acp --claude "--model opus"
-  claudraband sessions
   claudraband serve --port 7842
   claudraband --server localhost:7842 "hello"
   claudraband --terminal-backend xterm -c "--dangerously-skip-permissions" "run without tmux"

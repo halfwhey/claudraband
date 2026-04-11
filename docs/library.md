@@ -41,7 +41,9 @@ const runtime = createClaudraband({
 |---|---|
 | `startSession(options?)` | Start a new Claude Code session |
 | `resumeSession(sessionId, options?)` | Reattach to an existing session |
-| `listSessions(cwd?)` | List sessions discovered from JSONL files |
+| `listSessions(cwd?)` | List sessions from the canonical `~/.claudraband` registry |
+| `inspectSession(sessionId, cwd?)` | Inspect one tracked session |
+| `closeSession(sessionId)` | Close a tracked live session through its recorded owner |
 | `replaySession(sessionId, cwd)` | Parse a session's JSONL into events without starting Claude |
 
 ### `ClaudrabandSession`
@@ -163,6 +165,8 @@ await final.stop(); // kills the process
 ```
 
 With the tmux backend, sessions persist across CLI invocations. `detach()` disconnects the library without killing the tmux window. `stop()` kills it.
+
+All sessions are tracked in `~/.claudraband/`, regardless of backend. That registry carries the session ID, cwd, backend, liveness, and owner-routing metadata needed for close and reconnect operations.
 
 ## Listing and replaying sessions
 

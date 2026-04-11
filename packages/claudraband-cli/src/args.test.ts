@@ -67,17 +67,17 @@ describe("claudraband cli args", () => {
     expect(args.sessionId).toBe("abc-123");
   });
 
-  test("sessions close --global", () => {
-    const args = parseArgs(["sessions", "close", "--global"]);
+  test("sessions close --all", () => {
+    const args = parseArgs(["sessions", "close", "--all"]);
     expect(args.command).toBe("session-close");
-    expect(args.globalSessions).toBe(true);
+    expect(args.allSessions).toBe(true);
     expect(args.sessionId).toBe("");
   });
 
-  test("parses --global for session listing", () => {
-    const args = parseArgs(["sessions", "--global"]);
+  test("sessions list defaults to all tracked sessions", () => {
+    const args = parseArgs(["sessions"]);
     expect(args.command).toBe("sessions");
-    expect(args.globalSessions).toBe(true);
+    expect(args.allSessions).toBe(false);
   });
 
   test("sessions close --cwd targets bulk close by cwd", () => {
@@ -88,13 +88,17 @@ describe("claudraband cli args", () => {
     expect(args.hasExplicitCwd).toBe(true);
   });
 
-  test("sessions close requires an id, --global, or --cwd", () => {
+  test("sessions close requires an id, --all, or --cwd", () => {
     expect(() => parseArgs(["sessions", "close"], noopIo as never)).toThrow("exit(1)");
   });
 
   test("sessions close rejects mixed bulk scopes", () => {
-    expect(() => parseArgs(["sessions", "close", "--global", "--cwd", "/tmp"], noopIo as never))
+    expect(() => parseArgs(["sessions", "close", "--all", "--cwd", "/tmp"], noopIo as never))
       .toThrow("exit(1)");
+  });
+
+  test("sessions rejects --all", () => {
+    expect(() => parseArgs(["sessions", "--all"], noopIo as never)).toThrow("exit(1)");
   });
 
   test("serve command", () => {
