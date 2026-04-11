@@ -1,10 +1,10 @@
 # claudraband
 
-`claudraband` is a local wrapper around the official `claude` CLI that let's you utilize your Claude Code subscription with an alternative frontend or cli.
+`claudraband` is a local wrapper around the official `claude` CLI that lets you use your Claude Code subscription with an alternative frontend or CLI.
 
 - Doesn't replace Claude Code. 
 - Doesn't bypass Claude Code.
-- Doesn't intercept Oauth tokens.
+- Doesn't intercept OAuth tokens.
 
 ## Examples
 
@@ -33,38 +33,48 @@
 make build
 
 # Ask Claude Code something directly
-./claudraband "audit the last commit and tell me what looks risky"
+node packages/claudraband-cli/dist/bin.js "audit the last commit and tell me what looks risky"
 
 # Start a REPL
-./claudraband -i
+node packages/claudraband-cli/dist/bin.js -i
 
 # List resumable Claude sessions for the current repo
-./claudraband sessions
+node packages/claudraband-cli/dist/bin.js sessions
 
 # Resume one later
-./claudraband resume <session-id> "continue from where we left off"
+node packages/claudraband-cli/dist/bin.js resume <session-id> "continue from where we left off"
 
 # Force the headless backend if you don't want tmux
-./claudraband --terminal-backend xterm "review the staged diff"
+node packages/claudraband-cli/dist/bin.js --terminal-backend xterm "review the staged diff"
 
 # Start the ACP adapter
-./claudraband-acp --model opus
+node packages/claudraband-cli/dist/bin.js --acp --claude "--model opus"
 ```
 
 
-We wrap the full Claue Code TUI in a terminal and drive that terminal.
+We wrap the full Claude Code TUI in a terminal and drive that terminal.
 
-The repo is split into three packages:
+The repo is split into two packages:
 
 - `claudraband-core`: the TypeScript library for driving the real `claude` CLI
-- `claudraband-acp`: an ACP adapter built on top of that library
-- `claudraband-cli`: the first-party terminal client built on top of that library
+- `claudraband`: the publishable CLI, which supports direct terminal use and `--acp` server mode
+
+## npm
+
+After publish, the entrypoint is a single binary:
+
+```sh
+npx claudraband --help
+npx claudraband --acp
+bunx claudraband --help
+bunx claudraband --acp
+```
 
 ## Features
 
 - `claudraband-core`: reusable TypeScript library for starting, resuming, replaying, prompting, and interrupting Claude Code sessions
-- `claudraband-acp`: an ACP server that wraps your local Claude Code install
-- `claudraband-cli`: direct first-party CLI for local terminal use
+- `claudraband --acp`: an ACP server that wraps your local Claude Code install
+- `claudraband`: direct first-party CLI for local terminal use
 - resumable sessions backed by Claude's real session IDs (which addresses the `claude -p` limitation of not being resumable)
 - optional terminal backends:
   - `tmux` for detached terminal sessions 
@@ -101,15 +111,14 @@ The `xterm` backend is runtime-aware:
 make build
 ```
 
-That builds the packages and leaves repo-root launchers in place:
+That builds the packages:
 
-- `./claudraband`
-- `./claudraband-acp`
+- `packages/claudraband-core/dist/index.js`
+- `packages/claudraband-cli/dist/bin.js`
 
 You can also build each package separately:
 
 ```sh
 make build-lib
-make build-acp
 make build-cli
 ```

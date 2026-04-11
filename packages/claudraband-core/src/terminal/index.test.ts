@@ -1,5 +1,15 @@
 import { describe, expect, test } from "bun:test";
-import { resolveTerminalBackend, resolveXtermTransportKind } from "./index";
+import { randomUUID } from "node:crypto";
+import { hasSession, killSession } from "../tmuxctl";
+import {
+  createTerminalHost,
+  resolveTerminalBackend,
+  resolveXtermTransportKind,
+} from "./index";
+
+function isSandboxTmuxError(err: unknown): boolean {
+  return String(err).includes("Operation not permitted");
+}
 
 describe("terminal backend selection", () => {
   test("auto prefers tmux when available", () => {
@@ -22,5 +32,54 @@ describe("terminal backend selection", () => {
 
   test("xterm falls back to node-pty when Bun transport is unavailable", () => {
     expect(resolveXtermTransportKind(() => false)).toBe("node-pty");
+  });
+
+  test("tmux host stop only kills its own Claude window", async () => {
+    const sessionName = `claudraband-terminal-${randomUUID()}`;
+    const first = createTerminalHost({
+      backend: "tmux",
+      tmuxSessionName: sessionName,
+      tmuxWindowName: "claude-session-1",
+    });
+    const second = createTerminalHost({
+      backend: "tmux",
+      tmuxSessionName: sessionName,
+      tmuxWindowName: "claude-session-2",
+    });
+    const firstSignal = new AbortController();
+    const secondSignal = new AbortController();
+
+    try {
+      await first.start(["bash", "-c", "echo FIRST_OK; sleep 3"], {
+        cwd: "/tmp",
+        cols: 80,
+        rows: 24,
+        signal: firstSignal.signal,
+      });
+      await second.start(["bash", "-c", "echo SECOND_OK; sleep 3"], {
+        cwd: "/tmp",
+        cols: 80,
+        rows: 24,
+        signal: secondSignal.signal,
+      });
+      await Bun.sleep(500);
+
+      await first.stop();
+      await Bun.sleep(200);
+
+      expect(first.alive()).toBe(false);
+      expect(second.alive()).toBe(true);
+      expect(hasSession(sessionName)).toBe(true);
+      expect(await second.capture()).toContain("SECOND_OK");
+    } catch (err) {
+      if (isSandboxTmuxError(err)) return;
+      throw err;
+    } finally {
+      firstSignal.abort();
+      secondSignal.abort();
+      await first.stop().catch(() => {});
+      await second.stop().catch(() => {});
+      await killSession(sessionName).catch(() => {});
+    }
   });
 });

@@ -1,4 +1,8 @@
-import type { PermissionMode, TerminalBackend } from "claudraband-core";
+import {
+  parseClaudeArgs,
+  type PermissionMode,
+  type TerminalBackend,
+} from "claudraband-core";
 
 interface ParseIo {
   stdout(text: string): void;
@@ -13,16 +17,19 @@ const defaultIo: ParseIo = {
 };
 
 export interface CliConfig {
-  command: "prompt" | "sessions" | "resume";
+  command: "prompt" | "sessions" | "resume" | "acp";
   prompt: string;
   sessionId: string;
   cwd: string;
   debug: boolean;
   approveAll: boolean;
   interactive: boolean;
+  acp: boolean;
+  claudeArgs: string[];
   model: string;
   permissionMode: PermissionMode;
   terminalBackend: TerminalBackend;
+  select: string;
 }
 
 export function parseArgs(argv: string[], io: ParseIo = defaultIo): CliConfig {
@@ -34,9 +41,12 @@ export function parseArgs(argv: string[], io: ParseIo = defaultIo): CliConfig {
     debug: false,
     approveAll: false,
     interactive: false,
+    acp: false,
+    claudeArgs: [],
     model: "sonnet",
     permissionMode: "default",
     terminalBackend: "auto",
+    select: "",
   };
 
   const positional: string[] = [];
@@ -49,10 +59,14 @@ export function parseArgs(argv: string[], io: ParseIo = defaultIo): CliConfig {
       io.exit(0);
     } else if (arg === "--cwd" && i + 1 < argv.length) {
       config.cwd = argv[++i];
-    } else if (arg === "--model" && i + 1 < argv.length) {
-      config.model = argv[++i];
-    } else if (arg === "--permission-mode" && i + 1 < argv.length) {
-      config.permissionMode = argv[++i] as PermissionMode;
+    } else if ((arg === "--claude" || arg === "-c") && i + 1 < argv.length) {
+      try {
+        config.claudeArgs.push(...splitShellWords(argv[++i]));
+      } catch (err) {
+        io.stderr(`error: ${err instanceof Error ? err.message : String(err)}\n`);
+        io.stderr(USAGE);
+        io.exit(1);
+      }
     } else if (arg === "--terminal-backend" && i + 1 < argv.length) {
       config.terminalBackend = argv[++i] as TerminalBackend;
     } else if (arg === "--debug") {
@@ -61,6 +75,14 @@ export function parseArgs(argv: string[], io: ParseIo = defaultIo): CliConfig {
       config.approveAll = true;
     } else if (arg === "--interactive" || arg === "-i") {
       config.interactive = true;
+    } else if (arg === "--select" && i + 1 < argv.length) {
+      config.select = argv[++i];
+    } else if (arg === "--acp") {
+      config.acp = true;
+    } else if (arg === "--claude" || arg === "-c") {
+      io.stderr("error: --claude requires a quoted flag string.\n");
+      io.stderr(USAGE);
+      io.exit(1);
     } else if (arg.startsWith("-")) {
       io.stderr(`error: unknown option ${arg}\n`);
       io.stderr(USAGE);
@@ -71,7 +93,19 @@ export function parseArgs(argv: string[], io: ParseIo = defaultIo): CliConfig {
     i++;
   }
 
-  if (positional[0] === "sessions") {
+  const parsedClaudeArgs = parseClaudeArgs(config.claudeArgs);
+  config.claudeArgs = parsedClaudeArgs.passthroughArgs;
+  config.model = parsedClaudeArgs.model ?? "sonnet";
+  config.permissionMode = (parsedClaudeArgs.permissionMode as PermissionMode | undefined) ?? "default";
+
+  if (config.acp) {
+    if (positional.length > 0) {
+      io.stderr("error: --acp does not accept positional arguments.\n");
+      io.stderr(USAGE);
+      io.exit(1);
+    }
+    config.command = "acp";
+  } else if (positional[0] === "sessions") {
     config.command = "sessions";
   } else if (positional[0] === "resume") {
     if (!positional[1]) {
@@ -97,24 +131,85 @@ export function parseArgs(argv: string[], io: ParseIo = defaultIo): CliConfig {
 
 export const USAGE = `Usage: claudraband [options] <prompt...>
        claudraband -i
+       claudraband --acp [options]
        claudraband sessions [--cwd <dir>]
        claudraband resume <sessionId> [options] [prompt...]
 
 Options:
   -h, --help                     Show this help
   -i, --interactive              Start interactive REPL mode
+  --acp                          Run as an ACP server over stdio
   --cwd <dir>                    Working directory (default: cwd)
-  --model <model>                Claude model (default: sonnet)
-  --permission-mode <mode>       Claude permission mode (default: default)
+  -c, --claude <flags>           Claude CLI flags, e.g. '--model sonnet --effort high'
   --terminal-backend <backend>   auto | tmux | xterm (default: auto)
   --debug                        Show debug logging
   --approve-all                  Auto-approve the first permission option
+  --select <n>                   Auto-select option <n> for questions/permissions
 
 Examples:
   claudraband "what changed in this repo?"
   claudraband -i
+  claudraband --acp --claude "--model opus"
   claudraband sessions
   claudraband resume abc-123 "continue the refactor"
-  claudraband --model opus --permission-mode acceptEdits "write the tests"
+  claudraband --claude "--model sonnet --effort high --bypass-all-permissions" "write the tests"
   claudraband --terminal-backend xterm "run without tmux"
+  claudraband resume abc-123 --select 1
+  claudraband resume abc-123 --select 3 "my typed response"
 `;
+
+export function splitShellWords(input: string): string[] {
+  const out: string[] = [];
+  let current = "";
+  let quote: "'" | "\"" | null = null;
+  let escaping = false;
+
+  for (const ch of input) {
+    if (escaping) {
+      current += ch;
+      escaping = false;
+      continue;
+    }
+
+    if (ch === "\\") {
+      escaping = true;
+      continue;
+    }
+
+    if (quote) {
+      if (ch === quote) {
+        quote = null;
+      } else {
+        current += ch;
+      }
+      continue;
+    }
+
+    if (ch === "'" || ch === "\"") {
+      quote = ch;
+      continue;
+    }
+
+    if (/\s/.test(ch)) {
+      if (current) {
+        out.push(current);
+        current = "";
+      }
+      continue;
+    }
+
+    current += ch;
+  }
+
+  if (escaping) {
+    current += "\\";
+  }
+  if (quote) {
+    throw new Error(`unterminated quote in --claude value`);
+  }
+  if (current) {
+    out.push(current);
+  }
+
+  return out;
+}

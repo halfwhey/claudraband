@@ -97,17 +97,28 @@ function makeDefaultLogger(): ClaudrabandLogger {
 export class Bridge implements Agent {
   private conn!: AgentSideConnection;
   private runtime: Claudraband;
+  private defaultClaudeArgs: string[];
   private defaultModel: string;
+  private defaultPermissionMode: PermissionMode;
   private defaultTerminalBackend: TerminalBackend;
   private sessions = new Map<string, BridgeSession>();
   private log: ClaudrabandLogger;
 
-  constructor(model: string, terminalBackend: TerminalBackend) {
-    this.defaultModel = model || "sonnet";
-    this.defaultTerminalBackend = terminalBackend;
+  constructor(config: {
+    claudeArgs: string[];
+    model: string;
+    permissionMode: PermissionMode;
+    terminalBackend: TerminalBackend;
+  }) {
+    this.defaultClaudeArgs = config.claudeArgs;
+    this.defaultModel = config.model || "sonnet";
+    this.defaultPermissionMode = config.permissionMode;
+    this.defaultTerminalBackend = config.terminalBackend;
     this.log = makeDefaultLogger();
     this.runtime = createClaudraband({
+      claudeArgs: this.defaultClaudeArgs,
       model: this.defaultModel,
+      permissionMode: this.defaultPermissionMode,
       terminalBackend: this.defaultTerminalBackend,
     });
   }
@@ -119,7 +130,9 @@ export class Bridge implements Agent {
   setLogger(log: ClaudrabandLogger): void {
     this.log = log;
     this.runtime = createClaudraband({
+      claudeArgs: this.defaultClaudeArgs,
       model: this.defaultModel,
+      permissionMode: this.defaultPermissionMode,
       terminalBackend: this.defaultTerminalBackend,
       logger: log,
     });
@@ -170,8 +183,9 @@ export class Bridge implements Agent {
   async newSession(params: NewSessionRequest): Promise<NewSessionResponse> {
     const session = await this.runtime.startSession({
       cwd: params.cwd,
+      claudeArgs: this.defaultClaudeArgs,
       model: this.defaultModel,
-      permissionMode: "default",
+      permissionMode: this.defaultPermissionMode,
       logger: this.log,
       onPermissionRequest: (request) =>
         this.handlePermissionRequest(request),
@@ -194,8 +208,9 @@ export class Bridge implements Agent {
 
     const session = await this.runtime.resumeSession(params.sessionId, {
       cwd: params.cwd,
+      claudeArgs: this.defaultClaudeArgs,
       model: this.defaultModel,
-      permissionMode: "default",
+      permissionMode: this.defaultPermissionMode,
       logger: this.log,
       onPermissionRequest: (request) =>
         this.handlePermissionRequest(request),
@@ -308,7 +323,6 @@ export class Bridge implements Agent {
         };
         break;
       case EventKind.UserMessage:
-        // Don't forward - the ACP client already shows what the user typed.
         return;
       case EventKind.ToolCall: {
         let rawInput: Record<string, unknown> | undefined;

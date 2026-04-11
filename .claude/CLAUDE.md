@@ -5,10 +5,9 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## Build & Test
 
 ```bash
-make build          # build library + binaries -> ./dist/claudraband ./claudraband-acp ./claudraband
-make build-lib      # build library bundle -> ./dist/claudraband
-make build-acp      # compile ACP adapter -> ./claudraband-acp
-make build-cli      # compile CLI -> ./claudraband
+make build          # build library + CLI -> packages/*/dist
+make build-lib      # build library bundle -> packages/claudraband-core/dist
+make build-cli      # compile CLI -> packages/claudraband-cli/dist/bin.js
 make test           # run all tests
 make typecheck      # typecheck both packages
 
@@ -21,13 +20,15 @@ bun test --test-name-pattern "Tailer"
 
 ## Monorepo Structure
 
-Bun workspaces monorepo with three packages:
+Bun workspaces monorepo with two packages:
 
 - `packages/claudraband-core/` -- TypeScript library for controlling Claude Code (package: `claudraband-core`)
-- `packages/claudraband-acp/` -- ACP adapter wrapping the library (binary: `claudraband-acp`)
-- `packages/claudraband-cli/` -- First-party CLI built on the library (binary: `claudraband`)
+- `packages/claudraband-cli/` -- First-party CLI built on the library (package + binary: `claudraband`)
 
-The main product surface is the library. The ACP package and CLI are adapters layered on top.
+The main product surfaces are:
+
+- `claudraband-core` as the library
+- `claudraband` as the published CLI, including `--acp` mode over stdio
 
 ## Architecture
 
@@ -42,21 +43,16 @@ Key pieces:
 - `src/wrap` contains low-level event and wrapper types used internally.
 - `src/index.ts` exposes the public session-first API.
 
-### ACP Adapter (`packages/claudraband-acp/`)
-
-Wraps the `claudraband` library as an ACP agent. An ACP client launches `claudraband-acp` as a subprocess and communicates over stdio JSON-RPC.
-
-- `src/acpbridge` translates library events, sessions, and permission requests into ACP.
-- `src/main.ts` is the ACP server entry point.
-
 ### CLI (`packages/claudraband-cli/`)
 
-Direct first-party terminal client built on the library.
+Direct first-party terminal client built on the library. It also exposes ACP server mode via `claudraband --acp`.
 
 - `src/args.ts` -- command parsing
 - `src/client.ts` -- permission callback UX
 - `src/render.ts` -- ANSI terminal renderer for library events
-- `src/main.ts` -- entry point, dispatch, REPL loop
+- `src/acpbridge` -- ACP translation layer
+- `src/bin.ts` -- published executable entry point
+- `src/main.ts` -- CLI runtime, ACP mode, REPL loop
 
 ## JSONL Session File Format
 
@@ -68,6 +64,13 @@ The `Tailer` creates its async generator eagerly in the constructor and starts p
 
 Tailers use poll-based tailing (200ms intervals) rather than fsnotify, since the JSONL files are append-only and poll is simpler and more reliable across filesystems.
 
-tmux sessions are named `claudraband-<session-id>`. Each ACP session gets its own tmux session to support concurrent sessions.
+tmux-backed Claude sessions run inside a shared tmux session named `claudraband-working-session`. Each Claude session gets its own tmux window named after the Claude session UUID so concurrent sessions stay isolated.
 
 Turn completion detection uses an idle timer: after receiving assistant text with no pending tool calls, if no new events arrive within 3 seconds, the turn is considered complete.
+
+## CLI Conventions
+
+- For local built usage, run `node packages/claudraband-cli/dist/bin.js ...` or `bun packages/claudraband-cli/dist/bin.js ...`.
+- For published usage, run `npx claudraband ...` or `bunx claudraband ...`.
+- Claude launch flags are passed through a single option: `--claude "<flags>"`.
+- Local wrapper flags such as `--acp`, `--terminal-backend`, `--approve-all`, `--select`, and `--debug` stay at the claudraband layer.

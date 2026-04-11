@@ -1,19 +1,36 @@
-import { describe, test, expect } from "bun:test";
-import { Session } from "./tmux";
+import { describe, expect, test } from "bun:test";
+import { spawnSync } from "node:child_process";
+import { randomUUID } from "node:crypto";
+import { Session, hasSession, killSession } from "./tmux";
 
 function isSandboxTmuxError(err: unknown): boolean {
   return String(err).includes("Operation not permitted");
 }
 
+function sharedSessionName(): string {
+  return `claudraband-test-${randomUUID()}`;
+}
+
+function listWindows(name: string): string[] {
+  const result = spawnSync("tmux", ["list-windows", "-t", name, "-F", "#{window_name}"], {
+    encoding: "utf-8",
+  });
+  if (result.status !== 0) {
+    throw new Error(result.stderr || `failed to list windows for ${name}`);
+  }
+  return result.stdout.trim().split("\n").filter(Boolean);
+}
+
 describe("tmuxctl", () => {
-  test("new session + capture", async () => {
-    let sess: Session;
+  test("creates the first Claude window in a new shared session", async () => {
+    const name = sharedSessionName();
+    let sess: Session | undefined;
     try {
-      sess = await Session.newSession("claudraband-test", 80, 24, "/tmp", [
+      sess = await Session.newSession(name, 80, 24, "/tmp", [
         "bash",
         "-c",
         "echo ALLAGENT_OK; sleep 3",
-      ]);
+      ], "claude-session-1");
     } catch (err) {
       if (isSandboxTmuxError(err)) return;
       throw err;
@@ -21,34 +38,90 @@ describe("tmuxctl", () => {
     try {
       await Bun.sleep(500);
       expect(sess.isAlive).toBe(true);
-
-      const out = await sess.capturePane();
-      expect(out).toContain("ALLAGENT_OK");
+      expect(hasSession(name)).toBe(true);
+      expect(listWindows(name)).toEqual(["claude-session-1"]);
+      expect(await sess.capturePane()).toContain("ALLAGENT_OK");
     } finally {
-      await sess.kill();
+      await sess?.kill().catch(() => {});
+      await killSession(name).catch(() => {});
     }
   });
 
-  test("send line", async () => {
-    let sess: Session;
+  test("creates a new window when the shared tmux session already exists", async () => {
+    const name = sharedSessionName();
+    let first: Session | undefined;
+    let second: Session | undefined;
     try {
-      sess = await Session.newSession("claudraband-send-test", 80, 24, "/tmp", [
+      first = await Session.newSession(name, 80, 24, "/tmp", [
         "bash",
-      ]);
+        "-c",
+        "echo FIRST_OK; sleep 3",
+      ], "claude-session-1");
+      second = await Session.newSession(name, 80, 24, "/tmp", [
+        "bash",
+        "-c",
+        "echo SECOND_OK; sleep 3",
+      ], "claude-session-2");
     } catch (err) {
       if (isSandboxTmuxError(err)) return;
       throw err;
     }
     try {
-      await Bun.sleep(300);
-
-      await sess.sendLine("echo SEND_TEST_OK");
       await Bun.sleep(500);
-
-      const out = await sess.capturePane();
-      expect(out).toContain("SEND_TEST_OK");
+      expect(first.name).toBe(name);
+      expect(second.name).toBe(name);
+      expect(first.windowId).not.toBe(second.windowId);
+      expect(first.paneId).not.toBe(second.paneId);
+      expect(listWindows(name).sort()).toEqual([
+        "claude-session-1",
+        "claude-session-2",
+      ]);
+      expect(await first.capturePane()).toContain("FIRST_OK");
+      expect(await second.capturePane()).toContain("SECOND_OK");
     } finally {
-      await sess.kill();
+      await first?.kill().catch(() => {});
+      await second?.kill().catch(() => {});
+      await killSession(name).catch(() => {});
+    }
+  });
+
+  test("killing one Claude window leaves sibling windows alive", async () => {
+    const name = sharedSessionName();
+    let first: Session | undefined;
+    let second: Session | undefined;
+    try {
+      first = await Session.newSession(name, 80, 24, "/tmp", [
+        "bash",
+        "-c",
+        "echo FIRST_OK; sleep 3",
+      ], "claude-session-1");
+      second = await Session.newSession(name, 80, 24, "/tmp", [
+        "bash",
+        "-c",
+        "echo SECOND_OK; sleep 3",
+      ], "claude-session-2");
+    } catch (err) {
+      if (isSandboxTmuxError(err)) return;
+      throw err;
+    }
+    try {
+      await Bun.sleep(500);
+      await first.kill();
+      await Bun.sleep(200);
+
+      expect(first.isAlive).toBe(false);
+      expect(second.isAlive).toBe(true);
+      expect(hasSession(name)).toBe(true);
+      expect(listWindows(name)).toEqual(["claude-session-2"]);
+      expect(await second.capturePane()).toContain("SECOND_OK");
+
+      await second.kill();
+      await Bun.sleep(200);
+      expect(hasSession(name)).toBe(false);
+    } finally {
+      await first?.kill().catch(() => {});
+      await second?.kill().catch(() => {});
+      await killSession(name).catch(() => {});
     }
   });
 });

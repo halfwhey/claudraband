@@ -3,8 +3,8 @@
   "private": true,
   "workspaces": ["packages/*"],
   "scripts": {
-    "build": "bun run --filter '*' build",
-    "test": "bun test packages/claudraband-core/src packages/claudraband-acp/src packages/claudraband-cli/src",
-    "typecheck": "tsc -b"
+    "build": "bun run --filter claudraband-core build && bun run --filter claudraband build",
+    "test": "bun test packages/claudraband-core/src packages/claudraband-cli/src",
+    "typecheck": "tsc -b packages/claudraband-core packages/claudraband-cli"
   }
 }

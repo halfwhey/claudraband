@@ -2,7 +2,6 @@
   "files": [],
   "references": [
     { "path": "packages/claudraband-core" },
-    { "path": "packages/claudraband-acp" },
     { "path": "packages/claudraband-cli" }
   ]
 }

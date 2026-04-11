@@ -1,22 +1,24 @@
 {
-  "name": "claudraband-cli",
+  "name": "claudraband",
   "version": "0.1.0",
+  "description": "Drive the official Claude Code CLI directly or run an ACP server on top of it.",
   "type": "module",
-  "main": "./dist/main.js",
+  "main": "./dist/bin.js",
   "files": [
     "dist"
   ],
   "bin": {
-    "claudraband": "dist/main.js"
+    "claudraband": "dist/bin.js"
   },
   "scripts": {
     "clean": "rm -rf dist",
-    "build": "bun run clean && bun build src/main.ts --target node --packages external --outdir dist",
+    "build": "bun run clean && bun build src/bin.ts --target node --packages external --outdir dist",
     "prepack": "bun run build",
     "test": "bun test src",
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
+    "@agentclientprotocol/sdk": "^0.18.0",
     "claudraband-core": "^0.1.0"
   },
   "devDependencies": {

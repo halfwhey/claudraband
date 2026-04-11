@@ -31,6 +31,15 @@ export function hasSession(name: string): boolean {
   }
 }
 
+function hasPane(id: string): boolean {
+  try {
+    execSync(`tmux display-message -p -t ${id} '#{pane_id}'`, { stdio: "pipe" });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 export async function killSession(name: string): Promise<void> {
   if (!hasSession(name)) return;
   await tmux("kill-session", "-t", name);
@@ -44,10 +53,19 @@ export interface CaptureOpts {
 export class Session {
   readonly name: string;
   readonly command: string[];
+  readonly windowId: string;
+  readonly paneId: string;
 
-  private constructor(name: string, command: string[]) {
+  private constructor(
+    name: string,
+    command: string[],
+    windowId: string,
+    paneId: string,
+  ) {
     this.name = name;
     this.command = command;
+    this.windowId = windowId;
+    this.paneId = paneId;
   }
 
   static async newSession(
@@ -56,56 +74,82 @@ export class Session {
     height: number,
     workingDir: string,
     command: string[],
+    windowName: string,
   ): Promise<Session> {
     if (command.length === 0) {
       throw new Error("tmuxctl: command is required");
     }
-    if (hasSession(name)) {
-      await killSession(name);
+
+    const format = "#{window_id}\t#{pane_id}";
+    const result = hasSession(name)
+      ? await tmux(
+        "new-window",
+        "-P",
+        "-F",
+        format,
+        "-t",
+        name,
+        "-n",
+        windowName,
+        ...(workingDir ? ["-c", workingDir] : []),
+        ...command,
+      )
+      : await tmux(
+        "new-session",
+        "-d",
+        "-P",
+        "-F",
+        format,
+        "-s",
+        name,
+        "-n",
+        windowName,
+        "-x",
+        String(width),
+        "-y",
+        String(height),
+        ...(workingDir ? ["-c", workingDir] : []),
+        ...command,
+      );
+
+    const [windowId, paneId] = result.stdout.trim().split(/\s+/, 2);
+    if (!windowId || !paneId) {
+      throw new Error(`tmuxctl: failed to parse tmux target ids: ${result.stdout}`);
     }
 
-    const args = [
-      "new-session",
-      "-d",
-      "-s",
-      name,
-      "-x",
-      String(width),
-      "-y",
-      String(height),
-    ];
-    if (workingDir) {
-      args.push("-c", workingDir);
-    }
-    args.push(...command);
-
-    await tmux(...args);
     try {
       await tmux("set-option", "-t", name, "status", "off");
     } catch {
       // non-fatal
     }
 
-    return new Session(name, command);
+    await tmux(
+      "resize-window",
+      "-t",
+      windowId,
+      "-x",
+      String(width),
+      "-y",
+      String(height),
+    );
+
+    return new Session(name, command, windowId, paneId);
   }
 
   async kill(): Promise<void> {
-    await killSession(this.name);
+    if (!this.isAlive) return;
+    await tmux("kill-window", "-t", this.windowId);
   }
 
   get isAlive(): boolean {
-    return hasSession(this.name);
-  }
-
-  private target(): string {
-    return `${this.name}:0.0`;
+    return hasPane(this.paneId);
   }
 
   async resize(width: number, height: number): Promise<void> {
     await tmux(
       "resize-window",
       "-t",
-      this.name,
+      this.windowId,
       "-x",
       String(width),
       "-y",
@@ -115,7 +159,7 @@ export class Session {
 
   async sendKeys(input: string): Promise<void> {
     if (!input) return;
-    await tmux("send-keys", "-t", this.target(), "-l", "--", input);
+    await tmux("send-keys", "-t", this.paneId, "-l", "--", input);
   }
 
   async sendLine(input: string): Promise<void> {
@@ -127,7 +171,7 @@ export class Session {
 
   async sendSpecial(...keys: string[]): Promise<void> {
     if (keys.length === 0) return;
-    await tmux("send-keys", "-t", this.target(), ...keys);
+    await tmux("send-keys", "-t", this.paneId, ...keys);
   }
 
   async interrupt(): Promise<void> {
@@ -135,7 +179,7 @@ export class Session {
   }
 
   async capturePane(opts: CaptureOpts = {}): Promise<string> {
-    const args = ["capture-pane", "-p", "-t", this.target()];
+    const args = ["capture-pane", "-p", "-t", this.paneId];
     if (opts.withEscapes) {
       args.push("-e");
     }
@@ -153,7 +197,7 @@ export class Session {
       "display-message",
       "-p",
       "-t",
-      this.target(),
+      this.paneId,
       "#{pane_pid}",
     );
     return parseInt(result.stdout.trim(), 10);

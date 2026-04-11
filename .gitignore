@@ -3,3 +3,4 @@ dist/
 allagent
 *.log
 bun.lock
+*.tsbuildinfo

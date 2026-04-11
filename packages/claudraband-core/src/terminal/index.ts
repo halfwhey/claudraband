@@ -28,6 +28,7 @@ export interface TerminalHost {
 export interface CreateTerminalHostOptions {
   backend: TerminalBackend;
   tmuxSessionName: string;
+  tmuxWindowName: string;
 }
 
 type TmuxDetector = () => boolean;
@@ -94,7 +95,7 @@ export function createTerminalHost(
 ): TerminalHost {
   const backend = resolveTerminalBackend(options.backend);
   if (backend === "tmux") {
-    return new TmuxTerminalHost(options.tmuxSessionName);
+    return new TmuxTerminalHost(options.tmuxSessionName, options.tmuxWindowName);
   }
   return new XtermTerminalHost();
 }
@@ -104,7 +105,10 @@ class TmuxTerminalHost implements TerminalHost {
 
   private session: Session | null = null;
 
-  constructor(private readonly sessionName: string) {}
+  constructor(
+    private readonly sessionName: string,
+    private readonly windowName: string,
+  ) {}
 
   async start(command: string[], options: TerminalStartOptions): Promise<void> {
     this.session = await Session.newSession(
@@ -113,6 +117,7 @@ class TmuxTerminalHost implements TerminalHost {
       options.rows,
       options.cwd,
       command,
+      this.windowName,
     );
   }
 

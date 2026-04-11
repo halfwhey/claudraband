@@ -4,6 +4,7 @@ import { join } from "node:path";
 import {
   ClaudeWrapper,
   createTerminalHost,
+  parseClaudeArgs,
   parseLineEvents,
   sessionPath,
   type TerminalBackend,
@@ -15,8 +16,10 @@ import type { Wrapper } from "./wrap/wrapper";
 const DEFAULT_PANE_WIDTH = 120;
 const DEFAULT_PANE_HEIGHT = 40;
 const IDLE_TIMEOUT_MS = 3000;
+const SHARED_TMUX_SESSION = "claudraband-working-session";
 
 export { EventKind };
+export { parseClaudeArgs };
 export type { ClaudrabandEvent };
 export type { TerminalBackend };
 
@@ -53,6 +56,7 @@ export interface ClaudrabandPermissionOption {
   kind: "allow_once" | "reject_once";
   optionId: string;
   name: string;
+  textInput?: boolean;
 }
 
 export interface ClaudrabandPermissionRequest {
@@ -67,13 +71,17 @@ export interface ClaudrabandPermissionRequest {
 
 export type ClaudrabandPermissionDecision =
   | { outcome: "selected"; optionId: string }
+  | { outcome: "text"; text: string }
+  | { outcome: "deferred" }
   | { outcome: "cancelled" };
 
 export interface ClaudrabandOptions {
   cwd?: string;
+  claudeArgs?: string[];
   model?: string;
   permissionMode?: PermissionMode;
   terminalBackend?: TerminalBackend;
+  allowTextResponses?: boolean;
   paneWidth?: number;
   paneHeight?: number;
   logger?: ClaudrabandLogger;
@@ -100,6 +108,7 @@ export interface ClaudrabandSession {
   readonly permissionMode: PermissionMode;
   events(): AsyncIterable<ClaudrabandEvent>;
   prompt(text: string): Promise<PromptResult>;
+  awaitTurn(): Promise<PromptResult>;
   send(text: string): Promise<void>;
   interrupt(): Promise<void>;
   stop(): Promise<void>;
@@ -221,12 +230,25 @@ function normalizeOptions(
 ): Required<Omit<ClaudrabandOptions, "onPermissionRequest">> & {
   onPermissionRequest?: ClaudrabandOptions["onPermissionRequest"];
 } {
+  const parsedClaudeArgs = parseClaudeArgs(
+    options?.claudeArgs ?? defaults.claudeArgs ?? [],
+  );
   return {
     cwd: options?.cwd ?? defaults.cwd ?? process.cwd(),
-    model: options?.model ?? defaults.model ?? "sonnet",
+    claudeArgs: parsedClaudeArgs.passthroughArgs,
+    model:
+      options?.model ??
+      parsedClaudeArgs.model ??
+      defaults.model ??
+      "sonnet",
     permissionMode:
-      options?.permissionMode ?? defaults.permissionMode ?? "default",
+      options?.permissionMode ??
+      (parsedClaudeArgs.permissionMode as PermissionMode | undefined) ??
+      defaults.permissionMode ??
+      "default",
     terminalBackend: options?.terminalBackend ?? defaults.terminalBackend ?? "auto",
+    allowTextResponses:
+      options?.allowTextResponses ?? defaults.allowTextResponses ?? false,
     paneWidth: options?.paneWidth ?? defaults.paneWidth ?? DEFAULT_PANE_WIDTH,
     paneHeight:
       options?.paneHeight ?? defaults.paneHeight ?? DEFAULT_PANE_HEIGHT,
@@ -253,10 +275,11 @@ class ClaudrabandRuntime implements Claudraband {
     const cfg = normalizeOptions(this.defaults, options);
     const wrapper = new ClaudeWrapper({
       model: cfg.model,
+      claudeArgs: cfg.claudeArgs,
       permissionMode: cfg.permissionMode,
       terminalBackend: cfg.terminalBackend,
       workingDir: cfg.cwd,
-      tmuxSession: "claudraband-" + randomID().slice(0, 12),
+      tmuxSession: SHARED_TMUX_SESSION,
       paneWidth: cfg.paneWidth,
       paneHeight: cfg.paneHeight,
     });
@@ -268,6 +291,7 @@ class ClaudrabandRuntime implements Claudraband {
       cfg.cwd,
       cfg.model,
       cfg.permissionMode,
+      cfg.allowTextResponses,
       cfg.logger,
       cfg.onPermissionRequest,
       lifetime,
@@ -281,10 +305,11 @@ class ClaudrabandRuntime implements Claudraband {
     const cfg = normalizeOptions(this.defaults, options);
     const wrapper = new ClaudeWrapper({
       model: cfg.model,
+      claudeArgs: cfg.claudeArgs,
       permissionMode: cfg.permissionMode,
       terminalBackend: cfg.terminalBackend,
       workingDir: cfg.cwd,
-      tmuxSession: "claudraband-" + randomID().slice(0, 12),
+      tmuxSession: SHARED_TMUX_SESSION,
       paneWidth: cfg.paneWidth,
       paneHeight: cfg.paneHeight,
     });
@@ -296,6 +321,7 @@ class ClaudrabandRuntime implements Claudraband {
       cfg.cwd,
       cfg.model,
       cfg.permissionMode,
+      cfg.allowTextResponses,
       cfg.logger,
       cfg.onPermissionRequest,
       lifetime,
@@ -328,6 +354,7 @@ class ClaudrabandRuntime implements Claudraband {
 
 interface SessionWrapper extends Wrapper {
   capturePane(): Promise<string>;
+  setModel(model: string): void;
   setPermissionMode(mode: string): void;
   restart(): Promise<void>;
 }
@@ -346,6 +373,7 @@ class ClaudrabandSessionImpl implements ClaudrabandSession {
   private readonly pumpPromise: Promise<void>;
   private _model: string;
   private _permissionMode: PermissionMode;
+  private allowTextResponses: boolean;
 
   constructor(
     wrapper: SessionWrapper,
@@ -353,6 +381,7 @@ class ClaudrabandSessionImpl implements ClaudrabandSession {
     readonly cwd: string,
     model: string,
     permissionMode: PermissionMode,
+    allowTextResponses: boolean,
     logger: ClaudrabandLogger,
     onPermissionRequest: ClaudrabandOptions["onPermissionRequest"],
     lifetime: AbortController,
@@ -360,6 +389,7 @@ class ClaudrabandSessionImpl implements ClaudrabandSession {
     this.wrapper = wrapper;
     this._model = model;
     this._permissionMode = permissionMode;
+    this.allowTextResponses = allowTextResponses;
     this.logger = logger;
     this.onPermissionRequest = onPermissionRequest;
     this.lifetime = lifetime;
@@ -414,6 +444,37 @@ class ClaudrabandSessionImpl implements ClaudrabandSession {
     }
   }
 
+  async awaitTurn(): Promise<PromptResult> {
+    if (this.promptAbortController) {
+      this.promptAbortController.abort();
+    }
+
+    const controller = new AbortController();
+    this.promptAbortController = controller;
+
+    // Create a waiter that skips user echo matching — there's no outgoing
+    // message to echo, we just want to drain the current turn (handling
+    // any pending permissions/questions along the way).
+    const prompt = this.newPromptWaiter("");
+    prompt.matchedUserEcho = true;
+    this.activePrompt = prompt;
+
+    this.logger.info("awaitTurn", "sid", this.sessionId);
+
+    try {
+      const stopReason = await this.waitForPromptCompletion(prompt, controller.signal);
+      this.logger.info("awaitTurn completed", "sid", this.sessionId, "stop_reason", stopReason);
+      return { stopReason };
+    } finally {
+      if (this.activePrompt === prompt) {
+        this.activePrompt = null;
+      }
+      if (this.promptAbortController === controller) {
+        this.promptAbortController = null;
+      }
+    }
+  }
+
   send(text: string): Promise<void> {
     return this.wrapper.send(text);
   }
@@ -438,6 +499,7 @@ class ClaudrabandSessionImpl implements ClaudrabandSession {
 
   async setModel(model: string): Promise<void> {
     this._model = model;
+    this.wrapper.setModel(model);
     await this.wrapper.send(`/model ${model}`);
   }
 
@@ -708,8 +770,17 @@ class ClaudrabandSessionImpl implements ClaudrabandSession {
       })),
     });
 
+    if (decision.outcome === "deferred") {
+      return false;
+    }
+
     if (decision.outcome === "cancelled") {
       await this.wrapper.interrupt();
+      return true;
+    }
+
+    if (decision.outcome === "text") {
+      await this.wrapper.send(decision.text);
       return true;
     }
 
@@ -737,24 +808,26 @@ class ClaudrabandSessionImpl implements ClaudrabandSession {
         title: question.header || "Claude has a question",
         kind: "other",
         content: [{ type: "text", text: question.question }],
-        options: [
-          ...question.options.map((opt, i) => ({
-            kind: "allow_once" as const,
-            optionId: String(i + 1),
-            name: opt.label + (opt.description ? ` — ${opt.description}` : ""),
-          })),
-          {
-            kind: "reject_once" as const,
-            optionId: "0",
-            name: "Cancel",
-          },
-        ],
+        options: buildAskUserQuestionOptions(question, this.allowTextResponses),
       });
 
-      if (
-        decision.outcome === "cancelled" ||
-        decision.optionId === "0"
-      ) {
+      if (decision.outcome === "deferred") {
+        // Leave the question pending — caller can resume later with --select.
+        return;
+      }
+
+      if (decision.outcome === "cancelled") {
+        await this.wrapper.interrupt();
+        return;
+      }
+
+      if (decision.outcome === "text") {
+        await this.wrapper.send(decision.text);
+        return;
+      }
+
+      // outcome === "selected"
+      if (decision.optionId === "0") {
         await this.wrapper.interrupt();
         return;
       }
@@ -780,6 +853,7 @@ class ClaudrabandSessionImpl implements ClaudrabandSession {
 }
 
 export const __test = {
+  buildAskUserQuestionOptions,
   createTerminalHost,
   createSession(
     wrapper: SessionWrapper,
@@ -788,6 +862,7 @@ export const __test = {
       cwd?: string;
       model?: string;
       permissionMode?: PermissionMode;
+      allowTextResponses?: boolean;
       logger?: ClaudrabandLogger;
       onPermissionRequest?: ClaudrabandOptions["onPermissionRequest"];
       lifetime?: AbortController;
@@ -799,12 +874,39 @@ export const __test = {
       options.cwd ?? "/tmp",
       options.model ?? "sonnet",
       options.permissionMode ?? "default",
+      options.allowTextResponses ?? false,
       options.logger ?? makeDefaultLogger(),
       options.onPermissionRequest,
       options.lifetime ?? new AbortController(),
     );
   },
 };
+
+function buildAskUserQuestionOptions(
+  question: AskUserQuestionItem,
+  allowTextResponses: boolean,
+): ClaudrabandPermissionOption[] {
+  return [
+    ...question.options.map((opt, i) => ({
+      kind: "allow_once" as const,
+      optionId: String(i + 1),
+      name: opt.label + (opt.description ? ` — ${opt.description}` : ""),
+    })),
+    ...(allowTextResponses
+      ? [{
+          kind: "allow_once" as const,
+          optionId: String(question.options.length + 1),
+          name: "Type a response",
+          textInput: true,
+        }]
+      : []),
+    {
+      kind: "reject_once" as const,
+      optionId: "0",
+      name: "Cancel",
+    },
+  ];
+}
 
 async function discoverSessions(cwdFilter?: string): Promise<SessionSummary[]> {
   const projectsDir = join(homedir(), ".claude", "projects");
@@ -902,11 +1004,6 @@ async function extractSessionTitle(filePath: string): Promise<string | null> {
   }
 
   return null;
-}
-
-function randomID(): string {
-  const bytes = crypto.getRandomValues(new Uint8Array(12));
-  return Array.from(bytes, (b) => b.toString(16).padStart(2, "0")).join("");
 }
 
 function mapToolKind(toolName: string): ToolKind {

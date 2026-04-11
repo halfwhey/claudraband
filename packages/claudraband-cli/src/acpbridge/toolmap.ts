@@ -41,32 +41,6 @@ export function mapToolKind(toolName: string): ToolKind {
   }
 }
 
-interface AskUserQuestionOption {
-  label: string;
-  description: string;
-}
-
-interface AskUserQuestionItem {
-  question: string;
-  header: string;
-  multiSelect: boolean;
-  options: AskUserQuestionOption[];
-}
-
-interface AskUserQuestion {
-  questions: AskUserQuestionItem[];
-}
-
-export function parseAskUserQuestion(rawInput: string): AskUserQuestion | null {
-  try {
-    const q = JSON.parse(rawInput) as AskUserQuestion;
-    if (!q.questions || q.questions.length === 0) return null;
-    return q;
-  } catch {
-    return null;
-  }
-}
-
 interface ToolCallLocation {
   path: string;
   line?: number;

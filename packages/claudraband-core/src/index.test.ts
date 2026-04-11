@@ -72,6 +72,8 @@ class FakeWrapper implements Wrapper {
     return "";
   }
 
+  setModel(_model: string): void {}
+
   setPermissionMode(_mode: string): void {}
 
   async restart(): Promise<void> {}
@@ -197,5 +199,34 @@ describe("claudraband session runtime", () => {
 
     await stream;
     await session.stop();
+  });
+
+  test("does not offer free-form AskUserQuestion responses unless enabled", () => {
+    const question = {
+      question: "What should I do?",
+      header: "Claude has a question",
+      multiSelect: false,
+      options: [
+        { label: "Yes", description: "Proceed" },
+        { label: "No", description: "Stop" },
+      ],
+    };
+
+    const acpOptions = __test.buildAskUserQuestionOptions(question, false);
+    expect(acpOptions.map((option) => option.name)).toEqual([
+      "Yes — Proceed",
+      "No — Stop",
+      "Cancel",
+    ]);
+    expect(acpOptions.some((option) => option.textInput)).toBe(false);
+
+    const cliOptions = __test.buildAskUserQuestionOptions(question, true);
+    expect(cliOptions.map((option) => option.name)).toEqual([
+      "Yes — Proceed",
+      "No — Stop",
+      "Type a response",
+      "Cancel",
+    ]);
+    expect(cliOptions.find((option) => option.textInput)?.name).toBe("Type a response");
   });
 });

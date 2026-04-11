@@ -12,6 +12,7 @@ import {
 } from "../terminal";
 
 export interface ClaudeConfig {
+  claudeArgs: string[];
   model: string;
   permissionMode: string;
   workingDir: string;
@@ -46,6 +47,10 @@ export class ClaudeWrapper implements Wrapper {
 
   model(): string {
     return this.cfg.model;
+  }
+
+  setModel(model: string): void {
+    this.cfg.model = model;
   }
 
   setPermissionMode(mode: string): void {
@@ -109,7 +114,7 @@ export class ClaudeWrapper implements Wrapper {
   }
 
   private buildCmd(...extra: string[]): string[] {
-    const cmd = ["claude", "--model", this.cfg.model];
+    const cmd = ["claude", "--model", this.cfg.model, ...this.cfg.claudeArgs];
     if (this.cfg.permissionMode && this.cfg.permissionMode !== "default") {
       cmd.push("--permission-mode", this.cfg.permissionMode);
     }
@@ -122,6 +127,7 @@ export class ClaudeWrapper implements Wrapper {
     this.terminal = createTerminalHost({
       backend: this.cfg.terminalBackend,
       tmuxSessionName: this.cfg.tmuxSession,
+      tmuxWindowName: this._claudeSessionId,
     });
 
     signal.addEventListener("abort", () => {
@@ -207,4 +213,31 @@ export class ClaudeWrapper implements Wrapper {
       yield* this.eventIterable;
     }
   }
+}
+
+export interface ParsedClaudeArgs {
+  passthroughArgs: string[];
+  model?: string;
+  permissionMode?: string;
+}
+
+export function parseClaudeArgs(args: string[]): ParsedClaudeArgs {
+  const passthroughArgs: string[] = [];
+  let model: string | undefined;
+  let permissionMode: string | undefined;
+
+  for (let i = 0; i < args.length; i++) {
+    const arg = args[i];
+    if (arg === "--model" && i + 1 < args.length) {
+      model = args[++i];
+      continue;
+    }
+    if (arg === "--permission-mode" && i + 1 < args.length) {
+      permissionMode = args[++i];
+      continue;
+    }
+    passthroughArgs.push(arg);
+  }
+
+  return { passthroughArgs, model, permissionMode };
 }
