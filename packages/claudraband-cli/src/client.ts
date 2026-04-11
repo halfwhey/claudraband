@@ -2,7 +2,7 @@ import { createInterface } from "node:readline/promises";
 import type {
   ClaudrabandPermissionDecision,
   ClaudrabandPermissionRequest,
-} from "claudraband";
+} from "claudraband-core";
 import type { Renderer } from "./render";
 
 export async function requestPermission(

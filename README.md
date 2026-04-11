@@ -1,46 +1,53 @@
 # claudraband
 
-Claude Code for apps that were not invited.
+`claudraband` is a local wrapper around the official `claude` CLI that let's you utilize your Claude Code subscription with an alternative frontend or cli.
 
-`claudraband` is now split into three packages:
+- Doesn't replace Claude Code. 
+- Doesn't bypass Claude Code.
+- Doesn't intercept Oauth tokens.
 
-- `claudraband`: the TypeScript library for driving the real `claude` CLI
+We wrap the full Claue Code TUI in a terminal and drive that terminal.
+
+The repo is split into three packages:
+
+- `claudraband-core`: the TypeScript library for driving the real `claude` CLI
 - `claudraband-acp`: an ACP adapter built on top of that library
 - `claudraband-cli`: the first-party terminal client built on top of that library
 
-The trick is still the same: we use the real Claude Code process, drive it through a hidden `tmux` session, read Claude's JSONL session log, and expose a cleaner control surface on top.
-
-If the rule is "you can't use Claude Code subscriptions from third-party apps", this is the annoyingly literal response: we are still using Claude Code. We just automated the typing and the reading.
-
-This is a local wrapper, not a hosted Claude replacement. Claude Code is still the process doing the work. You are still responsible for using it in ways you're comfortable with.
-
 ## What You Get
 
-- `claudraband`: reusable TypeScript library for starting, resuming, prompting, and interrupting Claude Code sessions
+- `claudraband-core`: reusable TypeScript library for starting, resuming, replaying, prompting, and interrupting Claude Code sessions
 - `claudraband-acp`: an ACP server that wraps your local Claude Code install
 - `claudraband-cli`: direct first-party CLI for local terminal use
-- resumable sessions backed by Claude's real session IDs
-- interactive REPL mode for quick terminal conversations
-- session listing and replay for a given working directory
-- per-session `tmux` isolation so multiple conversations can run at once
-- model and permission mode controls exposed through both the library and ACP
+- resumable sessions backed by Claude's real session IDs (which addresses the `claude -p` limitation of not being resumable)
+- optional terminal backends:
+  - `tmux` for detached terminal sessions
+  - `xterm` for headless PTY-backed sessions
 
 ## Why This Exists
 
-Because "just use Claude Code directly" stops being useful the second you want:
+You can use:
 
-- Claude Code inside an ACP editor
-- Claude Code behind a custom terminal workflow
-- Claude Code sessions you can list, resume, and script
-- Claude Code as infrastructure instead of a single full-screen TUI
+- Claude Code inside an ACP editor such as `toad` and `zed` (https://agentclientprotocol.com/get-started/clients, session support by the clients are not reliable yet, though claudraband fully supports it).
+- Claude Code behind a custom scripting workflow that depends on resumability. 
 
-`claudraband` does not replace Claude Code. It liberates it from its own terminal window.
+## Terminal Backends
 
-## Requirements
+- `tmux`: runs Claude Code in a detached `tmux` session
+- `xterm`: runs Claude Code in a headless terminal session
+- `auto`: prefers `tmux` when available, otherwise falls back to `xterm`
 
-- Bun 1.3+
-- `tmux` 3.x
-- `claude` CLI installed and authenticated
+The `xterm` backend is runtime-aware:
+
+- under Bun, it uses `Bun.Terminal`
+- under Node, it uses `node-pty`
+- in both cases it keeps a headless xterm screen model for terminal capture and prompt detection
+
+## Tested on
+
+- `claude` v2.1.96 (Already authenticated)
+- Bun 1.3+ for the default local workflow and build scripts
+- `tmux` 3.x only if you want the `tmux` backend
 
 ## Build
 
@@ -48,18 +55,23 @@ Because "just use Claude Code directly" stops being useful the second you want:
 make build
 ```
 
-Or build each target separately:
+That builds the packages and leaves repo-root launchers in place:
+
+- `./claudraband`
+- `./claudraband-acp`
+
+You can also build each package separately:
 
 ```sh
-make build-lib      # -> ./dist/claudraband
-make build-acp      # -> ./claudraband-acp
-make build-cli      # -> ./claudraband
+make build-lib
+make build-acp
+make build-cli
 ```
 
 ## Quick Start
 
 ```sh
-# Build both binaries
+# Build everything
 make build
 
 # Ask Claude Code something directly
@@ -74,98 +86,9 @@ make build
 # Resume one later
 ./claudraband resume <session-id> "continue from where we left off"
 
-# Use the ACP adapter from an ACP-speaking client
+# Force the headless backend if you don't want tmux
+./claudraband --terminal-backend xterm "review the staged diff"
+
+# Start the ACP adapter
 ./claudraband-acp --model opus
-```
-
-## Cool Things To Demo
-
-### 1. Claude Code inside an ACP client
-
-Point any ACP-speaking tool at `claudraband-acp` and it gets Claude Code without needing native Claude support. If it can spawn an ACP subprocess, it can now "support Claude Code" by accident.
-
-### 2. Scripted repo review from the terminal
-
-```sh
-./claudraband "review the staged diff, list the three biggest risks, then draft a commit message"
-```
-
-This is useful when you want Claude Code's judgement without living inside Claude Code's UI.
-
-### 3. Long-lived project foreman
-
-Start a session, let Claude inspect the repo, exit, then resume the exact same session later:
-
-```sh
-./claudraband -i
-./claudraband sessions
-./claudraband resume <session-id> "pick up the refactor plan"
-```
-
-Because the session is Claude's real session, history survives outside the wrapper process.
-
-### 4. Parallel Claude workers
-
-Each ACP session gets its own hidden `tmux` session. That means you can run multiple Claude Code conversations at once across different repos or different tasks without sharing one giant TUI.
-
-Examples:
-
-- one session reviewing a PR
-- one session writing tests
-- one session summarizing the codebase for a new teammate
-
-### 5. Permission mode switching from the client side
-
-`claudraband` exposes Claude Code permission modes through ACP, so a client can flip between safer planning and more aggressive execution without manually driving the TUI.
-
-Available modes:
-
-- `default`
-- `plan`
-- `auto`
-- `acceptEdits`
-- `dontAsk`
-- `bypassPermissions`
-
-### 6. A tiny protocol adapter with disproportionate consequences
-
-The `claudraband` library is the real product surface. `claudraband-acp` is just one adapter on top:
-
-- build your own Claude automation in TypeScript
-- reuse session discovery, replay, and permission mediation logic
-- prove an ACP client works before wiring it into a UI
-- wrap Claude Code for tools that only understand ACP
-
-## How The Trick Works
-
-1. An ACP client launches `claudraband-acp` as a subprocess over stdio JSON-RPC.
-2. `claudraband-acp` starts Claude Code in a detached `tmux` session.
-3. It watches Claude's on-disk JSONL session file in `~/.claude/projects/...`.
-4. It parses Claude events and turns them into ACP `session/update` notifications.
-5. The client renders Claude Code like it was a native ACP agent the whole time.
-
-It is not elegant. It is effective.
-
-## Monorepo Layout
-
-```text
-packages/claudraband/      reusable Claude Code control library
-packages/claudraband-acp/  ACP adapter
-packages/claudraband-cli/  first-party terminal client
-```
-
-Inside `packages/claudraband/src/`:
-
-```text
-claude/                Claude Code wrapper + JSONL parser
-tmuxctl/               tmux session primitives
-wrap/                  event types and low-level wrapper internals
-index.ts               public library API
-```
-
-## Development
-
-```sh
-make test
-make typecheck
 ```

@@ -1,4 +1,4 @@
-import type { TerminalBackend } from "claudraband";
+import type { TerminalBackend } from "claudraband-core";
 
 interface ParseIo {
   stdout(text: string): void;

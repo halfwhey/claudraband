@@ -13,7 +13,7 @@
   },
   "dependencies": {
     "@agentclientprotocol/sdk": "^0.18.0",
-    "claudraband": "workspace:*"
+    "claudraband-core": "workspace:*"
   },
   "devDependencies": {
     "@types/bun": "^1.2.0",

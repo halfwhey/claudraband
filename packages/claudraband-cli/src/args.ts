@@ -1,4 +1,4 @@
-import type { PermissionMode, TerminalBackend } from "claudraband";
+import type { PermissionMode, TerminalBackend } from "claudraband-core";
 
 interface ParseIo {
   stdout(text: string): void;

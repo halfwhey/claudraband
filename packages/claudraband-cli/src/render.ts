@@ -1,5 +1,5 @@
-import type { ClaudrabandEvent } from "claudraband";
-import { EventKind } from "claudraband";
+import type { ClaudrabandEvent } from "claudraband-core";
+import { EventKind } from "claudraband-core";
 
 const DIM = "\x1b[2m";
 const BOLD = "\x1b[1m";

@@ -41,7 +41,7 @@ import {
   type ClaudrabandSession,
   type PermissionMode,
   type TerminalBackend,
-} from "claudraband";
+} from "claudraband-core";
 import { extractLocations, mapToolKind } from "./toolmap";
 
 function buildConfigOptions(

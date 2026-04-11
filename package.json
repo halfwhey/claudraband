@@ -4,7 +4,7 @@
   "workspaces": ["packages/*"],
   "scripts": {
     "build": "bun run --filter '*' build",
-    "test": "bun test packages/claudraband/src packages/claudraband-acp/src packages/claudraband-cli/src",
+    "test": "bun test packages/claudraband-core/src packages/claudraband-acp/src packages/claudraband-cli/src",
     "typecheck": "tsc -b"
   }
 }

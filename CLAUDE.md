@@ -13,7 +13,7 @@ make test           # run all tests
 make typecheck      # typecheck both packages
 
 # Run a single test file
-bun test packages/claudraband/src/claude/parser.test.ts
+bun test packages/claudraband-core/src/claude/parser.test.ts
 
 # Run tests matching a pattern
 bun test --test-name-pattern "Tailer"
@@ -23,7 +23,7 @@ bun test --test-name-pattern "Tailer"
 
 Bun workspaces monorepo with three packages:
 
-- `packages/claudraband/` -- TypeScript library for controlling Claude Code
+- `packages/claudraband-core/` -- TypeScript library for controlling Claude Code (package: `claudraband-core`)
 - `packages/claudraband-acp/` -- ACP adapter wrapping the library (binary: `claudraband-acp`)
 - `packages/claudraband-cli/` -- First-party CLI built on the library (binary: `claudraband`)
 
@@ -31,7 +31,7 @@ The main product surface is the library. The ACP package and CLI are adapters la
 
 ## Architecture
 
-### Library (`packages/claudraband/`)
+### Library (`packages/claudraband-core/`)
 
 Controls Claude Code directly. It spawns Claude in tmux, tails Claude's JSONL session log, exposes typed events, supports session listing/resume/replay, and normalizes permission requests into a callback interface.
 

@@ -3,8 +3,8 @@ import type {
   ClaudrabandLogger,
   ClaudrabandPermissionRequest,
   ClaudrabandSession,
-} from "claudraband";
-import { createClaudraband } from "claudraband";
+} from "claudraband-core";
+import { createClaudraband } from "claudraband-core";
 import { parseArgs } from "./args";
 import { requestPermission } from "./client";
 import { Renderer } from "./render";
