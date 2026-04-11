@@ -1,8 +1,111 @@
+<div align="center">
+
 # claudraband
 
-`claudraband` is a local wrapper around the official `claude` CLI.
+Control the real local Claude Code CLI from other interfaces by extracting an API out of a terminal.
 
-It does not replace Claude Code or bypass it. It just gives you other ways to drive the real local Claude Code session: a direct CLI, `--acp` for editor integrations, and `serve` for persistent headless `xterm` sessions.
+[What it does](#what-it-does) •
+[Getting started](#getting-started) •
+[Options][options] •
+[Examples](#examples) •
+[Session behavior](#session-behavior) •
+[Troubleshooting](#troubleshooting)
+
+</div>
+
+## What it does
+
+- Wraps the official local `claude` CLI instead of replacing it
+- Drives the real Claude Code TUI through a terminal session
+- Exposes that terminal-driven runtime as:
+  - a direct CLI
+  - an ACP server over stdio
+  - a small daemon for persistent headless `xterm` sessions
+- Preserves real Claude session IDs so sessions can be resumed later
+- Supports `tmux` for detached local sessions and `xterm` for headless PTY-backed sessions
+- Lets other tools reuse an already-authenticated Claude Code install without touching auth tokens
+
+> **Terminal abuse**: `claudraband` exists because Claude Code did not expose the interface I wanted. So this project gets one by running the real TUI in a terminal and treating that terminal as the API surface. It is slightly cursed, but practical.
+
+## Getting started
+
+### Requirements
+
+- A working local `claude` CLI install with an authenticated Claude Code session
+- Node.js or Bun
+- `tmux` if you want persistent detached local sessions
+- `node-pty` only when running the `xterm` backend under Node instead of Bun
+
+<details>
+<summary>Current runtime model</summary>
+
+- `tmux`: best local persistence story, since the Claude Code process stays attached to a live tmux pane
+- `xterm` under Bun: headless PTY via `Bun.Terminal`
+- `xterm` under Node: headless PTY via optional `node-pty`
+- `serve`: keeps `xterm` sessions alive in a daemon so clients can reconnect later
+
+</details>
+
+### Installation
+
+Build from source:
+
+```sh
+make build
+```
+
+That builds:
+
+- `packages/claudraband-core/dist/index.js`
+- `packages/claudraband-cli/dist/index.js`
+- `packages/claudraband-cli/dist/bin.js`
+
+If you are using the published CLI instead of this repo checkout:
+
+```sh
+npx claudraband --help
+```
+
+### Quick start
+
+```sh
+# build from source
+make build
+
+# published CLI
+npx claudraband --help
+
+# ask Claude Code something directly
+claudraband "audit the last commit and tell me what looks risky"
+
+# interactive REPL
+claudraband -i
+
+# list resumable sessions
+claudraband sessions
+
+# resume a session
+claudraband -s <session-id> "continue from where we left off"
+
+# answer a deferred prompt in a live session
+claudraband -s <session-id> --select 1
+
+# run as an ACP server over stdio
+claudraband --acp --claude "--model opus"
+
+# start the daemon for persistent headless xterm sessions
+claudraband serve --port 7842
+
+# connect to a running daemon
+claudraband --server localhost:7842 "hello"
+
+# headless local xterm
+claudraband --terminal-backend xterm -c "--dangerously-skip-permissions" "run without tmux"
+```
+
+## Options
+
+See [docs/options.md][options] for the command reference, backend behavior, daemon mode, and library surface.
 
 ## Examples
 
@@ -10,99 +113,74 @@ It does not replace Claude Code or bypass it. It just gives you other ways to dr
 
 ![Toad driving Claude Code](assets/toad-example.png)
 
-*Using [toad](https://github.com/batrachianai/toad) as the TUI while claudraband drives the real Claude Code session underneath.*
+Using [toad](https://github.com/batrachianai/toad) as the UI while `claudraband` drives the real Claude Code session underneath.
 
 ### Self-interrogate
 
 ![Self interrogation example](assets/self-interrogate.png)
 
-*Claude session IDs can be tied to commits, then resumed later so Claude can explain why it made a change. Useful for Claude itself, Codex, or any other harness that wants the original session context back.*
+Claude session IDs can be tied to commits and resumed later so the original session can explain why it made a change.
 
 ### Zed
 
 ![Zed driving Claude Code through claudraband](assets/zed-example.png)
 
-*Same idea as the toad setup, but inside Zed through ACP.*
+Same basic idea, but through ACP inside Zed.
 
-## Quick Start
-
-```sh
-# build
-make build
-
-# ask Claude something
-node packages/claudraband-cli/dist/bin.js "audit the last commit"
-
-# interactive mode
-node packages/claudraband-cli/dist/bin.js -i
-
-# list sessions
-node packages/claudraband-cli/dist/bin.js sessions
-
-# resume a session
-node packages/claudraband-cli/dist/bin.js -s <session-id> "continue from there"
-
-# answer a deferred prompt in a live session
-node packages/claudraband-cli/dist/bin.js -s <session-id> --select 1
-
-# ACP mode
-node packages/claudraband-cli/dist/bin.js --acp
-
-# daemon for persistent xterm sessions
-node packages/claudraband-cli/dist/bin.js serve --port 7842
-node packages/claudraband-cli/dist/bin.js --server localhost:7842 "hello"
-```
-
-For published usage:
+### Direct CLI with shared local tmux session
 
 ```sh
-npx claudraband --help
-npx claudraband --acp
-bunx claudraband --help
-bunx claudraband --acp
+claudraband "review the staged diff"
+claudraband sessions
+claudraband -s <session-id> "keep going"
 ```
+
+### Daemon-backed xterm sessions
+
+```sh
+claudraband serve --port 7842
+claudraband --server localhost:7842 "start a refactor plan"
+claudraband sessions --server localhost:7842
+```
+
+### Headless local xterm
+
+```sh
+claudraband --terminal-backend xterm -c "--dangerously-skip-permissions" "run without tmux"
+```
+
+## Session behavior
+
+- CLI + `tmux`: sessions stay alive as long as the local tmux-hosted Claude process stays alive
+- CLI + local `xterm`: sessions are not truly persistent; resume works by starting `claude --resume <id>`
+- CLI + `serve`: the daemon keeps `xterm` sessions alive so you can reconnect and answer deferred prompts later
+- ACP + `tmux`: sessions survive ACP disconnect because `claudraband` detaches instead of stopping them
+- ACP + local `xterm`: sessions live only as long as the ACP process does
+
+> **Important**: local `xterm` without `tmux` or `serve` requires dangerous Claude permission settings such as `-c "--dangerously-skip-permissions"` or `-c "--permission-mode bypassPermissions"`.
 
 ## Packages
 
-- `claudraband-core`: TypeScript library for starting, resuming, replaying, prompting, and interrupting real Claude Code sessions
-- `claudraband`: the CLI package, with direct terminal mode, `--acp`, and `serve`
+- `claudraband-core`: TypeScript runtime for controlling local Claude Code sessions through a real terminal
+- `claudraband`: CLI package exposing direct mode, ACP mode, and daemon mode
 
-## Backends
+## Troubleshooting
 
-- `tmux`: persistent local sessions
-- `xterm`: headless PTY-backed sessions
-- `auto`: prefer `tmux`, fall back to `xterm`
+### `xterm` mode exits with a permissions error
 
-`xterm` uses:
+Local headless `xterm` mode only works when Claude itself is allowed to proceed without an interactive permission prompt. Use one of:
 
-- `Bun.Terminal` under Bun
-- `node-pty` under Node
+- `--terminal-backend tmux`
+- `--server <host:port>`
+- `-c "--dangerously-skip-permissions"`
+- `-c "--permission-mode bypassPermissions"`
 
-## Session Behavior
+### Resume works, but an old interactive question is gone
 
-- CLI + `tmux`: sessions stay alive as long as the tmux window stays alive. If the shared tmux session does not exist yet, claudraband creates it.
-- CLI + local `xterm`: sessions are not persistent. Resume works by starting `claude --resume <id>`, so blocked interactive state is not preserved.
-- CLI + `--server`: the daemon keeps `xterm` sessions alive, so you can reconnect later and answer deferred prompts.
-- ACP + `tmux`: sessions survive ACP disconnect because claudraband detaches instead of stopping them.
-- ACP + local `xterm`: sessions only live as long as the ACP process does.
+That usually means the original session was not still live. Replaying a session with `claude --resume <id>` restores the conversation history, but not every blocked terminal state. If you need reconnectable pending questions, use `tmux` or the daemon.
 
-One important restriction:
+### `xterm` under Node complains about `node-pty`
 
-- local `xterm` without `tmux` or `--server` requires dangerous permission settings such as `-c "--dangerously-skip-permissions"` or `-c "--permission-mode bypassPermissions"`
+Install the optional `node-pty` dependency or run the CLI through Bun so `Bun.Terminal` can be used instead.
 
-## Why This Exists
-
-- Use Claude Code from other frontends like Toad or Zed
-- Keep resumable Claude sessions in custom workflows
-- Let other harnesses ask an existing Claude session what it was doing
-
-## Build
-
-```sh
-make build
-```
-
-Build output:
-
-- `packages/claudraband-core/dist/index.js`
-- `packages/claudraband-cli/dist/bin.js`
+[options]: docs/options.md
