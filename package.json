@@ -3,7 +3,7 @@
   "private": true,
   "workspaces": ["packages/*"],
   "dependencies": {
-    "claudraband": "workspace:packages/claudraband-cli"
+    "@halfwhey/claudraband": "workspace:packages/claudraband-cli"
   },
   "scripts": {
     "build": "bun run --filter claudraband-core build && bun run --filter claudraband build",

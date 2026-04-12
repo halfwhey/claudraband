@@ -1,5 +1,5 @@
 {
-  "name": "claudraband-core",
+  "name": "@halfwhey/claudraband-core",
   "version": "0.1.0",
   "description": "TypeScript runtime for controlling local Claude Code sessions through a real terminal.",
   "type": "module",
@@ -30,6 +30,19 @@
   },
   "optionalDependencies": {
     "node-pty": "^1.0.0"
+  },
+  "keywords": [
+    "claude",
+    "claude-code",
+    "agent",
+    "tmux",
+    "session"
+  ],
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/halfwhey/claudraband",
+    "directory": "packages/claudraband-core"
   },
   "devDependencies": {
     "@types/bun": "^1.2.0",

@@ -5,13 +5,13 @@
 For the command-line interface, see [docs/cli.md](cli.md).
 
 ```sh
-npm install claudraband
+npm install @halfwhey/claudraband
 ```
 
 ## Quick start
 
 ```typescript
-import { createClaudraband } from "claudraband";
+import { createClaudraband } from "@halfwhey/claudraband";
 
 const runtime = createClaudraband({ model: "sonnet" });
 const session = await runtime.startSession({ cwd: "/my/project" });
@@ -83,7 +83,7 @@ Returned by `startSession` and `resumeSession`.
 `session.events()` returns an `AsyncIterable<ClaudrabandEvent>`. Events keep flowing regardless of whether a prompt is active.
 
 ```typescript
-import { createClaudraband, EventKind } from "claudraband";
+import { createClaudraband, EventKind } from "@halfwhey/claudraband";
 
 const runtime = createClaudraband();
 const session = await runtime.startSession({ cwd: "." });

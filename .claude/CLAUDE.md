@@ -22,12 +22,12 @@ bun test --test-name-pattern "Tailer"
 
 Bun workspaces monorepo with two packages:
 
-- `packages/claudraband-core/` -- TypeScript library for controlling Claude Code (package: `claudraband-core`)
+- `packages/claudraband-core/` -- TypeScript library for controlling Claude Code (package: `@halfwhey/claudraband-core`)
 - `packages/claudraband-cli/` -- First-party CLI built on the library (package + binary: `claudraband`)
 
 The main product surfaces are:
 
-- `claudraband-core` as the library
+- `@halfwhey/claudraband-core` as the library
 - `claudraband` as the published CLI, including `--acp` mode over stdio
 
 ## Architecture
@@ -71,6 +71,6 @@ Turn completion detection uses an idle timer: after receiving assistant text wit
 ## CLI Conventions
 
 - For local built usage, run `node packages/claudraband-cli/dist/bin.js ...` or `bun packages/claudraband-cli/dist/bin.js ...`.
-- For published usage, run `npx claudraband ...` or `bunx claudraband ...`.
+- For published usage, run `npx @halfwhey/claudraband ...` or `bunx @halfwhey/claudraband ...`.
 - Claude launch flags are passed through a single option: `--claude "<flags>"`.
 - Local wrapper flags such as `--acp`, `--terminal-backend`, `--approve-all`, `--select`, and `--debug` stay at the claudraband layer.

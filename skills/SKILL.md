@@ -9,7 +9,7 @@ Claudraband spawns Claude Code in a hidden shared tmux session, tails its JSONL 
 
 Local built binary: `node packages/claudraband-cli/dist/bin.js` or `bun packages/claudraband-cli/dist/bin.js`
 
-Published binary: `claudraband` via `npx claudraband` or `bunx claudraband`
+Published binary: `claudraband` via `npx @halfwhey/claudraband` or `bunx @halfwhey/claudraband`
 
 ---
 

@@ -150,7 +150,7 @@ Comprehensive end-to-end test cases for claudraband.
 
 Library test script (12.1):
 ```typescript
-import { createClaudraband, EventKind } from "claudraband";
+import { createClaudraband, EventKind } from "@halfwhey/claudraband";
 const rt = createClaudraband({ model: "haiku", permissionMode: "acceptEdits" });
 const s = await rt.startSession({
   cwd: process.cwd(),
