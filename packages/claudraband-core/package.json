@@ -1,6 +1,6 @@
 {
   "name": "@halfwhey/claudraband-core",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "TypeScript runtime for controlling local Claude Code sessions through a real terminal.",
   "type": "module",
   "main": "./dist/index.js",
