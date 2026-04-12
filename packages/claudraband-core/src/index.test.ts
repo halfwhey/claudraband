@@ -124,6 +124,10 @@ class PromptLifecycleWrapper extends FakeSessionWrapper {
   }
 }
 
+const TRUST_FOLDER_PROMPT = `Is this a project you created and trust?
+❯ 1. Yes, I trust this folder
+  2. No, exit`;
+
 describe("session discovery", () => {
   let previousRegistryHome: string | undefined;
   let registryHome: string;
@@ -365,6 +369,163 @@ describe("session discovery", () => {
     const result = await session.sendAndAwaitTurn("2");
 
     expect(result).toEqual({ stopReason: "end_turn" });
+  });
+
+  test("sendAndAwaitTurn does not send a native prompt selection twice", async () => {
+    class NativePromptWrapper extends FakeSessionWrapper {
+      sent: string[] = [];
+      private pane = TRUST_FOLDER_PROMPT;
+
+      override async send(input: string): Promise<void> {
+        this.sent.push(input);
+        if (input !== "1") {
+          throw new Error(`unexpected input: ${input}`);
+        }
+        this.pane = "INSERT";
+        this.emit({
+          kind: EventKind.ToolResult,
+          time: new Date(),
+          text: "trusted",
+          toolName: "",
+          toolID: "native-prompt",
+          toolInput: "",
+          role: "user",
+        });
+        this.emit({
+          kind: EventKind.TurnEnd,
+          time: new Date(),
+          text: "",
+          toolName: "",
+          toolID: "",
+          toolInput: "",
+          role: "assistant",
+        });
+        setTimeout(() => this.finish(), 10);
+      }
+
+      override async capturePane(): Promise<string> {
+        return this.pane;
+      }
+    }
+
+    const wrapper = new NativePromptWrapper();
+    const session = __test.createSession(wrapper as never, {
+      onPermissionRequest: async () => ({ outcome: "selected", optionId: "1" }),
+    });
+
+    const result = await session.sendAndAwaitTurn("1");
+
+    expect(result).toEqual({ stopReason: "end_turn" });
+    expect(wrapper.sent).toEqual(["1"]);
+  });
+
+  test("sendAndAwaitTurn returns after consuming a startup native prompt", async () => {
+    class AcceptStartupWrapper extends FakeSessionWrapper {
+      sent: string[] = [];
+      private pane = TRUST_FOLDER_PROMPT;
+
+      override async send(input: string): Promise<void> {
+        this.sent.push(input);
+        if (input !== "1") {
+          throw new Error(`unexpected input: ${input}`);
+        }
+        this.pane = "INSERT";
+      }
+
+      override async capturePane(): Promise<string> {
+        return this.pane;
+      }
+    }
+
+    const wrapper = new AcceptStartupWrapper();
+    const session = __test.createSession(wrapper as never, {
+      onPermissionRequest: async () => ({ outcome: "selected", optionId: "1" }),
+    });
+
+    const result = await session.sendAndAwaitTurn("1");
+
+    expect(result).toEqual({ stopReason: "end_turn" });
+    expect(wrapper.sent).toEqual(["1"]);
+  });
+
+  test("prompt stops cleanly after rejecting a startup native prompt", async () => {
+    class RejectingStartupWrapper extends FakeSessionWrapper {
+      sent: string[] = [];
+      private pane = TRUST_FOLDER_PROMPT;
+
+      override async send(input: string): Promise<void> {
+        this.sent.push(input);
+        if (input !== "2") {
+          throw new Error(`unexpected input: ${input}`);
+        }
+        this.finish();
+      }
+
+      override async capturePane(): Promise<string> {
+        return this.pane;
+      }
+    }
+
+    const wrapper = new RejectingStartupWrapper();
+    const session = __test.createSession(wrapper as never, {
+      onPermissionRequest: async () => ({ outcome: "selected", optionId: "2" }),
+    });
+
+    const result = await session.prompt("hello");
+
+    expect(result).toEqual({ stopReason: "cancelled" });
+    expect(wrapper.sent).toEqual(["2"]);
+  });
+
+  test("rejecting a startup native prompt tolerates pane disappearance", async () => {
+    class VanishingRejectWrapper extends FakeSessionWrapper {
+      private pane = TRUST_FOLDER_PROMPT;
+
+      override async send(input: string): Promise<void> {
+        if (input !== "2") {
+          throw new Error(`unexpected input: ${input}`);
+        }
+        this.finish();
+        throw new Error("can't find pane: %567");
+      }
+
+      override async capturePane(): Promise<string> {
+        return this.pane;
+      }
+    }
+
+    const session = __test.createSession(new VanishingRejectWrapper() as never, {
+      onPermissionRequest: async () => ({ outcome: "selected", optionId: "2" }),
+    });
+
+    const result = await session.prompt("hello");
+
+    expect(result).toEqual({ stopReason: "cancelled" });
+  });
+
+  test("repeated polling of the same native prompt does not re-ask permission", async () => {
+    class StickyNativePromptWrapper extends FakeSessionWrapper {
+      override async capturePane(): Promise<string> {
+        return TRUST_FOLDER_PROMPT;
+      }
+
+      override async send(_input: string): Promise<void> {}
+    }
+
+    let calls = 0;
+    const session = __test.createSession(new StickyNativePromptWrapper() as never, {
+      onPermissionRequest: async () => {
+        calls++;
+        return { outcome: "selected", optionId: "1" };
+      },
+    });
+
+    const first = await (session as any).pollNativePermission(null, "1");
+    const second = await (session as any).pollNativePermission(null, "1");
+
+    expect(first).toBe("consumed");
+    expect(second).toBe("pending_clear");
+    expect(calls).toBe(1);
   });
 
   test("prompt waits for explicit turn end instead of idling out after assistant text", async () => {

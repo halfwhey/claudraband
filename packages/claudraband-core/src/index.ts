@@ -259,6 +259,18 @@ interface PendingTool {
   input: string;
 }
 
+type NativePermissionHandling =
+  | "none"
+  | "deferred"
+  | "handled"
+  | "consumed"
+  | "pending_clear";
+
+function isRejectingNativeOption(label: string): boolean {
+  const normalized = label.trim().toLowerCase();
+  return normalized.startsWith("no") || normalized.startsWith("reject");
+}
+
 interface AskUserQuestionOption {
   label: string;
   description: string;
@@ -468,6 +480,8 @@ class ClaudrabandSessionImpl implements ClaudrabandSession {
   private _permissionMode: PermissionMode;
   private allowTextResponses: boolean;
   private sessionOwner?: SessionOwnerRecord;
+  private lastNativePermissionFingerprint: string | null = null;
+  private lastNativePermissionOutcome: NativePermissionHandling = "none";
 
   constructor(
     wrapper: SessionWrapper,
@@ -519,7 +533,24 @@ class ClaudrabandSessionImpl implements ClaudrabandSession {
     this.activePrompt = prompt;
 
     this.logger.info("prompt received", "sid", this.sessionId, "length", text.length);
-    await this.wrapper.send(text);
+
+    // Handle any blocking prompt (e.g. trust folder) before sending text,
+    // otherwise the prompt text goes to the blocking prompt instead of Claude.
+    const startupState = await this.prepareForInput(text);
+    if (startupState === "blocked") {
+      this.activePrompt = null;
+      this.promptAbortController = null;
+      return { stopReason: "end_turn" };
+    }
+    if (startupState === "cancelled") {
+      this.activePrompt = null;
+      this.promptAbortController = null;
+      return { stopReason: "cancelled" };
+    }
+
+    if (startupState !== "consumed") {
+      await this.wrapper.send(text);
+    }
 
     try {
       const stopReason = await this.waitForPromptCompletion(prompt, controller.signal);
@@ -556,6 +587,19 @@ class ClaudrabandSessionImpl implements ClaudrabandSession {
     prompt.matchedUserEcho = true;
     this.activePrompt = prompt;
 
+    // Handle any blocking prompt before waiting for a turn.
+    const startupState = await this.prepareForInput(null);
+    if (startupState === "blocked") {
+      this.activePrompt = null;
+      this.promptAbortController = null;
+      return { stopReason: "end_turn" };
+    }
+    if (startupState === "cancelled") {
+      this.activePrompt = null;
+      this.promptAbortController = null;
+      return { stopReason: "cancelled" };
+    }
+
     this.logger.info("awaitTurn", "sid", this.sessionId);
 
     try {
@@ -584,6 +628,28 @@ class ClaudrabandSessionImpl implements ClaudrabandSession {
     prompt.matchedUserEcho = true;
     this.activePrompt = prompt;
 
+    // Handle any blocking prompt before sending text.
+    const startupState = await this.prepareForInput(text);
+    if (startupState === "blocked") {
+      this.activePrompt = null;
+      this.promptAbortController = null;
+      return { stopReason: "end_turn" };
+    }
+    if (startupState === "cancelled") {
+      this.activePrompt = null;
+      this.promptAbortController = null;
+      return { stopReason: "cancelled" };
+    }
+    if (startupState === "consumed") {
+      if (this.activePrompt === prompt) {
+        this.activePrompt = null;
+      }
+      if (this.promptAbortController === controller) {
+        this.promptAbortController = null;
+      }
+      return { stopReason: "end_turn" };
+    }
+
     this.logger.info("sendAndAwaitTurn", "sid", this.sessionId, "length", text.length);
     await this.wrapper.send(text);
 
@@ -609,6 +675,31 @@ class ClaudrabandSessionImpl implements ClaudrabandSession {
 
   send(text: string): Promise<void> {
     return this.wrapper.send(text);
+  }
+
+  private async prepareForInput(
+    intendedText: string | null,
+  ): Promise<"ready" | "blocked" | "consumed" | "cancelled"> {
+    const handled = await this.pollNativePermission(null, intendedText);
+    if (
+      handled === "handled"
+      || handled === "consumed"
+      || handled === "pending_clear"
+    ) {
+      const ready = await this.waitForInsertMode();
+      if (!ready) {
+        return this.wrapper.isProcessAlive() ? "blocked" : "cancelled";
+      }
+      return handled === "consumed" ? "consumed" : "ready";
+    }
+
+    const stillBlocking = hasPendingNativePrompt(
+      await this.wrapper.capturePane().catch(() => ""),
+    );
+    if (stillBlocking) {
+      return "blocked";
+    }
+    return "ready";
   }
 
   async interrupt(): Promise<void> {
@@ -972,7 +1063,7 @@ class ClaudrabandSessionImpl implements ClaudrabandSession {
         }
         if (prompt.pendingTools > 0) {
           const handled = await this.pollNativePermission(prompt.lastPendingTool);
-          if (handled) {
+          if (handled === "handled" || handled === "consumed") {
             prompt.pendingTools = Math.max(0, prompt.pendingTools - 1);
             prompt.gotResponse = true;
             prompt.lastPendingTool = null;
@@ -994,16 +1085,34 @@ class ClaudrabandSessionImpl implements ClaudrabandSession {
 
   private async pollNativePermission(
     pendingTool: PendingTool | null,
-  ): Promise<boolean> {
+    intendedText: string | null = null,
+  ): Promise<NativePermissionHandling> {
     let paneText: string;
     try {
       paneText = await this.wrapper.capturePane();
     } catch {
-      return false;
+      return "none";
     }
 
     const prompt = parseNativePermissionPrompt(paneText);
-    if (!prompt) return false;
+    if (!prompt) {
+      this.lastNativePermissionFingerprint = null;
+      this.lastNativePermissionOutcome = "none";
+      return "none";
+    }
+
+    const fingerprint = `${prompt.question}\n${prompt.options
+      .map((option) => `${option.number}:${option.label}`)
+      .join("\n")}`;
+    if (this.lastNativePermissionFingerprint === fingerprint) {
+      if (
+        this.lastNativePermissionOutcome === "handled"
+        || this.lastNativePermissionOutcome === "consumed"
+      ) {
+        return "pending_clear";
+      }
+      return this.lastNativePermissionOutcome;
+    }
 
     const decision = await this.resolvePermission({
       source: "native_prompt",
@@ -1036,22 +1145,73 @@ class ClaudrabandSessionImpl implements ClaudrabandSession {
       })),
     });
 
+    let outcome: NativePermissionHandling;
     if (decision.outcome === "deferred") {
-      return false;
+      outcome = "deferred";
+    } else if (decision.outcome === "cancelled") {
+      await this.safeInterruptNativePermission();
+      outcome = "handled";
+    } else if (decision.outcome === "text") {
+      await this.safeSendNativePermission(decision.text, false);
+      outcome = decision.text === intendedText ? "consumed" : "handled";
+    } else {
+      const selected = prompt.options.find((option) => option.number === decision.optionId);
+      const tolerateExit = selected ? isRejectingNativeOption(selected.label) : false;
+      await this.safeSendNativePermission(decision.optionId, tolerateExit);
+      outcome = decision.optionId === intendedText ? "consumed" : "handled";
     }
 
-    if (decision.outcome === "cancelled") {
+    this.lastNativePermissionFingerprint = fingerprint;
+    this.lastNativePermissionOutcome = outcome;
+    return outcome;
+  }
+
+  private async safeSendNativePermission(
+    input: string,
+    tolerateExit: boolean,
+  ): Promise<void> {
+    try {
+      await this.wrapper.send(input);
+    } catch (error) {
+      if (tolerateExit && !this.wrapper.isProcessAlive()) {
+        this.logger.debug("native permission send ignored after pane exit", "sid", this.sessionId);
+        return;
+      }
+      throw error;
+    }
+  }
+
+  private async safeInterruptNativePermission(): Promise<void> {
+    try {
       await this.wrapper.interrupt();
-      return true;
+    } catch (error) {
+      if (!this.wrapper.isProcessAlive()) {
+        this.logger.debug("native permission interrupt ignored after pane exit", "sid", this.sessionId);
+        return;
+      }
+      throw error;
     }
+  }
 
-    if (decision.outcome === "text") {
-      await this.wrapper.send(decision.text);
-      return true;
+  /**
+   * Poll the terminal until Claude enters INSERT or NORMAL mode.
+   * Used after answering a blocking prompt (e.g. trust folder) to wait
+   * for Claude to be ready to accept input.
+   */
+  private async waitForInsertMode(timeoutMs = 15_000): Promise<boolean> {
+    const POLL_MS = 300;
+    const start = Date.now();
+    while (Date.now() - start < timeoutMs) {
+      if (!this.wrapper.isProcessAlive()) {
+        return false;
+      }
+      try {
+        const pane = await this.wrapper.capturePane();
+        if (pane.includes("INSERT") || pane.includes("NORMAL")) return true;
+      } catch {}
+      await new Promise((r) => setTimeout(r, POLL_MS));
     }
-
-    await this.wrapper.send(decision.optionId);
-    return true;
+    return false;
   }
 
   private async handleUserQuestion(ev: ClaudrabandEvent): Promise<boolean> {

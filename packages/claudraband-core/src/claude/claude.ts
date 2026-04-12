@@ -202,6 +202,9 @@ export class ClaudeWrapper implements Wrapper {
   /**
    * Poll the terminal until Claude Code is ready to accept input.
    * Looks for "INSERT" in the status bar, which indicates the TUI has loaded.
+   *
+   * Also handles the "trust this folder" prompt that appears before any JSONL
+   * is written when Claude Code runs in a directory for the first time.
    */
   private async waitForReady(signal: AbortSignal): Promise<void> {
     const MAX_WAIT_MS = 15_000;
@@ -213,6 +216,17 @@ export class ClaudeWrapper implements Wrapper {
       try {
         const pane = await this.terminal!.capture();
         if (pane.includes("INSERT") || pane.includes("NORMAL")) {
+          return;
+        }
+        // The trust prompt appears before Claude enters INSERT mode and before
+        // any JSONL is written. Detect it from the terminal capture and
+        // auto-select "Yes, I trust this folder" (option 1).
+        if (
+          (pane.includes("Yes, I trust this folder") &&
+            pane.includes("No, exit")) ||
+          (pane.includes("Bypass Permissions mode") &&
+            pane.includes("Yes, I accept"))
+        ) {
           return;
         }
       } catch {

@@ -1,12 +1,14 @@
 # Daemon HTTP API
 
-`claudraband serve` starts an HTTP server for persistent headless sessions. Most endpoints accept and return JSON. Live session events are streamed over Server-Sent Events (SSE).
+`claudraband serve` starts an HTTP server for persistent sessions. Most endpoints accept and return JSON. Live session events are streamed over Server-Sent Events (SSE).
 
 Start a daemon locally:
 
 ```sh
 claudraband serve --host 127.0.0.1 --port 7842
 ```
+
+The daemon defaults to `tmux`. `--backend xterm` is still supported, but it is currently experimental.
 
 This document covers the raw HTTP API exposed by `cband serve`.
 
@@ -34,7 +36,7 @@ Response:
 ```json
 {
   "sessionId": "abc-123",
-  "backend": "xterm"
+  "backend": "tmux"
 }
 ```
 
@@ -80,7 +82,7 @@ Response:
 {
   "sessionId": "abc-123",
   "reattached": true,
-  "backend": "xterm"
+  "backend": "tmux"
 }
 ```
 
@@ -113,7 +115,7 @@ Response:
   "title": "Audit auth flow",
   "createdAt": "2026-04-12T10:00:00.000Z",
   "updatedAt": "2026-04-12T10:05:00.000Z",
-  "backend": "xterm",
+  "backend": "tmux",
   "source": "live",
   "alive": true,
   "reattachable": true,

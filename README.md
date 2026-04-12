@@ -36,16 +36,16 @@ Claude Code for the power user
 
 ```sh
 # run without installing globally
-npx claudraband "review the staged diff"
+npx @halfwhey/claudraband "review the staged diff"
 
 # or install it once
-npm install -g claudraband
+npm install -g @halfwhey/claudraband
 ```
 
 If you prefer Bun:
 
 ```sh
-bunx claudraband "review the staged diff"
+bunx @halfwhey/claudraband "review the staged diff"
 ```
 
 `claudraband` installs a pinned Claude Code version, `@anthropic-ai/claude-code@2.1.96`, as a dependency for compatibility. It will be bumped over time. If you need to point at a different Claude binary for debugging or compatibility work, set `CLAUDRABAND_CLAUDE_PATH`.
@@ -75,17 +75,21 @@ cband continue <session-id> --select 3 "xyz"
 ### Headless persistent sessions with `serve`
 
 ```sh
-cband serve --host 127.0.0.1 --backend xterm --port 7842
+cband serve --host 127.0.0.1 --port 7842
 cband --connect localhost:7842 "start a migration plan"
 cband attach <session-id>
 cband continue <session-id> --select 2
 ```
 
-Use `--connect` only when starting a new daemon-backed session. After that, `continue`, `attach`, and `sessions` route through the tracked session automatically. `attach` is especially useful here because it gives you a simple REPL for a headless xterm.js session.
+The daemon now defaults to `tmux`, just like the local first-class path. Use `--connect` only when starting a new daemon-backed session. After that, `continue`, `attach`, and `sessions` route through the tracked session automatically.
 
-### Using the CLI without tmux or server
+`--backend xterm` still exists, but it is experimental while we improve it.
 
-If you run `cband "..."` without `tmux` and without `--connect`, `cband` falls back to a local headless `xterm.js` session. That mode is useful for one-off runs, but it is not a good default for interactive follow-up because the session is not kept alive between commands. It only works properly when Claude itself can proceed without an interactive permission prompt. Use one of:
+### Using the CLI without tmux or server (experimental)
+
+If you run `cband "..."` without `tmux` and without `--connect`, `cband` falls back to a local headless `xterm.js` session. This backend is **experimental** and slower than tmux. It is useful for one-off runs, but it is not a good default for interactive follow-up because the session is not kept alive between commands.
+
+The xterm backend cannot handle Claude Code's initial startup prompts (trust folder, bypass permissions confirmation). You must disable these before using it:
 
 - `-c "--dangerously-skip-permissions"`
 - `--permission-mode bypassPermissions`
@@ -109,9 +113,9 @@ Some ACP clients still have limitations around resuming existing sessions. `clau
 
 Live sessions are tracked in `~/.claudraband/`.
 
-- `cband sessions` shows only live tracked sessions, either hosted by tmux or the xterm.js daemon.
+- `cband sessions` shows only live tracked sessions, either hosted by tmux directly or by the daemon.
 - `continue` can resume an existing Claude Code session even when it is no longer live, but `attach` only works on live sessions.
-- `sessions close ...` closes live sessions hosted by tmux or the xterm.js daemon
+- `sessions close ...` closes live sessions hosted by tmux directly or by the daemon
 - `sessions close --all` will close all live sessions controlled by Claudraband
 
 ## Examples

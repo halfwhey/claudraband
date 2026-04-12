@@ -24,6 +24,7 @@ interface DaemonSession {
 }
 
 interface SessionRequestBody {
+  sessionId?: string;
   cwd?: string;
   claudeArgs?: string[];
   model?: string;
@@ -55,7 +56,7 @@ function shouldReuseSession(
 }
 
 function resolveServerTerminalBackend(config: CliConfig): CliConfig["terminalBackend"] {
-  return config.hasExplicitTerminalBackend ? config.terminalBackend : "xterm";
+  return config.hasExplicitTerminalBackend ? config.terminalBackend : "tmux";
 }
 
 function formatHostForUrl(host: string): string {
@@ -177,22 +178,35 @@ function createDaemonServer(
       if (method === "POST" && path === "/sessions") {
         const body = JSON.parse(await readBody(req)) as SessionRequestBody;
         const sessionConfig = resolveSessionConfig(config, body);
-        const session = await runtime.startSession({
-          cwd: sessionConfig.cwd,
-          claudeArgs: sessionConfig.claudeArgs,
-          model: sessionConfig.model,
-          permissionMode: sessionConfig.permissionMode as typeof config.permissionMode,
-          allowTextResponses: true,
-          logger,
-          sessionOwner: {
-            kind: "daemon",
-            serverUrl,
-            serverPid: process.pid,
-            serverInstanceId,
-          },
-          onPermissionRequest: (request) =>
-            handlePermission(ds, request),
-        });
+        const sessionOwner = {
+          kind: "daemon" as const,
+          serverUrl,
+          serverPid: process.pid,
+          serverInstanceId,
+        };
+        const session = body.sessionId
+          ? await runtime.resumeSession(body.sessionId, {
+            cwd: sessionConfig.cwd,
+            claudeArgs: sessionConfig.claudeArgs,
+            model: sessionConfig.model,
+            permissionMode: sessionConfig.permissionMode as typeof config.permissionMode,
+            allowTextResponses: true,
+            logger,
+            sessionOwner,
+            onPermissionRequest: (request) =>
+              handlePermission(ds, request),
+          })
+          : await runtime.startSession({
+            cwd: sessionConfig.cwd,
+            claudeArgs: sessionConfig.claudeArgs,
+            model: sessionConfig.model,
+            permissionMode: sessionConfig.permissionMode as typeof config.permissionMode,
+            allowTextResponses: true,
+            logger,
+            sessionOwner,
+            onPermissionRequest: (request) =>
+              handlePermission(ds, request),
+          });
         const ds: DaemonSession = {
           session,
           sseClients: new Set(),

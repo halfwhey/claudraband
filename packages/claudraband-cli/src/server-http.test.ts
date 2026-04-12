@@ -207,6 +207,19 @@ describe("daemon HTTP API", () => {
     expect(body.backend).toBe("xterm");
   });
 
+  test("create session respects a caller-provided sessionId", async () => {
+    await startTestServer();
+    const res = await fetch(`${baseUrl}/sessions`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ sessionId: "provided-session-id" }),
+    });
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.sessionId).toBe("provided-session-id");
+    expect(body.backend).toBe("xterm");
+  });
+
   // --- GET /sessions ---
 
   test("list sessions returns empty array initially", async () => {

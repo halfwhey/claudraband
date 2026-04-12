@@ -48,7 +48,7 @@ Open a simple REPL against a live session.
 
 This does not reattach the original terminal UI. It just gives you an interactive
 way to keep talking to an already-live session, which is especially useful for
-headless xterm sessions running in the daemon.
+daemon-hosted sessions.
 
 This does not restart dead sessions. Use `continue` for that.
 
@@ -73,6 +73,8 @@ Close every live tracked session.
 ### `claudraband serve [options]`
 
 Run the persistent daemon for headless sessions.
+
+The daemon defaults to `tmux`. `xterm` is still available, but it is currently experimental.
 
 For the raw HTTP reference, see [docs/daemon-api.md](daemon-api.md).
 
@@ -133,7 +135,7 @@ Run `claudraband` as an ACP server over stdio.
 |---|---|
 | `auto` | Prefer `tmux`, then fall back to headless `xterm` |
 | `tmux` | Run Claude Code inside a shared local tmux session |
-| `xterm` | Run Claude Code in a headless PTY-backed terminal |
+| `xterm` | Run Claude Code in a headless PTY-backed terminal. Experimental. |
 
 ## Permission modes
 
@@ -148,5 +150,7 @@ Run `claudraband` as an ACP server over stdio.
 
 ## Notes
 
+- `tmux` is the first-class backend for both local sessions and the daemon.
+- `xterm` is experimental, both locally and under `serve`, while the backend continues to improve.
 - Local `xterm` without `tmux` or `serve` requires dangerous Claude permission settings because there is no safe way to answer native Claude permission prompts in that mode.
 - `attach` and `continue --select` require a live tracked session.

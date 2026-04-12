@@ -30,8 +30,12 @@ function makeConfig(overrides: Partial<CliConfig> = {}): CliConfig {
 
 describe("daemon client helpers", () => {
   test("builds daemon session request bodies with overrides", () => {
-    const body = __test.buildSessionRequestBody(makeConfig(), { requireLive: true });
+    const body = __test.buildSessionRequestBody(makeConfig(), {
+      requireLive: true,
+      sessionId: "sid-123",
+    });
     expect(body).toEqual({
+      sessionId: "sid-123",
       cwd: "/repo",
       claudeArgs: ["--effort", "high"],
       model: "opus",

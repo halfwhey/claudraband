@@ -11,6 +11,14 @@ export interface PermissionConfig {
   promptText: string;
 }
 
+function formatOptionLabel(
+  name: string,
+  kind: ClaudrabandPermissionRequest["options"][number]["kind"],
+): string {
+  const suffix = `(${kind})`;
+  return name.trim().endsWith(suffix) ? name.trim() : `${name} (${kind})`;
+}
+
 export async function requestPermission(
   renderer: Renderer,
   config: PermissionConfig,
@@ -19,12 +27,16 @@ export async function requestPermission(
   renderer.ensureNewline();
 
   process.stderr.write(`\x1b[33mPermission: ${params.title}\x1b[0m\n`);
-  for (const block of params.content) {
+  const contentBlocks =
+    params.content.length === 1 && params.content[0]?.text.trim() === params.title.trim()
+      ? []
+      : params.content;
+  for (const block of contentBlocks) {
     process.stderr.write(`${block.text}\n`);
   }
 
   for (const option of params.options) {
-    process.stderr.write(`  ${option.optionId}. ${option.name} (${option.kind})\n`);
+    process.stderr.write(`  ${option.optionId}. ${formatOptionLabel(option.name, option.kind)}\n`);
   }
 
   // Preselected answer: pick the specified option

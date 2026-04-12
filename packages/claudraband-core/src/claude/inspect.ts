@@ -22,6 +22,20 @@ export interface NativePermissionPrompt {
   options: { number: string; label: string }[];
 }
 
+function normalizeCapturedPane(paneText: string): string {
+  return paneText
+    .replace(/\r/g, "")
+    // Expand cursor-right movement used by xterm serialization so words keep spaces.
+    .replace(/\x1b\[(\d+)C/g, (_match, count: string) => " ".repeat(Number.parseInt(count, 10) || 0))
+    // Drop other cursor movement and mode toggles that don't contribute visible text.
+    .replace(/\x1b\[[0-9;]*[ABDHJKf]/g, "")
+    .replace(/\x1b\[\?[0-9;]*[a-zA-Z]/g, "")
+    // Drop SGR styling.
+    .replace(/\x1b\[[0-9;]*m/g, "")
+    // Drop any remaining simple CSI sequences.
+    .replace(/\x1b\[[0-9;]*[a-zA-Z]/g, "");
+}
+
 /**
  * Scan a Claude Code session JSONL file for an unresolved AskUserQuestion.
  * Returns true if the last AskUserQuestion tool_use has no matching tool_result.
@@ -69,11 +83,34 @@ export async function hasPendingQuestion(jsonlPath: string): Promise<boolean> {
 export function parseNativePermissionPrompt(
   paneText: string,
 ): NativePermissionPrompt | null {
-  const questionMatch = paneText.match(/(?:^|\n)\s*(Do you want to [^\n]+\?)/);
+  const normalizedPane = normalizeCapturedPane(paneText);
+  // Match standard permission prompts ("Do you want to ...?") and startup
+  // prompts (trust folder, bypass permissions). Startup prompts require both
+  // option strings to be present to avoid false positives.
+  const isTrustPrompt =
+    normalizedPane.includes("Yes, I trust this folder") &&
+    normalizedPane.includes("No, exit");
+  const isBypassPrompt =
+    normalizedPane.includes("Bypass Permissions mode") &&
+    normalizedPane.includes("Yes, I accept");
+  let questionMatch: RegExpMatchArray | null;
+  if (isTrustPrompt) {
+    questionMatch = normalizedPane.match(
+      /(Is this a project you created[^\n]*)/,
+    );
+  } else if (isBypassPrompt) {
+    questionMatch = normalizedPane.match(
+      /(you accept all responsibility[^\n]*)/,
+    );
+  } else {
+    questionMatch = normalizedPane.match(
+      /(?:^|\n)\s*(Do you want to [^\n]+\?)/,
+    );
+  }
   if (!questionMatch) return null;
 
-  const afterQuestion = paneText.slice(
-    paneText.indexOf(questionMatch[1]) + questionMatch[1].length,
+  const afterQuestion = normalizedPane.slice(
+    normalizedPane.indexOf(questionMatch[1]) + questionMatch[1].length,
   );
   const optionRegex = /(?:❯\s*)?(\d+)\.\s+(.+)/g;
   const options: NativePermissionPrompt["options"] = [];

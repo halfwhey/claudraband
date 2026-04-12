@@ -1,4 +1,5 @@
 import { request as httpRequest } from "node:http";
+import { randomUUID } from "node:crypto";
 import type {
   ClaudrabandEvent,
   ClaudrabandLogger,
@@ -21,6 +22,7 @@ interface DaemonSessionInfo {
 }
 
 interface DaemonSessionRequestBody {
+  sessionId?: string;
   cwd: string;
   claudeArgs?: string[];
   model?: string;
@@ -113,9 +115,10 @@ async function daemonRequest(
 
 function buildSessionRequestBody(
   config: CliConfig,
-  options: { requireLive?: boolean } = {},
+  options: { requireLive?: boolean; sessionId?: string } = {},
 ): DaemonSessionRequestBody {
   return {
+    ...(options.sessionId ? { sessionId: options.sessionId } : {}),
     cwd: config.cwd,
     ...(config.hasExplicitClaudeArgs ? { claudeArgs: config.claudeArgs } : {}),
     ...(config.hasExplicitModel ? { model: config.model } : {}),
@@ -452,12 +455,13 @@ export async function runWithDaemon(
     sessionBackend = result.backend;
   } else {
     // Create new session on daemon.
+    sessionId = randomUUID();
+    process.stderr.write(`session: ${sessionId}\n`);
     const result = (await daemonPost(config.connect, "/sessions", {
-      ...buildSessionRequestBody(config),
+      ...buildSessionRequestBody(config, { sessionId }),
     })) as DaemonSessionInfo;
     sessionId = result.sessionId;
     sessionBackend = result.backend;
-    process.stderr.write(`session: ${sessionId}\n`);
   }
 
   const session = new DaemonSessionProxy(

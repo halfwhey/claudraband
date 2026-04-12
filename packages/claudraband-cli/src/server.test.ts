@@ -29,16 +29,16 @@ function makeConfig(overrides: Partial<CliConfig> = {}): CliConfig {
 }
 
 describe("daemon server helpers", () => {
-  test("defaults daemon backend to xterm unless explicitly requested", () => {
-    expect(__test.resolveServerTerminalBackend(makeConfig())).toBe("xterm");
+  test("defaults daemon backend to tmux unless explicitly requested", () => {
+    expect(__test.resolveServerTerminalBackend(makeConfig())).toBe("tmux");
     expect(
       __test.resolveServerTerminalBackend(
         makeConfig({
-          terminalBackend: "tmux",
+          terminalBackend: "xterm",
           hasExplicitTerminalBackend: true,
         }),
       ),
-    ).toBe("tmux");
+    ).toBe("xterm");
   });
 
   test("formats IPv4 and IPv6 hosts for daemon URLs", () => {
