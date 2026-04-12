@@ -4,3 +4,4 @@ allagent
 *.log
 bun.lock
 *.tsbuildinfo
+.codex

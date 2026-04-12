@@ -1,24 +1,22 @@
 # Daemon HTTP API
 
-`claudraband serve` starts an HTTP server that manages persistent headless sessions. All endpoints accept and return JSON unless noted otherwise.
+`claudraband serve` starts an HTTP server for persistent headless sessions. Most endpoints accept and return JSON. Live session events are streamed over Server-Sent Events (SSE).
 
-**Default port:** 7842
+Start a daemon locally:
 
 ```sh
 claudraband serve --host 127.0.0.1 --port 7842
 ```
 
----
+This document covers the raw HTTP API exposed by `cband serve`.
 
 ## Sessions
 
-### Create session
+### `POST /sessions`
 
-```
-POST /sessions
-```
+Start a new daemon-owned Claude Code session.
 
-**Body:**
+Request body:
 
 ```json
 {
@@ -31,7 +29,7 @@ POST /sessions
 
 All fields are optional. Omitted fields fall back to the daemon's launch defaults.
 
-**Response:**
+Response:
 
 ```json
 {
@@ -40,13 +38,11 @@ All fields are optional. Omitted fields fall back to the daemon's launch default
 }
 ```
 
-### List sessions
+### `GET /sessions`
 
-```
-GET /sessions
-```
+List the sessions currently tracked by this daemon process.
 
-**Response:**
+Response:
 
 ```json
 {
@@ -60,15 +56,11 @@ GET /sessions
 }
 ```
 
-### Resume session
+### `POST /sessions/:id/resume`
 
-```
-POST /sessions/:id/resume
-```
+Resume a known session. If the session is still alive on the daemon, the existing process is reused. If it is dead, the daemon starts a new Claude process with `--resume`.
 
-If the session is still alive on the daemon, reattaches to it. If the session is dead, starts a new Claude process with `--resume`.
-
-**Body:**
+Request body:
 
 ```json
 {
@@ -80,9 +72,9 @@ If the session is still alive on the daemon, reattaches to it. If the session is
 }
 ```
 
-Set `requireLive: true` to fail instead of restarting a dead session (used by `continue --select`).
+Set `requireLive: true` to fail instead of restarting a dead session. This is what `continue --select` uses when it must target an already-live session.
 
-**Response:**
+Response:
 
 ```json
 {
@@ -94,166 +86,194 @@ Set `requireLive: true` to fail instead of restarting a dead session (used by `c
 
 `reattached: true` means the existing process was reused. `false` means a new process was started via `--resume`.
 
-### Delete session
+### `DELETE /sessions/:id`
 
-```
-DELETE /sessions/:id
-```
+Stop a daemon-owned session and remove it from the daemon.
 
-Kills the Claude process and removes the session from the daemon.
-
-**Response:**
+Response:
 
 ```json
 { "ok": true }
 ```
 
----
+### `GET /sessions/:id/status`
+
+Inspect one session and return its current summary. This works for sessions the runtime can still inspect, not just sessions currently attached to this daemon process.
+
+Optional query parameters:
+
+- `cwd`: disambiguate the session when needed
+
+Response:
+
+```json
+{
+  "sessionId": "abc-123",
+  "cwd": "/path/to/project",
+  "title": "Audit auth flow",
+  "createdAt": "2026-04-12T10:00:00.000Z",
+  "updatedAt": "2026-04-12T10:05:00.000Z",
+  "backend": "xterm",
+  "source": "live",
+  "alive": true,
+  "reattachable": true,
+  "owner": {
+    "kind": "daemon",
+    "serverUrl": "http://127.0.0.1:7842",
+    "serverPid": 12345,
+    "serverInstanceId": "daemon-1"
+  }
+}
+```
+
+### `GET /sessions/:id/last`
+
+Return the last assistant message from a session transcript.
+
+Optional query parameters:
+
+- `cwd`: disambiguate the session when needed
+
+Response:
+
+```json
+{
+  "sessionId": "abc-123",
+  "cwd": "/path/to/project",
+  "text": "The riskiest part of this change is the migration ordering..."
+}
+```
+
+If the session exists but has no assistant message yet, the daemon returns `404`.
 
 ## Prompting
 
-### Send prompt
+### `POST /sessions/:id/prompt`
 
-```
-POST /sessions/:id/prompt
-```
+Send a normal prompt and wait for Claude's turn to complete.
 
-Sends a prompt and waits for Claude's turn to complete.
-
-**Body:**
+Request body:
 
 ```json
 { "text": "explain the auth middleware" }
 ```
 
-**Response:**
+Response:
 
 ```json
 {
-  "stopReason": "end_turn"
+  "stopReason": "end_turn",
+  "eventSeq": 42
 }
 ```
 
-### Send raw text
+`eventSeq` is the last SSE sequence number emitted for this completed turn. The official daemon client uses it to wait until all matching events have been rendered before disconnecting.
 
-```
-POST /sessions/:id/send
-```
+### `POST /sessions/:id/send`
 
-Writes raw text to the terminal. Does not wait for a response.
+Write raw terminal input. This does not wait for a turn to finish.
 
-**Body:**
+Request body:
 
 ```json
 { "text": "2" }
 ```
 
-**Response:**
+Response:
 
 ```json
 { "ok": true }
 ```
 
-### Send and await turn
+### `POST /sessions/:id/send-and-await-turn`
 
-```
-POST /sessions/:id/send-and-await-turn
-```
+Write raw terminal input and wait for the next turn to complete. This is used for flows like `continue --select`.
 
-Sends raw text to the terminal and waits for the next turn to complete. Used by `continue --select` to type a selection and collect the response.
-
-**Body:**
+Request body:
 
 ```json
 { "text": "2" }
 ```
 
-**Response:**
+Response:
 
 ```json
 {
-  "stopReason": "end_turn"
+  "stopReason": "end_turn",
+  "eventSeq": 45
 }
 ```
 
-### Await turn
+### `POST /sessions/:id/await-turn`
 
-```
-POST /sessions/:id/await-turn
-```
+Wait for the current in-progress turn to finish. No request body.
 
-Waits for the current in-progress turn to finish. No request body.
-
-**Response:**
+Response:
 
 ```json
 {
-  "stopReason": "end_turn"
+  "stopReason": "end_turn",
+  "eventSeq": 45
 }
 ```
 
-### Interrupt
+### `POST /sessions/:id/interrupt`
 
-```
-POST /sessions/:id/interrupt
-```
+Send Ctrl+C to the Claude process. No request body.
 
-Sends Ctrl+C to the Claude process. No request body.
-
-**Response:**
+Response:
 
 ```json
 { "ok": true }
 ```
-
----
 
 ## Events
 
-### Event stream (SSE)
+### `GET /sessions/:id/events`
 
-```
-GET /sessions/:id/events
-```
+Open an SSE stream for live session events.
 
-Returns a Server-Sent Events stream. Each event is a JSON object on a `data:` line.
+The daemon sends a ready event immediately after the stream opens:
 
-**Ready event** (sent immediately on connect):
-
-```
+```text
 data: {"type":"ready"}
 ```
 
-**Session events:**
+Normal session events are emitted as JSON objects on `data:` lines. Session events include a monotonically increasing `seq` value:
 
-```
-data: {"kind":"AssistantText","time":"2025-01-15T10:00:00.000Z","text":"Hello"}
-data: {"kind":"ToolCall","time":"...","toolName":"Read","toolID":"tool_1","toolInput":"{...}"}
-data: {"kind":"ToolResult","time":"...","toolID":"tool_1","text":"file contents..."}
-data: {"kind":"TurnEnd","time":"...","text":""}
-```
-
-Event kinds: `UserMessage`, `AssistantText`, `AssistantThinking`, `ToolCall`, `ToolResult`, `TurnEnd`, `System`, `Error`.
-
-**Permission request** (pushed when Claude needs approval):
-
-```
-data: {"type":"permission_request","title":"Run bash command","options":[{"optionId":"1","name":"Allow"}]}
+```text
+data: {"seq":1,"kind":"AssistantText","time":"2025-01-15T10:00:00.000Z","text":"Hello"}
+data: {"seq":2,"kind":"ToolCall","time":"...","toolName":"Read","toolID":"tool_1","toolInput":"{...}"}
+data: {"seq":3,"kind":"ToolResult","time":"...","toolID":"tool_1","text":"file contents..."}
+data: {"seq":4,"kind":"TurnEnd","time":"...","text":""}
 ```
 
-If a permission request is already pending when you connect, it is sent immediately after the ready event.
+Supported event kinds:
 
----
+- `UserMessage`
+- `AssistantText`
+- `AssistantThinking`
+- `ToolCall`
+- `ToolResult`
+- `TurnEnd`
+- `System`
+- `Error`
 
-## Permissions
+When Claude requests permission, the daemon pushes a permission event over the same stream:
 
-### Check pending input
-
+```text
+data: {"seq":5,"type":"permission_request","title":"Run bash command","options":[{"optionId":"1","name":"Allow"}]}
 ```
-GET /sessions/:id/pending-question
-```
 
-**Response:**
+If a permission request is already pending when the SSE connection opens, it is sent immediately after the ready event.
+
+## Permissions and pending input
+
+### `GET /sessions/:id/pending-question`
+
+Check whether the live session is blocked on user input.
+
+Response:
 
 ```json
 {
@@ -262,35 +282,35 @@ GET /sessions/:id/pending-question
 }
 ```
 
-`source` is one of `"none"`, `"permission_request"`, or `"terminal"`.
+`source` is one of:
 
-### Resolve permission
+- `"none"`
+- `"permission_request"`
+- `"terminal"`
 
-```
-POST /sessions/:id/permission
-```
+### `POST /sessions/:id/permission`
 
-Resolves a pending permission request.
+Resolve a pending permission request.
 
-**Body (select an option):**
+Select an option:
 
 ```json
 { "outcome": "selected", "optionId": "1" }
 ```
 
-**Body (free-text response):**
+Send free text:
 
 ```json
 { "outcome": "text", "text": "use the blue theme" }
 ```
 
-**Body (cancel):**
+Cancel:
 
 ```json
 { "outcome": "cancelled" }
 ```
 
-**Response:**
+Response:
 
 ```json
 { "ok": true }
@@ -298,25 +318,11 @@ Resolves a pending permission request.
 
 Returns `409` if no permission request is pending.
 
----
+## Relationship to CLI and library
 
-## Detach
-
-### Detach
-
-```
-POST /sessions/:id/detach
-```
-
-No-op on the server side (the session stays alive). Exists for client symmetry.
-
-**Response:**
-
-```json
-{ "ok": true }
-```
-
----
+- CLI `status` maps closely to `GET /sessions/:id/status`.
+- CLI `last` maps closely to `GET /sessions/:id/last`.
+- The TypeScript library exposes the same lower-level pieces as `inspectSession(...)` and `replaySession(...)`.
 
 ## Errors
 
@@ -328,6 +334,6 @@ All errors return a JSON body:
 
 | Status | Meaning |
 |---|---|
-| 404 | Session not found, or unknown route |
-| 409 | Conflict (e.g. no pending permission, or `requireLive` failed) |
-| 500 | Internal error |
+| `404` | Session not found or unknown route |
+| `409` | Conflict, such as `requireLive` failure or no pending permission |
+| `500` | Internal server error |

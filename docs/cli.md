@@ -74,6 +74,8 @@ Close every live tracked session.
 
 Run the persistent daemon for headless sessions.
 
+For the raw HTTP reference, see [docs/daemon-api.md](daemon-api.md).
+
 Use `--connect <host:port>` with the top-level prompt command when you want to create a new session there:
 
 ```sh

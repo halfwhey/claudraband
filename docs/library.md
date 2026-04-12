@@ -50,6 +50,12 @@ By default, the runtime resolves bundled Claude Code `@anthropic-ai/claude-code@
 | `closeSession(sessionId)` | Close a tracked live session through its recorded owner |
 | `replaySession(sessionId, cwd)` | Parse a session's JSONL into events without starting Claude |
 
+CLI note:
+
+- `cband status <session-id>` is built on `inspectSession(...)`
+- `cband last <session-id>` is built on `inspectSession(...)` plus `replaySession(...)`
+- the daemon HTTP API now exposes matching endpoints at `GET /sessions/:id/status` and `GET /sessions/:id/last`
+
 ### `ClaudrabandSession`
 
 Returned by `startSession` and `resumeSession`.

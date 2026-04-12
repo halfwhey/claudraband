@@ -364,7 +364,6 @@ class DaemonSessionProxy implements ClaudrabandSession {
 
   async detach(): Promise<void> {
     this.sse?.abort();
-    await daemonPost(this.server, `/sessions/${this.sessionId}/detach`);
     this.closeEvents();
   }
 

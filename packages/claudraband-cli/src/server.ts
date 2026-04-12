@@ -8,6 +8,8 @@ import {
   type ClaudrabandPermissionDecision,
   type ClaudrabandPermissionRequest,
   type ClaudrabandSession,
+  type SessionSummary,
+  EventKind,
 } from "claudraband-core";
 import type { CliConfig } from "./args";
 
@@ -64,6 +66,38 @@ interface DaemonServerHandle {
   server: ReturnType<typeof createServer>;
   sessions: Map<string, DaemonSession>;
   close(): Promise<void>;
+}
+
+function sessionSummaryToJson(session: SessionSummary): Record<string, unknown> {
+  return {
+    sessionId: session.sessionId,
+    cwd: session.cwd,
+    title: session.title,
+    createdAt: session.createdAt,
+    updatedAt: session.updatedAt,
+    backend: session.backend,
+    source: session.source,
+    alive: session.alive,
+    reattachable: session.reattachable,
+    owner: session.owner,
+  };
+}
+
+function extractLastAssistantTurn(events: ClaudrabandEvent[]): string | null {
+  const chunks: string[] = [];
+  let inLastTurn = false;
+  for (let i = events.length - 1; i >= 0; i--) {
+    const ev = events[i];
+    if (ev.kind === EventKind.TurnEnd) {
+      if (inLastTurn) break;
+      inLastTurn = true;
+    }
+    if (ev.kind === EventKind.TurnStart && inLastTurn) break;
+    if (inLastTurn && ev.kind === EventKind.AssistantText) {
+      chunks.unshift(ev.text);
+    }
+  }
+  return chunks.length === 0 ? null : chunks.join("");
 }
 
 function createDaemonServer(
@@ -197,6 +231,39 @@ function createDaemonServer(
 
       const sessionId = match[1];
       const action = match[2] ?? "";
+      const cwd = url.searchParams.get("cwd") ?? undefined;
+
+      // GET /sessions/:id/status
+      if (method === "GET" && action === "status") {
+        const session = await runtime.inspectSession(sessionId, cwd);
+        if (!session) {
+          err(res, 404, `session ${sessionId} not found`);
+          return;
+        }
+        json(res, 200, sessionSummaryToJson(session));
+        return;
+      }
+
+      // GET /sessions/:id/last
+      if (method === "GET" && action === "last") {
+        const session = await runtime.inspectSession(sessionId, cwd);
+        if (!session) {
+          err(res, 404, `session ${sessionId} not found`);
+          return;
+        }
+        const events = await runtime.replaySession(sessionId, session.cwd);
+        const text = extractLastAssistantTurn(events);
+        if (text === null) {
+          err(res, 404, `no assistant message found for session ${sessionId}`);
+          return;
+        }
+        json(res, 200, {
+          sessionId,
+          cwd: session.cwd,
+          text,
+        });
+        return;
+      }
 
       // POST /sessions/:id/resume
       if (method === "POST" && action === "resume") {
@@ -347,12 +414,6 @@ function createDaemonServer(
         return;
       }
 
-      // POST /sessions/:id/detach
-      if (method === "POST" && action === "detach") {
-        json(res, 200, { ok: true });
-        return;
-      }
-
       // POST /sessions/:id/permission
       if (method === "POST" && action === "permission") {
         if (!ds.pendingPermission) {
@@ -444,6 +505,8 @@ export const __test = {
   resolveSessionConfig,
   resolveServerTerminalBackend,
   shouldReuseSession,
+  sessionSummaryToJson,
+  extractLastAssistantTurn,
   createDaemonServer,
 };
 
