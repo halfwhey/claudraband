@@ -1,6 +1,6 @@
 {
   "name": "@halfwhey/claudraband",
-  "version": "0.5.0",
+  "version": "0.6.0",
   "description": "Control the official Claude Code CLI programmatically. Use as a library, a direct CLI, an ACP server, or a persistent session daemon.",
   "type": "module",
   "main": "./dist/index.js",
