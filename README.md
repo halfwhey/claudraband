@@ -17,8 +17,8 @@ Claude Code for the power user
 
 It provides:
 
-- Resumable non-interactive workflows. Essentially claude -p with session support: cband continue <session-id> 'what was the result of the research?'
-- An http daemon for remote or headless session control
+- Resumable non-interactive workflows. Essentially `claude -p` with session support: `cband continue <session-id> 'what was the result of the research?'`
+- An HTTP daemon for remote or headless session control
 - An ACP server for editor and alternate frontend integration
 - A TypeScript library for building these workflows into your own tools
 
