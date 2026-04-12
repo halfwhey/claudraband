@@ -31,6 +31,12 @@ describe("claudraband cli args", () => {
     expect(args.prompt).toBe("hello");
   });
 
+  test("allows local xterm prompts without forcing dangerous permission flags", () => {
+    const args = parseArgs(["--backend", "xterm", "hello"]);
+    expect(args.terminalBackend).toBe("xterm");
+    expect(args.prompt).toBe("hello");
+  });
+
   test("parses acp command", () => {
     const args = parseArgs(["acp", "--claude", "--model opus"]);
     expect(args.command).toBe("acp");

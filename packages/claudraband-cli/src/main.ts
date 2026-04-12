@@ -12,11 +12,10 @@ import type {
 import {
   createClaudraband,
   EventKind,
-  resolveTerminalBackend,
 } from "claudraband-core";
 import type { TerminalBackend } from "claudraband-core";
 import { Bridge } from "./acpbridge";
-import { isDangerousPermissionMode, parseArgs, type CliConfig } from "./args";
+import { parseArgs, type CliConfig } from "./args";
 import { requestPermission } from "./client";
 import { Renderer } from "./render";
 import { formatLocalSessionList } from "./session-format";
@@ -201,33 +200,7 @@ async function resolveTrackedSession(
 }
 
 function validateLocalLaunchPermissions(config: CliConfig): void {
-  if (config.connect) {
-    return;
-  }
-  if (config.command !== "prompt" && config.command !== "continue") {
-    return;
-  }
-  if (isDangerousPermissionMode(config)) {
-    return;
-  }
-
-  let resolved: "tmux" | "xterm";
-  try {
-    resolved = resolveTerminalBackend(config.terminalBackend);
-  } catch {
-    resolved = "xterm";
-  }
-
-  if (resolved === "xterm") {
-    process.stderr.write(
-      "error: local xterm backend requires dangerous permission settings.\n"
-      + "  Either:\n"
-      + "    --connect <host:port>\n"
-      + "    --backend tmux\n"
-      + '    -c "--dangerously-skip-permissions"\n',
-    );
-    process.exit(1);
-  }
+  void config;
 }
 
 async function pumpEvents(

@@ -1,6 +1,5 @@
 import {
   parseClaudeArgs,
-  resolveTerminalBackend,
   type PermissionMode,
   type TerminalBackend,
 } from "claudraband-core";
@@ -357,38 +356,6 @@ function validateConfig(config: CliConfig, io: ParseIo): void {
     io.exit(1);
   }
 
-  if (
-    config.command === "prompt"
-    && !config.connect
-    && !isDangerousPermissionMode(config)
-  ) {
-    let resolved: "tmux" | "xterm";
-    try {
-      resolved = resolveTerminalBackend(config.terminalBackend);
-    } catch {
-      resolved = "xterm";
-    }
-    if (resolved === "xterm") {
-      io.stderr(
-        "error: local xterm backend requires dangerous permission settings.\n"
-        + "  Either:\n"
-        + "    --connect <host:port>\n"
-        + "    --backend tmux\n"
-        + '    -c "--dangerously-skip-permissions"\n',
-      );
-      io.exit(1);
-    }
-  }
-}
-
-export function isDangerousPermissionMode(config: Pick<
-  CliConfig,
-  "permissionMode" | "claudeArgs"
->): boolean {
-  if (config.permissionMode === "bypassPermissions") return true;
-  if (config.permissionMode === "dontAsk") return true;
-  if (config.claudeArgs.includes("--dangerously-skip-permissions")) return true;
-  return false;
 }
 
 export function splitShellWords(input: string): string[] {

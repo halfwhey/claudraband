@@ -152,5 +152,4 @@ Run `claudraband` as an ACP server over stdio.
 
 - `tmux` is the first-class backend for both local sessions and the daemon.
 - `xterm` is experimental, both locally and under `serve`, while the backend continues to improve.
-- Local `xterm` without `tmux` or `serve` requires dangerous Claude permission settings because there is no safe way to answer native Claude permission prompts in that mode.
 - `attach` and `continue --select` require a live tracked session.
