@@ -14,6 +14,7 @@ describe("session list formatting", () => {
         cwd: "/repo",
         createdAt: "2026-04-10T12:34:56.000Z",
         backend: "tmux",
+        source: "live",
         alive: true,
         reattachable: true,
         owner: { kind: "local" },
@@ -36,6 +37,7 @@ describe("session list formatting", () => {
         cwd: "/repo",
         createdAt: "2026-04-10T12:34:56.000Z",
         backend: "xterm",
+        source: "history",
         alive: false,
         reattachable: false,
         owner: { kind: "local" },
@@ -44,7 +46,7 @@ describe("session list formatting", () => {
       },
     );
 
-    expect(line).toBe("def-456  status=saved  backend=xterm  cwd=/repo  (untitled)");
+    expect(line).toBe("def-456  status=history  backend=xterm  cwd=/repo  (untitled)");
   });
 
   test("formats daemon sessions with status and pending flag", () => {
@@ -64,6 +66,7 @@ describe("session list formatting", () => {
         cwd: "/repo",
         createdAt: "2026-04-10T12:00:00.000Z",
         backend: "tmux",
+        source: "live",
         alive: true,
         reattachable: true,
         owner: { kind: "local" },
@@ -75,6 +78,7 @@ describe("session list formatting", () => {
         cwd: "/repo",
         createdAt: "2026-04-10T10:00:00.000Z",
         backend: "tmux",
+        source: "history",
         alive: false,
         reattachable: true,
         owner: { kind: "local" },
@@ -86,6 +90,7 @@ describe("session list formatting", () => {
         cwd: "/repo",
         createdAt: "2026-04-10T11:00:00.000Z",
         backend: "tmux",
+        source: "history",
         alive: false,
         reattachable: true,
         owner: { kind: "local" },

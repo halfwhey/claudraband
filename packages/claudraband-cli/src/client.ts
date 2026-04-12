@@ -7,7 +7,7 @@ import type { Renderer } from "./render";
 
 export interface PermissionConfig {
   interactive: boolean;
-  select: string;
+  answerChoice: string;
   promptText: string;
 }
 
@@ -27,9 +27,9 @@ export async function requestPermission(
     process.stderr.write(`  ${option.optionId}. ${option.name} (${option.kind})\n`);
   }
 
-  // --select <n>: pick the specified option
-  if (config.select) {
-    const selected = params.options.find((o) => o.optionId === config.select);
+  // Preselected answer: pick the specified option
+  if (config.answerChoice) {
+    const selected = params.options.find((o) => o.optionId === config.answerChoice);
     if (selected) {
       process.stderr.write(`  -> select: ${selected.name}\n`);
       if (selected.textInput && config.promptText) {
@@ -37,14 +37,16 @@ export async function requestPermission(
       }
       return { outcome: "selected", optionId: selected.optionId };
     }
-    process.stderr.write(`  -> invalid selection '${config.select}', cancelling\n`);
+    process.stderr.write(`  -> invalid selection '${config.answerChoice}', cancelling\n`);
     return { outcome: "cancelled" };
   }
 
   // Non-interactive: defer. The question stays pending so the user can
-  // resume with --select later.
+  // answer it later from the CLI.
   if (!config.interactive) {
-    process.stderr.write("  -> deferred (use -s <id> --select <n> to answer)\n");
+    process.stderr.write(
+      "  -> deferred (use 'cband continue <id> --select <choice> [text]' to answer)\n",
+    );
     return { outcome: "deferred" };
   }
 

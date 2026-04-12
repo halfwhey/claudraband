@@ -14,18 +14,31 @@ describe("claudraband cli args", () => {
     expect(args.hasExplicitTerminalBackend).toBe(false);
   });
 
-  test("parses explicit terminal backend", () => {
-    const args = parseArgs(["--terminal-backend", "xterm", "-c", "--dangerously-skip-permissions", "hello"]);
+  test("parses explicit backend and top-level flags", () => {
+    const args = parseArgs([
+      "--backend",
+      "xterm",
+      "--model",
+      "opus",
+      "--permission-mode",
+      "bypassPermissions",
+      "hello",
+    ]);
     expect(args.terminalBackend).toBe("xterm");
     expect(args.hasExplicitTerminalBackend).toBe(true);
+    expect(args.model).toBe("opus");
+    expect(args.permissionMode).toBe("bypassPermissions");
     expect(args.prompt).toBe("hello");
   });
 
-  test("parses --acp mode", () => {
-    const args = parseArgs(["--acp", "--claude", "--model opus"]);
+  test("parses acp command", () => {
+    const args = parseArgs(["acp", "--claude", "--model opus"]);
     expect(args.command).toBe("acp");
-    expect(args.acp).toBe(true);
     expect(args.model).toBe("opus");
+  });
+
+  test("rejects removed --acp alias", () => {
+    expect(() => parseArgs(["--acp"], noopIo as never)).toThrow("exit(1)");
   });
 
   test("parses Claude launch flags from a single option", () => {
@@ -40,25 +53,54 @@ describe("claudraband cli args", () => {
     expect(args.prompt).toBe("hello");
   });
 
-  test("parses --session/-s flag", () => {
-    const args = parseArgs(["-s", "abc-123", "continue"]);
+  test("parses continue command", () => {
+    const args = parseArgs(["continue", "abc-123", "continue"]);
     expect(args.sessionId).toBe("abc-123");
     expect(args.prompt).toBe("continue");
-    expect(args.command).toBe("prompt");
+    expect(args.command).toBe("continue");
   });
 
-  test("--select requires --session", () => {
-    expect(() => parseArgs(["--select", "1", "hello"], noopIo as never)).toThrow("exit(1)");
+  test("rejects removed -s shorthand", () => {
+    expect(() => parseArgs(["-s", "abc-123", "keep going"], noopIo as never)).toThrow("exit(1)");
   });
 
-  test("--session without prompt/select/interactive errors", () => {
-    expect(() => parseArgs(["-s", "abc-123"], noopIo as never)).toThrow("exit(1)");
+  test("rejects removed answer command", () => {
+    expect(() => parseArgs(["answer", "abc-123", "2"], noopIo as never)).toThrow("exit(1)");
   });
 
-  test("--session with --select", () => {
-    const args = parseArgs(["-s", "abc-123", "--select", "2"]);
+  test("parses continue selection flow", () => {
+    const args = parseArgs(["continue", "abc-123", "--select", "2"]);
+    expect(args.command).toBe("continue");
     expect(args.sessionId).toBe("abc-123");
-    expect(args.select).toBe("2");
+    expect(args.answer).toBe("2");
+    expect(args.prompt).toBe("");
+  });
+
+  test("parses continue selection flow with text response", () => {
+    const args = parseArgs(["continue", "abc-123", "--select", "3", "xyz"]);
+    expect(args.command).toBe("continue");
+    expect(args.sessionId).toBe("abc-123");
+    expect(args.answer).toBe("3");
+    expect(args.prompt).toBe("xyz");
+  });
+
+  test("rejects removed -s shorthand with --select", () => {
+    expect(() => parseArgs(["-s", "abc-123", "--select", "2"], noopIo as never)).toThrow("exit(1)");
+  });
+
+  test("parses attach command", () => {
+    const args = parseArgs(["attach", "abc-123"]);
+    expect(args.command).toBe("attach");
+    expect(args.sessionId).toBe("abc-123");
+  });
+
+  test("rejects removed interactive shorthand", () => {
+    expect(() => parseArgs(["-s", "abc-123", "-i"], noopIo as never)).toThrow("exit(1)");
+  });
+
+  test("rejects removed --terminal-backend alias", () => {
+    expect(() => parseArgs(["--terminal-backend", "tmux", "hello"], noopIo as never))
+      .toThrow("exit(1)");
   });
 
   test("sessions close command", () => {
@@ -107,10 +149,27 @@ describe("claudraband cli args", () => {
     expect(args.port).toBe(9000);
   });
 
-  test("--server flag", () => {
-    const args = parseArgs(["--server", "localhost:7842", "hello"]);
-    expect(args.server).toBe("localhost:7842");
+  test("serve host flag", () => {
+    const args = parseArgs(["serve", "--host", "0.0.0.0", "--port", "9000"]);
+    expect(args.command).toBe("serve");
+    expect(args.host).toBe("0.0.0.0");
+    expect(args.port).toBe(9000);
+  });
+
+  test("connect flag is allowed for new prompts", () => {
+    const args = parseArgs(["--connect", "localhost:7842", "hello"]);
+    expect(args.connect).toBe("localhost:7842");
     expect(args.prompt).toBe("hello");
+    expect(args.command).toBe("prompt");
+  });
+
+  test("connect flag is rejected for tracked session commands", () => {
+    expect(() => parseArgs(["continue", "abc-123", "--connect", "localhost:7842", "hello"], noopIo as never))
+      .toThrow("exit(1)");
+  });
+
+  test("--select is rejected without continue", () => {
+    expect(() => parseArgs(["hello", "--select", "2"], noopIo as never)).toThrow("exit(1)");
   });
 
   test("splits quoted Claude args", () => {

@@ -6,7 +6,8 @@
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
   "bin": {
-    "claudraband": "dist/bin.js"
+    "claudraband": "dist/bin.js",
+    "cband": "dist/bin.js"
   },
   "files": [
     "dist"
@@ -29,6 +30,7 @@
   },
   "dependencies": {
     "@agentclientprotocol/sdk": "^0.18.0",
+    "@anthropic-ai/claude-code": "2.1.96",
     "@xterm/addon-serialize": "^0.13.0",
     "@xterm/headless": "^5.5.0"
   },

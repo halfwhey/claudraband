@@ -13,7 +13,6 @@ import { EventKind } from "claudraband-core";
 import type { CliConfig } from "./args";
 import { requestPermission } from "./client";
 import type { Renderer } from "./render";
-import { formatDaemonSessionList } from "./session-format";
 
 interface DaemonSessionInfo {
   sessionId: string;
@@ -32,6 +31,15 @@ interface DaemonSessionRequestBody {
 interface PendingQuestionResponse {
   pending: boolean;
   source: "none" | "permission_request" | "terminal";
+}
+
+interface DaemonPromptResult extends PromptResult {
+  eventSeq?: number;
+}
+
+interface QueuedDaemonEvent {
+  event: ClaudrabandEvent;
+  seq: number;
 }
 
 function daemonUrl(server: string, path: string): string {
@@ -121,10 +129,23 @@ function buildSessionRequestBody(
 }
 
 async function answerPendingSelection(
-  session: Pick<ClaudrabandSession, "sendAndAwaitTurn">,
+  session: Pick<ClaudrabandSession, "send" | "sendAndAwaitTurn">,
   optionId: string,
+  text?: string,
 ): Promise<PromptResult> {
+  if (optionId === "0" && text) {
+    await session.sendAndAwaitTurn(optionId);
+    return session.sendAndAwaitTurn(text);
+  }
+  if (text) {
+    await session.send(optionId);
+    return session.sendAndAwaitTurn(text);
+  }
   return session.sendAndAwaitTurn(optionId);
+}
+
+function isSelectionFlow(config: CliConfig): boolean {
+  return config.command === "continue" && Boolean(config.answer);
 }
 
 function connectSSE(
@@ -202,10 +223,12 @@ class DaemonSessionProxy implements ClaudrabandSession {
   readonly permissionMode: PermissionMode;
 
   private server: string;
-  private eventQueue: ClaudrabandEvent[] = [];
-  private eventWaiters: Array<(r: IteratorResult<ClaudrabandEvent>) => void> = [];
+  private eventQueue: QueuedDaemonEvent[] = [];
+  private eventWaiters: Array<(r: IteratorResult<QueuedDaemonEvent>) => void> = [];
   private closed = false;
   private sse: { abort: () => void; ready: Promise<void> } | null = null;
+  private lastRenderedSeq = 0;
+  private seqWaiters: Array<{ target: number; resolve: () => void }> = [];
   private permissionHandler?: (
     req: ClaudrabandPermissionRequest,
   ) => Promise<ClaudrabandPermissionDecision>;
@@ -241,6 +264,7 @@ class DaemonSessionProxy implements ClaudrabandSession {
   }
 
   private handleSSEEvent(data: Record<string, unknown>): void {
+    const seq = typeof data.seq === "number" ? data.seq : 0;
     if (data.type === "permission_request" && this.permissionHandler) {
       const request = data as unknown as ClaudrabandPermissionRequest;
       this.permissionHandler(request).then((decision) => {
@@ -250,6 +274,10 @@ class DaemonSessionProxy implements ClaudrabandSession {
           decision,
         ).catch(() => {});
       });
+      if (seq > 0) {
+        this.lastRenderedSeq = Math.max(this.lastRenderedSeq, seq);
+        this.resolveSeqWaiters();
+      }
       return;
     }
 
@@ -262,12 +290,16 @@ class DaemonSessionProxy implements ClaudrabandSession {
       toolInput: (data.toolInput as string) ?? "",
       role: (data.role as string) ?? "",
     };
+    const queued: QueuedDaemonEvent = {
+      event,
+      seq,
+    };
 
     const waiter = this.eventWaiters.shift();
     if (waiter) {
-      waiter({ value: event, done: false });
+      waiter({ value: queued, done: false });
     } else {
-      this.eventQueue.push(event);
+      this.eventQueue.push(queued);
     }
   }
 
@@ -282,26 +314,29 @@ class DaemonSessionProxy implements ClaudrabandSession {
   async *events(): AsyncGenerator<ClaudrabandEvent> {
     while (true) {
       if (this.eventQueue.length > 0) {
-        yield this.eventQueue.shift()!;
+        const queued = this.eventQueue.shift()!;
+        yield queued.event;
+        this.markRendered(queued.seq);
         continue;
       }
       if (this.closed) return;
-      const result = await new Promise<IteratorResult<ClaudrabandEvent>>((resolve) => {
+      const result = await new Promise<IteratorResult<QueuedDaemonEvent>>((resolve) => {
         this.eventWaiters.push(resolve);
       });
       if (result.done) return;
-      yield result.value;
+      yield result.value.event;
+      this.markRendered(result.value.seq);
     }
   }
 
   async prompt(text: string): Promise<PromptResult> {
     const result = await daemonPost(this.server, `/sessions/${this.sessionId}/prompt`, { text });
-    return result as PromptResult;
+    return result as DaemonPromptResult;
   }
 
   async awaitTurn(): Promise<PromptResult> {
     const result = await daemonPost(this.server, `/sessions/${this.sessionId}/await-turn`);
-    return result as PromptResult;
+    return result as DaemonPromptResult;
   }
 
   async sendAndAwaitTurn(text: string): Promise<PromptResult> {
@@ -310,7 +345,7 @@ class DaemonSessionProxy implements ClaudrabandSession {
       `/sessions/${this.sessionId}/send-and-await-turn`,
       { text },
     );
-    return result as PromptResult;
+    return result as DaemonPromptResult;
   }
 
   async send(text: string): Promise<void> {
@@ -359,6 +394,33 @@ class DaemonSessionProxy implements ClaudrabandSession {
   async setPermissionMode(_mode: PermissionMode): Promise<void> {
     // Not implemented for daemon mode.
   }
+
+  async flushEvents(): Promise<void> {}
+
+  async waitForRenderedSeq(target: number | undefined): Promise<void> {
+    if (!target || target <= this.lastRenderedSeq) {
+      return;
+    }
+    await new Promise<void>((resolve) => {
+      this.seqWaiters.push({ target, resolve });
+      this.resolveSeqWaiters();
+    });
+  }
+
+  private markRendered(seq: number): void {
+    if (seq > 0) {
+      this.lastRenderedSeq = Math.max(this.lastRenderedSeq, seq);
+      this.resolveSeqWaiters();
+    }
+  }
+
+  private resolveSeqWaiters(): void {
+    const ready = this.seqWaiters.filter((waiter) => waiter.target <= this.lastRenderedSeq);
+    this.seqWaiters = this.seqWaiters.filter((waiter) => waiter.target > this.lastRenderedSeq);
+    for (const waiter of ready) {
+      waiter.resolve();
+    }
+  }
 }
 
 export async function runWithDaemon(
@@ -366,66 +428,24 @@ export async function runWithDaemon(
   renderer: Renderer,
   _logger: ClaudrabandLogger,
 ): Promise<void> {
-  // Handle commands that don't need a full session proxy.
-  if (config.command === "sessions") {
-    const result = (await daemonGet(config.server, "/sessions")) as {
-      sessions: Array<{ sessionId: string; alive: boolean; hasPendingPermission: boolean }>;
-    };
-    if (result.sessions.length === 0) {
-      process.stderr.write("no daemon sessions\n");
-    } else {
-      for (const line of formatDaemonSessionList(result.sessions)) {
-        process.stdout.write(`${line}\n`);
-      }
-    }
-    return;
-  }
-
-  if (config.command === "session-close") {
-    if (!config.sessionId) {
-        if (config.hasExplicitCwd) {
-          process.stderr.write(
-            "error: daemon session management does not support --cwd. Use --all or a session ID.\n",
-          );
-          process.exit(1);
-        }
-      const result = (await daemonGet(config.server, "/sessions")) as {
-        sessions: Array<{ sessionId: string; alive: boolean; hasPendingPermission: boolean }>;
-      };
-      const liveSessions = result.sessions.filter((session) => session.alive);
-      if (liveSessions.length === 0) {
-        process.stderr.write("no live sessions found\n");
-        return;
-      }
-      for (const session of liveSessions) {
-        await daemonDelete(config.server, `/sessions/${session.sessionId}`);
-        process.stderr.write(`session ${session.sessionId} closed\n`);
-      }
-      return;
-    }
-    await daemonDelete(config.server, `/sessions/${config.sessionId}`);
-    process.stderr.write(`session ${config.sessionId} closed\n`);
-    return;
-  }
-
   const permissionHandler = (request: ClaudrabandPermissionRequest) =>
     requestPermission(renderer, {
-      interactive: config.interactive,
-      select: config.select,
+      interactive: config.command === "attach",
+      answerChoice: config.answer,
       promptText: config.prompt,
     }, request);
 
   let sessionId: string;
   let sessionBackend: ResolvedTerminalBackend;
 
-  if (config.sessionId) {
+  if (config.command === "continue" || config.command === "attach") {
     // Resume existing session on daemon.
-    const result = (await daemonPost(config.server, `/sessions/${config.sessionId}/resume`, {
-      ...buildSessionRequestBody(config, { requireLive: Boolean(config.select) }),
+    const result = (await daemonPost(config.connect, `/sessions/${config.sessionId}/resume`, {
+      ...buildSessionRequestBody(config, { requireLive: isSelectionFlow(config) }),
     })) as DaemonSessionInfo;
-    if (config.select && result.reattached !== true) {
+    if (isSelectionFlow(config) && result.reattached !== true) {
       process.stderr.write(
-        `error: session ${config.sessionId} is not live on the daemon. Cannot answer a pending question.\n`,
+        `error: session ${config.sessionId} is not live on the daemon. Cannot use --select on a pending question.\n`,
       );
       process.exit(1);
     }
@@ -433,15 +453,16 @@ export async function runWithDaemon(
     sessionBackend = result.backend;
   } else {
     // Create new session on daemon.
-    const result = (await daemonPost(config.server, "/sessions", {
+    const result = (await daemonPost(config.connect, "/sessions", {
       ...buildSessionRequestBody(config),
     })) as DaemonSessionInfo;
     sessionId = result.sessionId;
     sessionBackend = result.backend;
+    process.stderr.write(`session: ${sessionId}\n`);
   }
 
   const session = new DaemonSessionProxy(
-    config.server,
+    config.connect,
     sessionId,
     config.cwd,
     sessionBackend,
@@ -458,15 +479,15 @@ export async function runWithDaemon(
     }
   })().catch(() => {});
 
-  if (config.debug) {
+  if (config.command !== "prompt" && config.debug) {
     process.stderr.write(`session: ${sessionId}\n`);
   }
 
   try {
-    if (config.select) {
+    if (isSelectionFlow(config)) {
       // Validate pending question.
       const result = (await daemonGet(
-        config.server,
+        config.connect,
         `/sessions/${sessionId}/pending-question`,
       )) as PendingQuestionResponse;
       if (!result.pending) {
@@ -475,20 +496,38 @@ export async function runWithDaemon(
       }
       const turnResult = result.source === "permission_request"
         ? await session.awaitTurn()
-        : await answerPendingSelection(session, config.select);
+        : await answerPendingSelection(
+          session,
+          config.answer,
+          config.prompt || undefined,
+        );
+      await session.waitForRenderedSeq((turnResult as DaemonPromptResult).eventSeq);
       renderer.ensureNewline();
       if (config.debug) {
         process.stderr.write(`stop: ${turnResult.stopReason}\n`);
       }
-    } else if (config.prompt) {
+    } else if (config.command === "prompt" || config.command === "continue") {
+      if (config.command === "continue") {
+        const pending = (await daemonGet(
+          config.connect,
+          `/sessions/${sessionId}/pending-question`,
+        )) as PendingQuestionResponse;
+        if (pending.pending) {
+          process.stderr.write(
+            `error: session ${sessionId} has a pending question or permission prompt. Use 'cband continue ${sessionId} --select <choice> [text]'.\n`,
+          );
+          process.exit(1);
+        }
+      }
       const result = await session.prompt(config.prompt);
+      await session.waitForRenderedSeq((result as DaemonPromptResult).eventSeq);
       renderer.ensureNewline();
       if (config.debug) {
         process.stderr.write(`stop: ${result.stopReason}\n`);
       }
     }
 
-    if (config.interactive) {
+    if (config.command === "attach") {
       process.stderr.write("(interactive mode, Ctrl+C to cancel, Ctrl+D to exit)\n");
       process.stdin.setEncoding("utf8");
 

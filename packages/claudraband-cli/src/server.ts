@@ -2,6 +2,7 @@ import { createServer, type IncomingMessage, type ServerResponse } from "node:ht
 import { randomUUID } from "node:crypto";
 import {
   createClaudraband,
+  type Claudraband,
   type ClaudrabandEvent,
   type ClaudrabandLogger,
   type ClaudrabandPermissionDecision,
@@ -17,6 +18,7 @@ interface DaemonSession {
     request: ClaudrabandPermissionRequest;
     resolve: (decision: ClaudrabandPermissionDecision) => void;
   } | null;
+  lastEventSeq: number;
 }
 
 interface SessionRequestBody {
@@ -54,25 +56,23 @@ function resolveServerTerminalBackend(config: CliConfig): CliConfig["terminalBac
   return config.hasExplicitTerminalBackend ? config.terminalBackend : "xterm";
 }
 
-export async function startServer(config: CliConfig): Promise<void> {
-  const serverInstanceId = randomUUID();
-  const serverUrl = `http://127.0.0.1:${config.port}`;
-  const logger: ClaudrabandLogger = {
-    info: (msg, ...args) => process.stderr.write(`info: ${msg} ${args.join(" ")}\n`),
-    debug: (msg, ...args) => {
-      if (config.debug) process.stderr.write(`debug: ${msg} ${args.join(" ")}\n`);
-    },
-    warn: (msg, ...args) => process.stderr.write(`warn: ${msg} ${args.join(" ")}\n`),
-    error: (msg, ...args) => process.stderr.write(`error: ${msg} ${args.join(" ")}\n`),
-  };
+function formatHostForUrl(host: string): string {
+  return host.includes(":") && !host.startsWith("[") ? `[${host}]` : host;
+}
 
-  const runtime = createClaudraband({
-    claudeArgs: config.claudeArgs,
-    model: config.model,
-    permissionMode: config.permissionMode,
-    terminalBackend: resolveServerTerminalBackend(config),
-    logger,
-  });
+interface DaemonServerHandle {
+  server: ReturnType<typeof createServer>;
+  sessions: Map<string, DaemonSession>;
+  close(): Promise<void>;
+}
+
+function createDaemonServer(
+  config: CliConfig,
+  runtime: Claudraband,
+  logger: ClaudrabandLogger,
+): DaemonServerHandle {
+  const serverInstanceId = randomUUID();
+  const serverUrl = `http://${formatHostForUrl(config.host)}:${config.port}`;
 
   const sessions = new Map<string, DaemonSession>();
 
@@ -83,12 +83,24 @@ export async function startServer(config: CliConfig): Promise<void> {
   function attachEventStream(ds: DaemonSession): void {
     (async () => {
       for await (const event of ds.session.events()) {
-        const data = JSON.stringify(eventToJson(event));
-        for (const res of ds.sseClients) {
-          res.write(`data: ${data}\n\n`);
-        }
+        broadcastSse(ds, eventToJson(event));
       }
     })().catch(() => {});
+  }
+
+  function broadcastSse(
+    ds: DaemonSession,
+    payload: Record<string, unknown>,
+  ): number {
+    ds.lastEventSeq++;
+    const data = JSON.stringify({
+      seq: ds.lastEventSeq,
+      ...payload,
+    });
+    for (const res of ds.sseClients) {
+      res.write(`data: ${data}\n\n`);
+    }
+    return ds.lastEventSeq;
   }
 
   async function handlePermission(
@@ -97,13 +109,10 @@ export async function startServer(config: CliConfig): Promise<void> {
   ): Promise<ClaudrabandPermissionDecision> {
     return new Promise<ClaudrabandPermissionDecision>((resolve) => {
       ds.pendingPermission = { request, resolve };
-      const data = JSON.stringify({
+      broadcastSse(ds, {
         type: "permission_request",
         ...request,
       });
-      for (const res of ds.sseClients) {
-        res.write(`data: ${data}\n\n`);
-      }
     });
   }
 
@@ -154,6 +163,7 @@ export async function startServer(config: CliConfig): Promise<void> {
           session,
           sseClients: new Set(),
           pendingPermission: null,
+          lastEventSeq: 0,
         };
         sessions.set(session.sessionId, ds);
         attachEventStream(ds);
@@ -233,6 +243,7 @@ export async function startServer(config: CliConfig): Promise<void> {
           session,
           sseClients: new Set(),
           pendingPermission: null,
+          lastEventSeq: 0,
         };
         sessions.set(sessionId, newDs);
         attachEventStream(newDs);
@@ -277,14 +288,22 @@ export async function startServer(config: CliConfig): Promise<void> {
       if (method === "POST" && action === "prompt") {
         const body = JSON.parse(await readBody(req)) as { text: string };
         const result = await ds.session.prompt(body.text);
-        json(res, 200, result);
+        await ds.session.flushEvents();
+        json(res, 200, {
+          ...result,
+          eventSeq: ds.lastEventSeq,
+        });
         return;
       }
 
       // POST /sessions/:id/await-turn
       if (method === "POST" && action === "await-turn") {
         const result = await ds.session.awaitTurn();
-        json(res, 200, result);
+        await ds.session.flushEvents();
+        json(res, 200, {
+          ...result,
+          eventSeq: ds.lastEventSeq,
+        });
         return;
       }
 
@@ -300,7 +319,11 @@ export async function startServer(config: CliConfig): Promise<void> {
       if (method === "POST" && action === "send-and-await-turn") {
         const body = JSON.parse(await readBody(req)) as { text: string };
         const result = await ds.session.sendAndAwaitTurn(body.text);
-        json(res, 200, result);
+        await ds.session.flushEvents();
+        json(res, 200, {
+          ...result,
+          eventSeq: ds.lastEventSeq,
+        });
         return;
       }
 
@@ -365,35 +388,63 @@ export async function startServer(config: CliConfig): Promise<void> {
     }
   });
 
-  server.listen(config.port, () => {
+  return {
+    server,
+    sessions,
+    close: () =>
+      new Promise<void>((resolve) => {
+        for (const [, ds] of sessions) {
+          ds.session.detach().catch(() => {});
+        }
+        server.close(() => resolve());
+      }),
+  };
+}
+
+export async function startServer(config: CliConfig): Promise<void> {
+  const logger: ClaudrabandLogger = {
+    info: (msg, ...args) => process.stderr.write(`info: ${msg} ${args.join(" ")}\n`),
+    debug: (msg, ...args) => {
+      if (config.debug) process.stderr.write(`debug: ${msg} ${args.join(" ")}\n`);
+    },
+    warn: (msg, ...args) => process.stderr.write(`warn: ${msg} ${args.join(" ")}\n`),
+    error: (msg, ...args) => process.stderr.write(`error: ${msg} ${args.join(" ")}\n`),
+  };
+
+  const runtime = createClaudraband({
+    claudeArgs: config.claudeArgs,
+    model: config.model,
+    permissionMode: config.permissionMode,
+    terminalBackend: resolveServerTerminalBackend(config),
+    logger,
+  });
+
+  const handle = createDaemonServer(config, runtime, logger);
+
+  handle.server.listen(config.port, config.host, () => {
     logger.info(
-      `claudraband daemon listening on port ${config.port}`,
-      `instance=${serverInstanceId}`,
+      `claudraband daemon listening on ${config.host}:${config.port}`,
     );
   });
 
   await new Promise<void>((resolve) => {
     process.on("SIGINT", () => {
       logger.info("shutting down daemon");
-      for (const [, ds] of sessions) {
-        ds.session.detach().catch(() => {});
-      }
-      server.close(() => resolve());
+      handle.close().then(resolve);
     });
     process.on("SIGTERM", () => {
       logger.info("shutting down daemon");
-      for (const [, ds] of sessions) {
-        ds.session.detach().catch(() => {});
-      }
-      server.close(() => resolve());
+      handle.close().then(resolve);
     });
   });
 }
 
 export const __test = {
+  formatHostForUrl,
   resolveSessionConfig,
   resolveServerTerminalBackend,
   shouldReuseSession,
+  createDaemonServer,
 };
 
 function eventToJson(event: ClaudrabandEvent): Record<string, unknown> {

@@ -1,4 +1,6 @@
 import { spawn, spawnSync } from "child_process";
+import { awaitPaneIdle } from "../terminal/activity";
+import type { PaneActivityOptions, ActivityResult } from "../terminal/activity";
 
 export interface TmuxWindowSummary {
   windowId: string;
@@ -273,6 +275,10 @@ export class Session {
 
     const result = await tmux(...args);
     return result.stdout;
+  }
+
+  async awaitIdle(options?: PaneActivityOptions): Promise<ActivityResult> {
+    return awaitPaneIdle(() => this.capturePane(), options);
   }
 
   async panePID(): Promise<number> {

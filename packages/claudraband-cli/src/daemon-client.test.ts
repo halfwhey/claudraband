@@ -7,12 +7,11 @@ function makeConfig(overrides: Partial<CliConfig> = {}): CliConfig {
     command: "prompt",
     prompt: "",
     sessionId: "",
+    answer: "",
     allSessions: false,
     cwd: "/repo",
     hasExplicitCwd: false,
     debug: false,
-    interactive: false,
-    acp: false,
     claudeArgs: ["--effort", "high"],
     hasExplicitClaudeArgs: true,
     hasExplicitModel: true,
@@ -21,9 +20,10 @@ function makeConfig(overrides: Partial<CliConfig> = {}): CliConfig {
     model: "opus",
     permissionMode: "bypassPermissions",
     terminalBackend: "auto",
-    select: "",
-    server: "localhost:7842",
+    connect: "localhost:7842",
+    host: "127.0.0.1",
     port: 7842,
+    warnings: [],
     ...overrides,
   };
 }
@@ -58,6 +58,9 @@ describe("daemon client helpers", () => {
   test("sends deferred selections before awaiting the turn", async () => {
     const calls: string[] = [];
     const session = {
+      async send(text: string) {
+        calls.push(`send:${text}`);
+      },
       async sendAndAwaitTurn(text: string) {
         calls.push(`send-and-await:${text}`);
         return { stopReason: "end_turn" as const };
@@ -68,5 +71,41 @@ describe("daemon client helpers", () => {
 
     expect(result).toEqual({ stopReason: "end_turn" });
     expect(calls).toEqual(["send-and-await:2"]);
+  });
+
+  test("sends the selected option before text-entry responses", async () => {
+    const calls: string[] = [];
+    const session = {
+      async send(text: string) {
+        calls.push(`send:${text}`);
+      },
+      async sendAndAwaitTurn(text: string) {
+        calls.push(`send-and-await:${text}`);
+        return { stopReason: "end_turn" as const };
+      },
+    };
+
+    const result = await __test.answerPendingSelection(session, "3", "xyz");
+
+    expect(result).toEqual({ stopReason: "end_turn" });
+    expect(calls).toEqual(["send:3", "send-and-await:xyz"]);
+  });
+
+  test("cancels before sending follow-up text", async () => {
+    const calls: string[] = [];
+    const session = {
+      async send(text: string) {
+        calls.push(`send:${text}`);
+      },
+      async sendAndAwaitTurn(text: string) {
+        calls.push(`send-and-await:${text}`);
+        return { stopReason: "end_turn" as const };
+      },
+    };
+
+    const result = await __test.answerPendingSelection(session, "0", "xyz");
+
+    expect(result).toEqual({ stopReason: "end_turn" });
+    expect(calls).toEqual(["send-and-await:0", "send-and-await:xyz"]);
   });
 });

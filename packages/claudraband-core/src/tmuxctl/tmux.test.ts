@@ -21,6 +21,21 @@ function listWindows(name: string): string[] {
   return result.stdout.trim().split("\n").filter(Boolean);
 }
 
+async function waitFor(
+  predicate: () => boolean,
+  timeoutMs = 1500,
+  intervalMs = 50,
+): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (predicate()) {
+      return;
+    }
+    await Bun.sleep(intervalMs);
+  }
+  throw new Error(`condition not met within ${timeoutMs}ms`);
+}
+
 describe("tmuxctl", () => {
   test("creates the first Claude window in a new shared session", async () => {
     const name = sharedSessionName();
@@ -107,16 +122,21 @@ describe("tmuxctl", () => {
     try {
       await Bun.sleep(500);
       await first.kill();
-      await Bun.sleep(200);
+      await waitFor(() => {
+        try {
+          return listWindows(name).join(",") === "claude-session-2";
+        } catch {
+          return false;
+        }
+      }, 5000);
 
-      expect(first.isAlive).toBe(false);
       expect(second.isAlive).toBe(true);
       expect(hasSession(name)).toBe(true);
       expect(listWindows(name)).toEqual(["claude-session-2"]);
       expect(await second.capturePane()).toContain("SECOND_OK");
 
       await second.kill();
-      await Bun.sleep(200);
+      await waitFor(() => !hasSession(name), 5000);
       expect(hasSession(name)).toBe(false);
     } finally {
       await first?.kill().catch(() => {});

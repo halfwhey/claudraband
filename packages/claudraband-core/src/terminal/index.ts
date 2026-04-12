@@ -1,5 +1,7 @@
 import { spawnSync } from "node:child_process";
 import { Session, listWindows } from "../tmuxctl";
+import { awaitPaneIdle } from "./activity";
+import type { PaneActivityOptions, ActivityResult } from "./activity";
 import type { Terminal as HeadlessTerminal } from "@xterm/headless";
 import type { SerializeAddon } from "@xterm/addon-serialize";
 import type { IPty } from "node-pty";
@@ -29,6 +31,8 @@ export interface TerminalHost {
   send(input: string): Promise<void>;
   interrupt(): Promise<void>;
   capture(): Promise<string>;
+  /** Poll capture() until the pane content stabilizes. */
+  awaitIdle(options?: PaneActivityOptions): Promise<ActivityResult>;
   alive(): boolean;
   processId(): Promise<number | undefined>;
 }
@@ -261,6 +265,11 @@ class TmuxTerminalHost implements TerminalHost {
     return this.session.capturePane();
   }
 
+  async awaitIdle(options?: PaneActivityOptions): Promise<ActivityResult> {
+    if (!this.session) throw new Error("tmux terminal is not started");
+    return this.session.awaitIdle(options);
+  }
+
   alive(): boolean {
     return this.session !== null && this.session.isAlive;
   }
@@ -381,6 +390,10 @@ class XtermTerminalHost implements TerminalHost {
     if (!this.serializeAddon) throw new Error("xterm terminal is not started");
     await this.outputDrain;
     return this.serializeAddon.serialize();
+  }
+
+  async awaitIdle(options?: PaneActivityOptions): Promise<ActivityResult> {
+    return awaitPaneIdle(() => this.capture(), options);
   }
 
   alive(): boolean {

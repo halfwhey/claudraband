@@ -2,6 +2,8 @@
 
 `claudraband` is both a CLI and a TypeScript library. Install it once and you get programmatic control over real local Claude Code sessions.
 
+For the command-line interface, see [docs/cli.md](cli.md).
+
 ```sh
 npm install claudraband
 ```
@@ -35,14 +37,16 @@ const runtime = createClaudraband({
 });
 ```
 
+By default, the runtime resolves bundled Claude Code `@anthropic-ai/claude-code@2.1.96`. For advanced override cases, pass `claudeExecutable` or set `CLAUDRABAND_CLAUDE_PATH`.
+
 ### `Claudraband`
 
 | Method | Description |
 |---|---|
 | `startSession(options?)` | Start a new Claude Code session |
 | `resumeSession(sessionId, options?)` | Reattach to an existing session |
-| `listSessions(cwd?)` | List sessions from the canonical `~/.claudraband` registry |
-| `inspectSession(sessionId, cwd?)` | Inspect one tracked session |
+| `listSessions(cwd?)` | List live registry-backed sessions plus transcript-backed history |
+| `inspectSession(sessionId, cwd?)` | Inspect one live or historical session |
 | `closeSession(sessionId)` | Close a tracked live session through its recorded owner |
 | `replaySession(sessionId, cwd)` | Parse a session's JSONL into events without starting Claude |
 
@@ -54,6 +58,7 @@ Returned by `startSession` and `resumeSession`.
 |---|---|
 | `prompt(text)` | Send a prompt and wait for the turn to complete |
 | `awaitTurn()` | Wait for an in-progress turn to finish |
+| `sendAndAwaitTurn(text)` | Send raw terminal input and wait for the next turn to complete |
 | `send(text)` | Send raw text to the terminal (low-level) |
 | `interrupt()` | Send Ctrl+C |
 | `stop()` | Kill the Claude Code process |
@@ -61,10 +66,11 @@ Returned by `startSession` and `resumeSession`.
 | `events()` | Async iterable of session events |
 | `capturePane()` | Snapshot of the terminal's visible content |
 | `isProcessAlive()` | Whether the backing terminal process is running |
+| `hasPendingInput()` | Check whether the live terminal still has a pending question |
 | `setModel(model)` | Switch model mid-session |
 | `setPermissionMode(mode)` | Switch permission mode (restarts Claude) |
 
-**Properties:** `sessionId`, `cwd`, `model`, `permissionMode`
+**Properties:** `sessionId`, `cwd`, `backend`, `model`, `permissionMode`
 
 ## Streaming events
 
@@ -107,6 +113,7 @@ await stream;
 | `AssistantThinking` | `text` | Extended thinking content |
 | `ToolCall` | `toolName`, `toolID`, `toolInput` | Tool invocation |
 | `ToolResult` | `toolID`, `text` | Tool output |
+| `TurnEnd` | none | Explicit Claude turn completion |
 | `System` | `text` | System messages, progress |
 | `Error` | `text` | Errors |
 
@@ -166,7 +173,7 @@ await final.stop(); // kills the process
 
 With the tmux backend, sessions persist across CLI invocations. `detach()` disconnects the library without killing the tmux window. `stop()` kills it.
 
-All sessions are tracked in `~/.claudraband/`, regardless of backend. That registry carries the session ID, cwd, backend, liveness, and owner-routing metadata needed for close and reconnect operations.
+`~/.claudraband/` stores only live sessions. Historical sessions come from Claude transcript discovery. The live registry carries the session ID, cwd, backend, liveness, and owner-routing metadata needed for close and reconnect operations.
 
 ## Listing and replaying sessions
 
@@ -174,7 +181,7 @@ All sessions are tracked in `~/.claudraband/`, regardless of backend. That regis
 // List all sessions for a directory
 const sessions = await runtime.listSessions("/my/project");
 for (const s of sessions) {
-  console.log(`${s.sessionId}  ${s.updatedAt}  ${s.title}`);
+  console.log(`${s.sessionId}  ${s.backend}  ${s.updatedAt}  ${s.title}`);
 }
 
 // Replay a session's history without starting Claude
@@ -197,12 +204,14 @@ Passed to `createClaudraband()` as defaults or to individual session methods as 
 | `cwd` | `string` | `process.cwd()` | Working directory for Claude |
 | `model` | `string` | `"sonnet"` | Claude model |
 | `claudeArgs` | `string[]` | `[]` | Extra flags passed to `claude` CLI |
+| `claudeExecutable` | `string` | bundled `@anthropic-ai/claude-code@2.1.96` | Override the Claude executable path |
 | `permissionMode` | `PermissionMode` | `"default"` | Permission mode |
 | `terminalBackend` | `TerminalBackend` | `"auto"` | `"auto"`, `"tmux"`, or `"xterm"` |
 | `paneWidth` | `number` | `120` | Terminal width |
 | `paneHeight` | `number` | `40` | Terminal height |
 | `logger` | `ClaudrabandLogger` | no-op | Logging interface |
 | `onPermissionRequest` | callback | `undefined` | Permission handler |
+| `sessionOwner` | owner record | inferred | Internal routing metadata for session ownership |
 
 ### `PermissionMode`
 

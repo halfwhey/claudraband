@@ -227,7 +227,8 @@ export class Bridge implements Agent {
   async listSessions(
     params: ListSessionsRequest,
   ): Promise<ListSessionsResponse> {
-    const sessions = await this.runtime.listSessions(params.cwd ?? undefined);
+    const sessions = (await this.runtime.listSessions(params.cwd ?? undefined))
+      .filter((session) => session.source === "live" && session.alive);
     return { sessions };
   }
 

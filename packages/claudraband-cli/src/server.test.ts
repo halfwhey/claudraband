@@ -7,12 +7,11 @@ function makeConfig(overrides: Partial<CliConfig> = {}): CliConfig {
     command: "serve",
     prompt: "",
     sessionId: "",
+    answer: "",
     allSessions: false,
     cwd: "/daemon-cwd",
     hasExplicitCwd: false,
     debug: false,
-    interactive: false,
-    acp: false,
     claudeArgs: ["--append-system-prompt", "daemon"],
     hasExplicitClaudeArgs: true,
     hasExplicitModel: true,
@@ -21,9 +20,10 @@ function makeConfig(overrides: Partial<CliConfig> = {}): CliConfig {
     model: "sonnet",
     permissionMode: "default",
     terminalBackend: "auto",
-    select: "",
-    server: "",
+    connect: "",
+    host: "127.0.0.1",
     port: 7842,
+    warnings: [],
     ...overrides,
   };
 }
@@ -39,6 +39,11 @@ describe("daemon server helpers", () => {
         }),
       ),
     ).toBe("tmux");
+  });
+
+  test("formats IPv4 and IPv6 hosts for daemon URLs", () => {
+    expect(__test.formatHostForUrl("127.0.0.1")).toBe("127.0.0.1");
+    expect(__test.formatHostForUrl("::1")).toBe("[::1]");
   });
 
   test("resolves per-request session overrides", () => {

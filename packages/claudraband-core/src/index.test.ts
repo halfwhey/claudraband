@@ -5,6 +5,8 @@ import { mkdtemp, mkdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createClaudraband, EventKind, __test } from "./index";
+import { sessionPath } from "./claude";
+import { readSessionRecord, writeKnownSessionRecord } from "./session-registry";
 import { Session } from "./tmuxctl";
 import type { Event } from "./wrap/event";
 
@@ -168,6 +170,7 @@ describe("session discovery", () => {
       expect(found).toBeDefined();
       expect(found?.cwd).toBe("/tmp");
       expect(found?.backend).toBe("tmux");
+      expect(found?.source).toBe("live");
       expect(found?.alive).toBe(true);
       expect(found?.reattachable).toBe(true);
     } finally {
@@ -199,7 +202,7 @@ describe("session discovery", () => {
     try {
       const closed = await runtime.closeSession(sessionId);
       expect(closed).toBe(true);
-      expect((await runtime.inspectSession(sessionId, "/tmp"))?.alive).toBe(false);
+      expect(await runtime.inspectSession(sessionId, "/tmp")).toBeNull();
     } finally {
       await session?.kill().catch(() => {});
     }
@@ -261,12 +264,13 @@ describe("session discovery", () => {
       const sessions = await runtime.listSessions();
       const found = sessions.find((session) => session.sessionId === sessionId);
       expect(found?.owner.kind).toBe("daemon");
+      expect(found?.source).toBe("live");
       expect(found?.alive).toBe(true);
 
       const closed = await runtime.closeSession(sessionId);
       expect(closed).toBe(true);
       expect(deleted).toEqual([sessionId]);
-      expect((await runtime.inspectSession(sessionId))?.alive).toBe(false);
+      expect(await runtime.inspectSession(sessionId)).toBeNull();
     } finally {
       await new Promise<void>((resolve, reject) =>
         server.close((err) => (err ? reject(err) : resolve())),
@@ -274,6 +278,58 @@ describe("session discovery", () => {
       await rm(join(registryHome, "sessions", `${sessionId}.json`), {
         force: true,
       });
+    }
+  });
+
+  test("lists only claudraband-tracked transcript sessions as history", async () => {
+    const sessionId = randomUUID();
+    const cwd = `/tmp/claudraband-history-${sessionId}`;
+    const transcript = sessionPath(cwd, sessionId);
+    const unrelatedId = randomUUID();
+    const unrelatedCwd = `/tmp/unrelated-history-${unrelatedId}`;
+    const unrelatedTranscript = sessionPath(unrelatedCwd, unrelatedId);
+
+    try {
+      await mkdir(join(transcript, ".."), { recursive: true });
+      await writeFile(
+        transcript,
+        `${JSON.stringify({
+          type: "assistant",
+          message: { content: [{ type: "text", text: "history session output that is long enough to pass the size filter" }] },
+          session_id: sessionId,
+        })}\n`,
+      );
+      await mkdir(join(unrelatedTranscript, ".."), { recursive: true });
+      await writeFile(
+        unrelatedTranscript,
+        `${JSON.stringify({
+          type: "assistant",
+          message: { content: [{ type: "text", text: "unrelated standalone claude output that should not appear in claudraband sessions" }] },
+          session_id: unrelatedId,
+        })}\n`,
+      );
+      await writeKnownSessionRecord({
+        version: 1,
+        sessionId,
+        cwd,
+        backend: "tmux",
+        createdAt: "2026-04-12T00:00:00.000Z",
+        updatedAt: "2026-04-12T00:00:00.000Z",
+        transcriptPath: transcript,
+      });
+
+      const runtime = createClaudraband();
+      const sessions = await runtime.listSessions();
+      const found = sessions.find((session) => session.sessionId === sessionId);
+      const unrelated = sessions.find((session) => session.sessionId === unrelatedId);
+
+      expect(found?.source).toBe("history");
+      expect(found?.alive).toBe(false);
+      expect(unrelated).toBeUndefined();
+      expect(await readSessionRecord(sessionId)).toBeNull();
+    } finally {
+      await rm(join(transcript, ".."), { recursive: true, force: true });
+      await rm(join(unrelatedTranscript, ".."), { recursive: true, force: true });
     }
   });
 
@@ -409,5 +465,45 @@ describe("session discovery", () => {
 
     expect((await events.next()).value?.text).toBe("second");
     expect((await events.next()).done).toBe(true);
+  });
+
+  test("flushEvents waits for direct-delivery subscribers to finish consuming", async () => {
+    class QueueingWrapper extends FakeSessionWrapper {
+      push(event: Event): void {
+        this.emit(event);
+      }
+    }
+
+    const wrapper = new QueueingWrapper();
+    const session = __test.createSession(wrapper as never);
+    const events = session.events()[Symbol.asyncIterator]();
+
+    const firstNext = events.next();
+    wrapper.push({
+      kind: EventKind.AssistantText,
+      time: new Date(),
+      text: "first",
+      toolName: "",
+      toolID: "",
+      toolInput: "",
+      role: "assistant",
+    });
+
+    expect((await firstNext).value?.text).toBe("first");
+
+    let flushed = false;
+    const flushPromise = session.flushEvents().then(() => {
+      flushed = true;
+    });
+
+    await Bun.sleep(20);
+    expect(flushed).toBe(false);
+
+    const closeNext = events.next();
+    await session.stop();
+    await closeNext;
+    await flushPromise;
+
+    expect(flushed).toBe(true);
   });
 });

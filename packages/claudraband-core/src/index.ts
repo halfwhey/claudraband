@@ -1,6 +1,4 @@
-import { open, readdir, readFile, stat } from "node:fs/promises";
-import { homedir } from "node:os";
-import { join } from "node:path";
+import { open, readFile, stat } from "node:fs/promises";
 import { request as httpRequest } from "node:http";
 import {
   ClaudeWrapper,
@@ -22,12 +20,16 @@ import type { Event as ClaudrabandEvent } from "./wrap/event";
 import { EventKind } from "./wrap/event";
 import type { Wrapper } from "./wrap/wrapper";
 import {
+  deleteSessionRecord,
   isPidAlive,
+  listKnownSessionRecords,
   listSessionRecords,
   normalizeServerUrl,
+  readKnownSessionRecord,
   readSessionRecord,
   type SessionOwnerRecord,
   type SessionRecord,
+  writeKnownSessionRecord,
   writeSessionRecord,
 } from "./session-registry";
 
@@ -42,6 +44,8 @@ export { hasPendingQuestion };
 export { parseClaudeArgs };
 export { resolveTerminalBackend };
 export { sessionPath };
+export { awaitPaneIdle } from "./terminal/activity";
+export type { PaneActivityOptions, ActivityResult } from "./terminal/activity";
 export type { ClaudrabandEvent };
 export type { TerminalBackend };
 export type { ResolvedTerminalBackend };
@@ -119,6 +123,7 @@ export type ClaudrabandPermissionDecision =
 export interface ClaudrabandOptions {
   cwd?: string;
   claudeArgs?: string[];
+  claudeExecutable?: string;
   model?: string;
   permissionMode?: PermissionMode;
   allowTextResponses?: boolean;
@@ -139,6 +144,7 @@ export interface SessionSummary {
   createdAt: string;
   updatedAt?: string;
   backend: ResolvedTerminalBackend;
+  source: "live" | "history";
   alive: boolean;
   reattachable: boolean;
   owner: SessionOwnerRecord;
@@ -168,6 +174,7 @@ export interface ClaudrabandSession {
   hasPendingInput(): Promise<{ pending: boolean; source: "none" | "terminal" }>;
   setModel(model: string): Promise<void>;
   setPermissionMode(mode: PermissionMode): Promise<void>;
+  flushEvents(): Promise<void>;
 }
 
 export interface Claudraband {
@@ -231,6 +238,7 @@ interface Subscriber {
   queue: ClaudrabandEvent[];
   resolvers: Array<(result: IteratorResult<ClaudrabandEvent>) => void>;
   closed: boolean;
+  inFlight: number;
 }
 
 interface PromptWaiter {
@@ -241,6 +249,7 @@ interface PromptWaiter {
   turnEnded: boolean;
   inputDeferred: boolean;
   lastPendingTool: PendingTool | null;
+  consecutiveIdles: number;
   waiters: Set<() => void>;
 }
 
@@ -289,6 +298,7 @@ function normalizeOptions(
   return {
     cwd: options?.cwd ?? defaults.cwd ?? process.cwd(),
     claudeArgs: parsedClaudeArgs.passthroughArgs,
+    claudeExecutable: options?.claudeExecutable ?? defaults.claudeExecutable ?? "",
     model:
       options?.model ??
       parsedClaudeArgs.model ??
@@ -337,6 +347,7 @@ class ClaudrabandRuntime implements Claudraband {
     const wrapper = new ClaudeWrapper({
       model: cfg.model,
       claudeArgs: cfg.claudeArgs,
+      claudeExecutable: cfg.claudeExecutable || undefined,
       permissionMode: cfg.permissionMode,
       terminalBackend: cfg.terminalBackend,
       workingDir: cfg.cwd,
@@ -372,6 +383,7 @@ class ClaudrabandRuntime implements Claudraband {
     const wrapper = new ClaudeWrapper({
       model: cfg.model,
       claudeArgs: cfg.claudeArgs,
+      claudeExecutable: cfg.claudeExecutable || undefined,
       permissionMode: cfg.permissionMode,
       terminalBackend: cfg.terminalBackend,
       workingDir: cfg.cwd,
@@ -633,15 +645,37 @@ class ClaudrabandSessionImpl implements ClaudrabandSession {
 
   async syncSessionRecord(alive = this.isProcessAlive()): Promise<void> {
     const existing = await readSessionRecord(this.sessionId);
+    const known = await readKnownSessionRecord(this.sessionId);
     const transcriptPath = sessionPath(this.cwd, this.sessionId);
     const now = new Date().toISOString();
+    const title =
+      existing?.title
+      ?? known?.title
+      ?? await extractSessionTitle(transcriptPath)
+      ?? undefined;
+
+    await writeKnownSessionRecord({
+      version: 1,
+      sessionId: this.sessionId,
+      cwd: this.cwd,
+      backend: this.backend,
+      title,
+      createdAt: existing?.createdAt ?? known?.createdAt ?? now,
+      updatedAt: now,
+      transcriptPath,
+    });
+
+    if (!alive) {
+      await deleteSessionRecord(this.sessionId);
+      return;
+    }
     const owner = await this.resolveSessionOwner();
     await writeSessionRecord({
       version: 1,
       sessionId: this.sessionId,
       cwd: this.cwd,
       backend: this.backend,
-      title: existing?.title ?? await extractSessionTitle(transcriptPath) ?? undefined,
+      title,
       createdAt: existing?.createdAt ?? now,
       updatedAt: now,
       lastKnownAlive: alive,
@@ -691,18 +725,38 @@ class ClaudrabandSessionImpl implements ClaudrabandSession {
     await this.syncSessionRecord();
   }
 
+  async flushEvents(): Promise<void> {
+    while (true) {
+      let pending = false;
+      for (const subscriber of this.subscribers) {
+        if (subscriber.queue.length > 0 || subscriber.inFlight > 0) {
+          pending = true;
+          break;
+        }
+      }
+      if (!pending) {
+        return;
+      }
+      await new Promise<void>((resolve) => setTimeout(resolve, 0));
+    }
+  }
+
   async *events(): AsyncGenerator<ClaudrabandEvent> {
     const subscriber: Subscriber = {
       queue: [],
       resolvers: [],
       closed: false,
+      inFlight: 0,
     };
     this.subscribers.add(subscriber);
 
     try {
       while (true) {
         if (subscriber.queue.length > 0) {
-          yield subscriber.queue.shift()!;
+          const event = subscriber.queue.shift()!;
+          subscriber.inFlight++;
+          yield event;
+          subscriber.inFlight = Math.max(0, subscriber.inFlight - 1);
           continue;
         }
         if (subscriber.closed) return;
@@ -713,6 +767,7 @@ class ClaudrabandSessionImpl implements ClaudrabandSession {
         );
         if (result.done) return;
         yield result.value;
+        subscriber.inFlight = Math.max(0, subscriber.inFlight - 1);
       }
     } finally {
       subscriber.closed = true;
@@ -725,6 +780,7 @@ class ClaudrabandSessionImpl implements ClaudrabandSession {
       if (subscriber.closed) continue;
       const resolver = subscriber.resolvers.shift();
       if (resolver) {
+        subscriber.inFlight++;
         resolver({ value: ev, done: false });
       } else {
         subscriber.queue.push(ev);
@@ -741,6 +797,7 @@ class ClaudrabandSessionImpl implements ClaudrabandSession {
       turnEnded: false,
       inputDeferred: false,
       lastPendingTool: null,
+      consecutiveIdles: 0,
       waiters: new Set(),
     };
   }
@@ -897,9 +954,13 @@ class ClaudrabandSessionImpl implements ClaudrabandSession {
 
       if (result === "abort") return "cancelled";
       if (result === "done") return "end_turn";
-      if (result === "changed") continue;
+      if (result === "changed") {
+        prompt.consecutiveIdles = 0;
+        continue;
+      }
 
       if (result === "timeout") {
+        prompt.consecutiveIdles++;
         if (!prompt.matchedUserEcho) {
           continue;
         }
@@ -917,6 +978,14 @@ class ClaudrabandSessionImpl implements ClaudrabandSession {
             prompt.lastPendingTool = null;
             this.notifyPrompt(prompt);
           }
+          continue;
+        }
+        // Idle fallback: if we received assistant output, no tools are
+        // pending, and two consecutive idle periods passed with no new
+        // events, treat this as turn completion even when the JSONL didn't
+        // include an explicit TurnEnd event.
+        if (prompt.gotResponse && prompt.consecutiveIdles >= 2) {
+          return "end_turn";
         }
         continue;
       }
@@ -1009,7 +1078,7 @@ class ClaudrabandSessionImpl implements ClaudrabandSession {
       });
 
       if (decision.outcome === "deferred") {
-        // Leave the question pending — caller can resume later with --select.
+        // Leave the question pending so the caller can answer it later.
         return true;
       }
 
@@ -1108,33 +1177,41 @@ function buildAskUserQuestionOptions(
 }
 
 async function discoverSessions(cwdFilter?: string): Promise<SessionSummary[]> {
-  await backfillLegacyLocalSessions(cwdFilter);
-  const records = await listSessionRecords();
-  const refreshed = await refreshSessionRecords(records);
-  return refreshed
+  await reconcileLiveLocalSessions(cwdFilter);
+  const live = (await refreshSessionRecords(await listSessionRecords()))
     .filter((record) => !cwdFilter || record.cwd === cwdFilter)
-    .map(sessionRecordToSummary)
-    .sort((left, right) =>
-      Number(right.alive) - Number(left.alive) ||
-      (right.updatedAt ?? "").localeCompare(left.updatedAt ?? "") ||
-      left.sessionId.localeCompare(right.sessionId),
-    );
+    .map(sessionRecordToSummary);
+  const liveKeys = new Set(live.map((session) => `${session.sessionId}\t${session.cwd}`));
+  const history = (await discoverHistoricalSessions(cwdFilter))
+    .filter((session) => !liveKeys.has(`${session.sessionId}\t${session.cwd}`));
+
+  return [...live, ...history].sort((left, right) =>
+    Number(right.alive) - Number(left.alive) ||
+    (right.updatedAt ?? "").localeCompare(left.updatedAt ?? "") ||
+    left.sessionId.localeCompare(right.sessionId),
+  );
 }
 
 async function inspectSession(
   sessionId: string,
   cwd?: string,
 ): Promise<SessionSummary | null> {
-  await backfillLegacyLocalSessions(cwd);
+  await reconcileLiveLocalSessions(cwd);
   const record = await readSessionRecord(sessionId);
-  if (!record) return null;
-  if (cwd && record.cwd !== cwd) return null;
-  const refreshed = await refreshSessionRecords([record]);
-  return refreshed[0] ? sessionRecordToSummary(refreshed[0]) : null;
+  if (record && (!cwd || record.cwd === cwd)) {
+    const refreshed = await refreshSessionRecords([record]);
+    if (refreshed[0]) {
+      return sessionRecordToSummary(refreshed[0]);
+    }
+  }
+
+  const history = await discoverHistoricalSessions(cwd);
+  const matches = history.filter((session) => session.sessionId === sessionId);
+  return matches[0] ?? null;
 }
 
 async function closeSessionByRecord(sessionId: string): Promise<boolean> {
-  await backfillLegacyLocalSessions();
+  await reconcileLiveLocalSessions();
   const record = await readSessionRecord(sessionId);
   if (!record) return false;
 
@@ -1161,31 +1238,48 @@ async function closeSessionByRecord(sessionId: string): Promise<boolean> {
   }
 
   if (closed) {
-    await writeSessionRecord({
-      ...refreshed,
-      lastKnownAlive: false,
-      reattachable: false,
-      updatedAt: new Date().toISOString(),
-    });
+    await deleteSessionRecord(sessionId);
   }
 
   return closed;
 }
 
-async function backfillLegacyLocalSessions(cwdFilter?: string): Promise<void> {
-  const discovered = await discoverLegacyLocalSessions(cwdFilter);
+async function reconcileLiveLocalSessions(cwdFilter?: string): Promise<void> {
+  const discovered = await discoverLegacyLiveSessions(
+    createTerminalBackendDriver({
+      backend: "tmux",
+      tmuxSessionName: SHARED_TMUX_SESSION,
+    }),
+    cwdFilter,
+  );
   for (const session of discovered) {
     const existing = await readSessionRecord(session.sessionId);
+    const known = await readKnownSessionRecord(session.sessionId);
     const transcriptPath = sessionPath(session.cwd, session.sessionId);
+    const title = existing?.title ?? known?.title ?? session.title;
+    const createdAt = existing?.createdAt ?? known?.createdAt ?? session.createdAt;
+    const updatedAt = session.updatedAt ?? existing?.updatedAt ?? known?.updatedAt ?? session.createdAt;
+
+    await writeKnownSessionRecord({
+      version: 1,
+      sessionId: session.sessionId,
+      cwd: session.cwd,
+      backend: session.backend,
+      title,
+      createdAt,
+      updatedAt,
+      transcriptPath,
+    });
+
     await writeSessionRecord({
       version: 1,
       sessionId: session.sessionId,
       cwd: session.cwd,
       backend: session.backend,
-      title: existing?.title ?? session.title,
-      createdAt: existing?.createdAt ?? session.createdAt,
-      updatedAt: session.updatedAt ?? existing?.updatedAt ?? session.createdAt,
-      lastKnownAlive: session.alive,
+      title,
+      createdAt,
+      updatedAt,
+      lastKnownAlive: true,
       reattachable: session.reattachable,
       transcriptPath,
       owner: {
@@ -1196,81 +1290,34 @@ async function backfillLegacyLocalSessions(cwdFilter?: string): Promise<void> {
   }
 }
 
-async function discoverLegacyLocalSessions(cwdFilter?: string): Promise<SessionSummary[]> {
-  const backendDriver = createTerminalBackendDriver({
-    backend: "tmux",
-    tmuxSessionName: SHARED_TMUX_SESSION,
-  });
-  const projectsDir = join(homedir(), ".claude", "projects");
-  const cwdDirs: { dir: string; cwd: string }[] = [];
+async function discoverHistoricalSessions(cwdFilter?: string): Promise<SessionSummary[]> {
+  const records = (await listKnownSessionRecords())
+    .filter((record) => !cwdFilter || record.cwd === cwdFilter);
+  const results: SessionSummary[] = [];
 
-  if (cwdFilter) {
-    cwdDirs.push({
-      dir: join(projectsDir, cwdFilter.replace(/\//g, "-")),
-      cwd: cwdFilter,
-    });
-  } else {
+  for (const record of records) {
+    const transcriptPath = record.transcriptPath ?? sessionPath(record.cwd, record.sessionId);
     try {
-      const entries = await readdir(projectsDir);
-      for (const entry of entries) {
-        cwdDirs.push({
-          dir: join(projectsDir, entry),
-          cwd: entry.replace(/^-/, "/").replace(/-/g, "/"),
-        });
-      }
-    } catch {
-      return [];
-    }
-  }
-
-  const results = new Map<string, SessionSummary>();
-
-  for (const { dir, cwd } of cwdDirs) {
-    let files: string[];
-    try {
-      files = await readdir(dir);
+      const fileStat = await stat(transcriptPath);
+      if (fileStat.size < 100) continue;
+      results.push({
+        sessionId: record.sessionId,
+        cwd: record.cwd,
+        title: record.title ?? await extractSessionTitle(transcriptPath) ?? undefined,
+        createdAt: record.createdAt || fileStat.birthtime.toISOString(),
+        updatedAt: fileStat.mtime.toISOString(),
+        backend: record.backend,
+        source: "history",
+        alive: false,
+        reattachable: false,
+        owner: { kind: "local" },
+      });
     } catch {
       continue;
     }
-
-    for (const file of files) {
-      if (!file.endsWith(".jsonl")) continue;
-      const sessionId = file.replace(/\.jsonl$/, "");
-      if (!isSessionId(sessionId)) continue;
-
-      const filePath = join(dir, file);
-      try {
-        const fileStat = await stat(filePath);
-        if (fileStat.size < 100) continue;
-        results.set(sessionId, {
-          sessionId,
-          cwd,
-          title: (await extractSessionTitle(filePath)) ?? undefined,
-          createdAt: fileStat.birthtime.toISOString(),
-          updatedAt: fileStat.mtime.toISOString(),
-          backend: "tmux",
-          alive: false,
-          reattachable: false,
-          owner: { kind: "local" },
-        });
-      } catch {
-        continue;
-      }
-    }
   }
 
-  for (const window of await discoverLegacyLiveSessions(backendDriver, cwdFilter)) {
-    const existing = results.get(window.sessionId);
-    results.set(window.sessionId, existing ? {
-      ...existing,
-      ...window,
-      createdAt: existing.createdAt,
-      title: existing.title ?? window.title,
-      updatedAt: existing.updatedAt ?? window.updatedAt,
-    } : window);
-  }
-
-  return [...results.values()];
+  return results;
 }
 
 async function discoverLegacyLiveSessions(
@@ -1291,6 +1338,7 @@ async function discoverLegacyLiveSessions(
         createdAt: window.updatedAt ?? new Date().toISOString(),
         updatedAt: window.updatedAt,
         backend: backendDriver.backend,
+        source: "live",
         alive: true,
         reattachable: backendDriver.supportsLiveReconnect(),
         owner: {
@@ -1366,6 +1414,10 @@ async function refreshSessionRecords(records: SessionRecord[]): Promise<SessionR
       };
     }
 
+    if (!next.lastKnownAlive) {
+      await deleteSessionRecord(record.sessionId);
+      continue;
+    }
     if (!sessionRecordsEqual(record, next)) {
       await writeSessionRecord(next);
     }
@@ -1405,6 +1457,7 @@ function sessionRecordToSummary(record: SessionRecord): SessionSummary {
     createdAt: record.createdAt,
     updatedAt: record.updatedAt,
     backend: record.backend,
+    source: "live",
     alive: record.lastKnownAlive,
     reattachable: record.reattachable,
     owner: record.owner,

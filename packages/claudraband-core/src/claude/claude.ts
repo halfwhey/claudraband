@@ -10,9 +10,11 @@ import {
   type TerminalBackend,
   type TerminalHost,
 } from "../terminal";
+import { resolveClaudeExecutable } from "./resolve";
 
 export interface ClaudeConfig {
   claudeArgs: string[];
+  claudeExecutable?: string;
   model: string;
   permissionMode: string;
   workingDir: string;
@@ -148,7 +150,12 @@ export class ClaudeWrapper implements Wrapper {
   }
 
   private buildCmd(...extra: string[]): string[] {
-    const cmd = ["claude", "--model", this.cfg.model, ...this.cfg.claudeArgs];
+    const cmd = [
+      resolveClaudeExecutable(this.cfg.claudeExecutable),
+      "--model",
+      this.cfg.model,
+      ...this.cfg.claudeArgs,
+    ];
     if (this.cfg.permissionMode && this.cfg.permissionMode !== "default") {
       cmd.push("--permission-mode", this.cfg.permissionMode);
     }

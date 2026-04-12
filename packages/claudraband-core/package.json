@@ -24,6 +24,7 @@
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
+    "@anthropic-ai/claude-code": "2.1.96",
     "@xterm/addon-serialize": "^0.13.0",
     "@xterm/headless": "^5.5.0"
   },

@@ -4,6 +4,7 @@ import {
   type PermissionMode,
   type TerminalBackend,
 } from "claudraband-core";
+import { renderHelp, type HelpTopic } from "./help";
 
 interface ParseIo {
   stdout(text: string): void;
@@ -17,16 +18,26 @@ const defaultIo: ParseIo = {
   exit: (code) => process.exit(code),
 };
 
+export type CliCommand =
+  | "prompt"
+  | "continue"
+  | "attach"
+  | "sessions"
+  | "session-close"
+  | "status"
+  | "last"
+  | "acp"
+  | "serve";
+
 export interface CliConfig {
-  command: "prompt" | "sessions" | "session-close" | "acp" | "serve";
+  command: CliCommand;
   prompt: string;
   sessionId: string;
+  answer: string;
   allSessions: boolean;
   cwd: string;
   hasExplicitCwd: boolean;
   debug: boolean;
-  interactive: boolean;
-  acp: boolean;
   claudeArgs: string[];
   hasExplicitClaudeArgs: boolean;
   hasExplicitModel: boolean;
@@ -35,9 +46,10 @@ export interface CliConfig {
   model: string;
   permissionMode: PermissionMode;
   terminalBackend: TerminalBackend;
-  select: string;
-  server: string;
+  connect: string;
+  host: string;
   port: number;
+  warnings: string[];
 }
 
 export function parseArgs(argv: string[], io: ParseIo = defaultIo): CliConfig {
@@ -45,12 +57,11 @@ export function parseArgs(argv: string[], io: ParseIo = defaultIo): CliConfig {
     command: "prompt",
     prompt: "",
     sessionId: "",
+    answer: "",
     allSessions: false,
     cwd: process.cwd(),
     hasExplicitCwd: false,
     debug: false,
-    interactive: false,
-    acp: false,
     claudeArgs: [],
     hasExplicitClaudeArgs: false,
     hasExplicitModel: false,
@@ -59,206 +70,326 @@ export function parseArgs(argv: string[], io: ParseIo = defaultIo): CliConfig {
     model: "sonnet",
     permissionMode: "default",
     terminalBackend: "auto",
-    select: "",
-    server: "",
+    connect: "",
+    host: "127.0.0.1",
     port: 7842,
+    warnings: [],
   };
 
   const positional: string[] = [];
-  let i = 0;
+  let helpRequested = false;
+  let selectAlias = "";
+  let explicitModel: string | undefined;
+  let explicitPermissionMode: PermissionMode | undefined;
 
-  while (i < argv.length) {
+  for (let i = 0; i < argv.length; i++) {
     const arg = argv[i];
+
     if (arg === "--help" || arg === "-h") {
-      io.stdout(USAGE);
-      io.exit(0);
-    } else if (arg === "--cwd" && i + 1 < argv.length) {
+      helpRequested = true;
+      continue;
+    }
+
+    if (arg === "--cwd" && i + 1 < argv.length) {
       config.cwd = argv[++i];
       config.hasExplicitCwd = true;
-    } else if ((arg === "--claude" || arg === "-c") && i + 1 < argv.length) {
+      continue;
+    }
+
+    if ((arg === "--claude" || arg === "-c") && i + 1 < argv.length) {
       try {
         config.claudeArgs.push(...splitShellWords(argv[++i]));
       } catch (err) {
         io.stderr(`error: ${err instanceof Error ? err.message : String(err)}\n`);
-        io.stderr(USAGE);
+        io.stderr(renderHelp("top"));
         io.exit(1);
       }
-    } else if (arg === "--terminal-backend" && i + 1 < argv.length) {
+      continue;
+    }
+
+    if (arg === "--claude" || arg === "-c") {
+      io.stderr("error: --claude requires a quoted flag string.\n");
+      io.stderr(renderHelp("top"));
+      io.exit(1);
+    }
+
+    if (arg === "--backend" && i + 1 < argv.length) {
       config.terminalBackend = argv[++i] as TerminalBackend;
       config.hasExplicitTerminalBackend = true;
-    } else if (arg === "--debug") {
-      config.debug = true;
-    } else if (arg === "--interactive" || arg === "-i") {
-      config.interactive = true;
-    } else if ((arg === "--session" || arg === "-s") && i + 1 < argv.length) {
-      config.sessionId = argv[++i];
-    } else if (arg === "--select" && i + 1 < argv.length) {
-      config.select = argv[++i];
-    } else if (arg === "--all") {
-      config.allSessions = true;
-    } else if (arg === "--server" && i + 1 < argv.length) {
-      config.server = argv[++i];
-    } else if (arg === "--port" && i + 1 < argv.length) {
-      config.port = parseInt(argv[++i], 10);
-    } else if (arg === "--acp") {
-      config.acp = true;
-    } else if (arg === "--claude" || arg === "-c") {
-      io.stderr("error: --claude requires a quoted flag string.\n");
-      io.stderr(USAGE);
-      io.exit(1);
-    } else if (arg.startsWith("-")) {
-      io.stderr(`error: unknown option ${arg}\n`);
-      io.stderr(USAGE);
-      io.exit(1);
-    } else {
-      positional.push(arg);
+      continue;
     }
-    i++;
+
+    if (arg === "--model" && i + 1 < argv.length) {
+      explicitModel = argv[++i];
+      config.hasExplicitModel = true;
+      continue;
+    }
+
+    if (arg === "--permission-mode" && i + 1 < argv.length) {
+      explicitPermissionMode = argv[++i] as PermissionMode;
+      config.hasExplicitPermissionMode = true;
+      continue;
+    }
+
+    if (arg === "--debug") {
+      config.debug = true;
+      continue;
+    }
+
+    if (arg === "--select" && i + 1 < argv.length) {
+      selectAlias = argv[++i];
+      continue;
+    }
+
+    if (arg === "--all") {
+      config.allSessions = true;
+      continue;
+    }
+
+    if (arg === "--connect" && i + 1 < argv.length) {
+      config.connect = argv[++i];
+      continue;
+    }
+
+    if (arg === "--port" && i + 1 < argv.length) {
+      config.port = parseInt(argv[++i], 10);
+      continue;
+    }
+
+    if (arg === "--host" && i + 1 < argv.length) {
+      config.host = argv[++i];
+      continue;
+    }
+
+    if (arg.startsWith("-")) {
+      io.stderr(`error: unknown option ${arg}\n`);
+      io.stderr(renderHelp("top"));
+      io.exit(1);
+    }
+
+    positional.push(arg);
   }
 
   const parsedClaudeArgs = parseClaudeArgs(config.claudeArgs);
   config.claudeArgs = parsedClaudeArgs.passthroughArgs;
   config.hasExplicitClaudeArgs = parsedClaudeArgs.passthroughArgs.length > 0;
-  config.hasExplicitModel = parsedClaudeArgs.model !== undefined;
-  config.hasExplicitPermissionMode = parsedClaudeArgs.permissionMode !== undefined;
-  config.model = parsedClaudeArgs.model ?? "sonnet";
-  config.permissionMode = (parsedClaudeArgs.permissionMode as PermissionMode | undefined) ?? "default";
+  config.model = explicitModel ?? parsedClaudeArgs.model ?? "sonnet";
+  config.permissionMode =
+    explicitPermissionMode
+    ?? (parsedClaudeArgs.permissionMode as PermissionMode | undefined)
+    ?? "default";
+  config.hasExplicitModel ||= parsedClaudeArgs.model !== undefined;
+  config.hasExplicitPermissionMode ||= parsedClaudeArgs.permissionMode !== undefined;
 
-  // Route positional commands.
-  if (config.acp) {
-    if (positional.length > 0) {
-      io.stderr("error: --acp does not accept positional arguments.\n");
-      io.stderr(USAGE);
-      io.exit(1);
-    }
-    config.command = "acp";
-  } else if (positional[0] === "sessions" && positional[1] === "close") {
-    config.command = "session-close";
-    config.sessionId = positional[2] ?? "";
-  } else if (positional[0] === "sessions") {
-    config.command = "sessions";
-  } else if (positional[0] === "serve") {
-    config.command = "serve";
-  } else {
-    config.command = "prompt";
-    config.prompt = positional.join(" ");
+  const helpTopic = resolveHelpTopic(positional);
+  resolveCommand(config, positional, {
+    selectAlias,
+  });
+
+  if (helpRequested) {
+    io.stdout(renderHelp(helpTopic));
+    io.exit(0);
   }
 
-  // Validation.
-
-  if (config.select && !config.sessionId) {
-    io.stderr("error: --select requires --session <id>.\n");
+  if (selectAlias && config.command !== "continue") {
+    io.stderr("error: --select only works with 'cband continue <session-id> ...'.\n");
+    io.stderr(renderHelp("continue"));
     io.exit(1);
   }
 
+  if (positional[0] === "answer") {
+    io.stderr(
+      "error: 'claudraband answer' has been removed. Use 'cband continue <session-id> --select <choice> [text]'.\n",
+    );
+    io.stderr(renderHelp("continue"));
+    io.exit(1);
+  }
+
+  validateConfig(config, io);
+
+  return config;
+}
+
+function resolveHelpTopic(positional: string[]): HelpTopic {
+  if (positional[0] === "continue") return "continue";
+  if (positional[0] === "attach") return "attach";
+  if (positional[0] === "sessions" && positional[1] === "close") return "session-close";
+  if (positional[0] === "sessions") return "sessions";
+  if (positional[0] === "serve") return "serve";
+  if (positional[0] === "status") return "status";
+  if (positional[0] === "last") return "last";
+  if (positional[0] === "acp") return "acp";
+  return "top";
+}
+
+function resolveCommand(
+  config: CliConfig,
+  positional: string[],
+  aliases: {
+    selectAlias: string;
+  },
+): void {
+  switch (positional[0]) {
+    case "continue":
+      config.command = "continue";
+      config.sessionId = positional[1] ?? "";
+      config.answer = aliases.selectAlias;
+      config.prompt = positional.slice(2).join(" ");
+      return;
+    case "attach":
+      config.command = "attach";
+      config.sessionId = positional[1] ?? "";
+      return;
+    case "sessions":
+      config.command = positional[1] === "close" ? "session-close" : "sessions";
+      if (config.command === "session-close") {
+        config.sessionId = positional[2] ?? "";
+      }
+      return;
+    case "status":
+      config.command = "status";
+      config.sessionId = positional[1] ?? "";
+      return;
+    case "last":
+      config.command = "last";
+      config.sessionId = positional[1] ?? "";
+      return;
+    case "serve":
+      config.command = "serve";
+      return;
+    case "acp":
+      config.command = "acp";
+      return;
+    default:
+      break;
+  }
+
+  config.command = "prompt";
+  config.prompt = positional.join(" ");
+}
+
+function validateConfig(config: CliConfig, io: ParseIo): void {
+  if (
+    config.connect
+    && (
+      config.command === "continue"
+      || config.command === "attach"
+      || config.command === "sessions"
+      || config.command === "session-close"
+      || config.command === "status"
+      || config.command === "last"
+    )
+  ) {
+    io.stderr(
+      "error: --connect is only for starting new daemon sessions. Existing tracked sessions route automatically.\n",
+    );
+    io.exit(1);
+  }
+
+  if (config.command === "attach") {
+    if (!config.sessionId) {
+      io.stderr("error: attach requires <session-id>.\n");
+      io.stderr(renderHelp("attach"));
+      io.exit(1);
+    }
+  }
+
+  if (config.command === "status") {
+    if (!config.sessionId) {
+      io.stderr("error: status requires <session-id>.\n");
+      io.stderr(renderHelp("status"));
+      io.exit(1);
+    }
+  }
+
+  if (config.command === "last") {
+    if (!config.sessionId) {
+      io.stderr("error: last requires <session-id>.\n");
+      io.stderr(renderHelp("last"));
+      io.exit(1);
+    }
+  }
+
+  if (config.command === "continue") {
+    if (!config.sessionId) {
+      io.stderr("error: continue requires <session-id>.\n");
+      io.stderr(renderHelp("continue"));
+      io.exit(1);
+    }
+    if (!config.answer && !config.prompt) {
+      io.stderr("error: continue requires either <prompt...> or --select <choice>.\n");
+      io.stderr(renderHelp("continue"));
+      io.exit(1);
+    }
+  }
+
   if (config.command === "session-close") {
-    const bulkScopeCount =
-      (config.allSessions ? 1 : 0) +
-      (config.hasExplicitCwd ? 1 : 0);
+    const bulkScopeCount = (config.allSessions ? 1 : 0) + (config.hasExplicitCwd ? 1 : 0);
     if (config.sessionId && bulkScopeCount > 0) {
-      io.stderr("error: 'sessions close' accepts either <id>, --all, or --cwd <dir>.\n");
+      io.stderr("error: sessions close accepts either <session-id>, --cwd <dir>, or --all.\n");
       io.exit(1);
     }
     if (!config.sessionId && bulkScopeCount === 0) {
-      io.stderr("error: sessions close requires a session ID, --all, or --cwd <dir>.\n");
+      io.stderr("error: sessions close requires <session-id>, --cwd <dir>, or --all.\n");
+      io.stderr(renderHelp("session-close"));
       io.exit(1);
     }
     if (bulkScopeCount > 1) {
-      io.stderr("error: 'sessions close' accepts only one bulk scope: --all or --cwd <dir>.\n");
+      io.stderr("error: sessions close accepts only one bulk scope: --cwd <dir> or --all.\n");
       io.exit(1);
     }
   }
 
   if (config.command === "sessions" && config.allSessions) {
-    io.stderr("error: 'sessions' does not accept --all. Use 'sessions close --all' to bulk close.\n");
+    io.stderr("error: sessions does not accept --all. Use 'sessions close --all'.\n");
     io.exit(1);
   }
 
-  if (config.sessionId && !config.prompt && !config.select && !config.interactive
-      && config.command === "prompt") {
-    io.stderr("error: --session requires a prompt, --select, or --interactive.\n");
+  if (config.command === "prompt" && !config.prompt) {
+    io.stderr("error: no prompt provided.\n");
+    io.stderr(renderHelp("top"));
     io.exit(1);
   }
 
-  if (!config.prompt && !config.interactive && !config.select
-      && config.command === "prompt" && !config.sessionId) {
-    io.stderr("error: no prompt provided. Use --interactive / -i for REPL mode.\n");
-    io.stderr(USAGE);
+  if (config.command !== "continue" && config.answer) {
+    io.stderr("error: --select only works with 'cband continue <session-id> ...'.\n");
+    io.stderr(renderHelp("continue"));
     io.exit(1);
   }
 
-  // xterm guard: local xterm without daemon requires dangerous permission mode.
-  if (config.command === "prompt" && !config.server) {
+  if (
+    config.command === "prompt"
+    && !config.connect
+    && !isDangerousPermissionMode(config)
+  ) {
     let resolved: "tmux" | "xterm";
     try {
       resolved = resolveTerminalBackend(config.terminalBackend);
     } catch {
-      // resolveTerminalBackend throws if tmux backend is requested but
-      // tmux isn't installed. Treat that as xterm for the guard.
       resolved = "xterm";
     }
-    if (resolved === "xterm" && !isDangerousPermissionMode(config)) {
+    if (resolved === "xterm") {
       io.stderr(
-        "error: local xterm backend requires dangerous permission settings.\n" +
-        "  Either:\n" +
-        "    --server <host:port>   (use a claudraband daemon)\n" +
-        "    --terminal-backend tmux\n" +
-        '    -c "--dangerously-skip-permissions"\n',
+        "error: local xterm backend requires dangerous permission settings.\n"
+        + "  Either:\n"
+        + "    --connect <host:port>\n"
+        + "    --backend tmux\n"
+        + '    -c "--dangerously-skip-permissions"\n',
       );
       io.exit(1);
     }
   }
-
-  return config;
 }
 
-function isDangerousPermissionMode(config: CliConfig): boolean {
+export function isDangerousPermissionMode(config: Pick<
+  CliConfig,
+  "permissionMode" | "claudeArgs"
+>): boolean {
   if (config.permissionMode === "bypassPermissions") return true;
   if (config.permissionMode === "dontAsk") return true;
   if (config.claudeArgs.includes("--dangerously-skip-permissions")) return true;
   return false;
 }
-
-export const USAGE = `Usage: claudraband [options] <prompt...>
-       claudraband -s <id> <prompt...>
-       claudraband -s <id> --select <n>
-       claudraband -s <id> -i
-       claudraband sessions close <sessionId>
-       claudraband sessions close --all
-       claudraband sessions close --cwd <dir>
-       claudraband sessions [--cwd <dir>]
-       claudraband serve [--port <n>]
-       claudraband --acp [options]
-
-Options:
-  -h, --help                     Show this help
-  -s, --session <id>             Target an existing session
-  -i, --interactive              Start interactive REPL mode
-  --select <n>                   Auto-select option <n> for a pending question (requires -s)
-  --all                          Close every live tracked session for 'sessions close'
-  --acp                          Run as an ACP server over stdio
-  --cwd <dir>                    Working directory (default: cwd)
-  -c, --claude <flags>           Claude CLI flags, e.g. '--model sonnet --effort high'
-  --terminal-backend <backend>   auto | tmux | xterm (default: auto)
-  --server <host:port>           Connect to a claudraband daemon instead of running locally
-  --port <n>                     Port for the serve command (default: 7842)
-  --debug                        Show debug logging
-
-Examples:
-  claudraband "what changed in this repo?"
-  claudraband -i
-  claudraband -s abc-123 "continue the refactor"
-  claudraband -s abc-123 --select 2
-  claudraband -s abc-123 -i
-  claudraband sessions
-  claudraband sessions close abc-123
-  claudraband sessions close --all
-  claudraband sessions close --cwd /my/project
-  claudraband --acp --claude "--model opus"
-  claudraband serve --port 7842
-  claudraband --server localhost:7842 "hello"
-  claudraband --terminal-backend xterm -c "--dangerously-skip-permissions" "run without tmux"
-`;
 
 export function splitShellWords(input: string): string[] {
   const out: string[] = [];
@@ -307,7 +438,7 @@ export function splitShellWords(input: string): string[] {
     current += "\\";
   }
   if (quote) {
-    throw new Error(`unterminated quote in --claude value`);
+    throw new Error("unterminated quote in --claude value");
   }
   if (current) {
     out.push(current);
