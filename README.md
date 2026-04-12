@@ -73,7 +73,7 @@ cband continue <session-id> --select 2
 
 The daemon defaults to using `tmux` as the terminal runtime, just like the local path. Use `--connect` only when creating a new daemon-backed session; after that, tracked `continue`, `attach`, and `sessions` route through the recorded live owner automatically.
 
-## Experimental Xterm Backend
+## Experimental xterm.js Backend
 
 `--backend xterm` exists for local or daemon use, but it is experimental and slower than `tmux`. Use it when you need a headless fallback, not as the default path for long-lived interactive work. See [docs/cli.md](docs/cli.md) for current caveats and backend behavior.
 
