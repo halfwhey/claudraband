@@ -81,15 +81,13 @@ cband attach <session-id>
 cband continue <session-id> --select 2
 ```
 
-The daemon now defaults to `tmux`, just like the local first-class path. Use `--connect` only when starting a new daemon-backed session. After that, `continue`, `attach`, and `sessions` route through the tracked session automatically.
+The daemon defaults to `tmux`, just like the local first-class path. Use `--connect` only when starting a new daemon-backed session. After that, `continue`, `attach`, and `sessions` route through the tracked session automatically.
 
-`--backend xterm` still exists, but it is experimental while we improve it.
+`--backend xterm` is available and is the default fallback if tmux isn't available, but it is experimental while being improved. To make `xterm.js` work reliably, make sure there are no `claude` permission prompts before the start of the of the session such as `WARNING: Claude Code running in Bypass Permissions mode` or `Is this a project you created or one you trust?`. the `xterm.js` backend is also slower than tmux.
 
 ### Using the CLI without tmux or server (experimental)
 
-If you run `cband "..."` without `tmux` and without `--connect`, `cband` falls back to a local headless `xterm.js` session. This backend is **experimental** and slower than tmux. It is useful for one-off runs, but it is not a good default for interactive follow-up because the session is not kept alive between commands.
-
-The xterm backend cannot handle Claude Code's initial startup prompts (trust folder, bypass permissions confirmation). You must disable these before using it:
+If you run `cband "..."` without `tmux` and without `--connect`, `cband` falls back to a local headless `xterm.js` session. This backend is **experimental** and slower than tmux. It is useful for one-off runs, but it is not a good default for interactive follow-up because the session is not kept alive between commands:
 
 - `-c "--dangerously-skip-permissions"`
 - `--permission-mode bypassPermissions`

@@ -1111,7 +1111,9 @@ class ClaudrabandSessionImpl implements ClaudrabandSession {
       ) {
         return "pending_clear";
       }
-      return this.lastNativePermissionOutcome;
+      if (this.lastNativePermissionOutcome !== "deferred") {
+        return this.lastNativePermissionOutcome;
+      }
     }
 
     const decision = await this.resolvePermission({

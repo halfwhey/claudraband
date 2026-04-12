@@ -528,6 +528,40 @@ describe("session discovery", () => {
     expect(calls).toBe(1);
   });
 
+  test("a deferred native prompt can be answered on a later poll", async () => {
+    class StickyDeferredPromptWrapper extends FakeSessionWrapper {
+      sent: string[] = [];
+
+      override async capturePane(): Promise<string> {
+        return TRUST_FOLDER_PROMPT;
+      }
+
+      override async send(input: string): Promise<void> {
+        this.sent.push(input);
+      }
+    }
+
+    let calls = 0;
+    const wrapper = new StickyDeferredPromptWrapper();
+    const session = __test.createSession(wrapper as never, {
+      onPermissionRequest: async () => {
+        calls++;
+        if (calls === 1) {
+          return { outcome: "deferred" };
+        }
+        return { outcome: "selected", optionId: "1" };
+      },
+    });
+
+    const first = await (session as any).pollNativePermission(null, "1");
+    const second = await (session as any).pollNativePermission(null, "1");
+
+    expect(first).toBe("deferred");
+    expect(second).toBe("consumed");
+    expect(calls).toBe(2);
+    expect(wrapper.sent).toEqual(["1"]);
+  });
+
   test("prompt waits for explicit turn end instead of idling out after assistant text", async () => {
     class TurnEndWrapper extends PromptLifecycleWrapper {
       override async send(input: string): Promise<void> {
