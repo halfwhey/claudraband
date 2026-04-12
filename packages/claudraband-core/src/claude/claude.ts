@@ -10,7 +10,7 @@ import {
   type TerminalBackend,
   type TerminalHost,
 } from "../terminal";
-import { resolveClaudeExecutable } from "./resolve";
+import { resolveClaudeLaunchCommand } from "./resolve";
 
 export interface ClaudeConfig {
   claudeArgs: string[];
@@ -151,7 +151,7 @@ export class ClaudeWrapper implements Wrapper {
 
   private buildCmd(...extra: string[]): string[] {
     const cmd = [
-      resolveClaudeExecutable(this.cfg.claudeExecutable),
+      ...resolveClaudeLaunchCommand(this.cfg.claudeExecutable),
       "--model",
       this.cfg.model,
       ...this.cfg.claudeArgs,

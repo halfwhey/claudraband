@@ -43,6 +43,14 @@ export function resolveClaudeExecutable(explicitPath?: string): string {
   }
 }
 
+export function resolveClaudeLaunchCommand(explicitPath?: string): string[] {
+  const executable = resolveClaudeExecutable(explicitPath);
+  if (executable.endsWith(".js")) {
+    return [process.execPath, executable];
+  }
+  return [executable];
+}
+
 export const __test = {
   ENV_OVERRIDE,
 };

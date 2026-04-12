@@ -1,7 +1,11 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import { createRequire } from "node:module";
 import { ClaudeWrapper } from "./claude";
-import { __test, resolveClaudeExecutable } from "./resolve";
+import {
+  __test,
+  resolveClaudeExecutable,
+  resolveClaudeLaunchCommand,
+} from "./resolve";
 
 const require = createRequire(import.meta.url);
 
@@ -36,6 +40,19 @@ describe("claude executable resolution", () => {
     expect(executable.endsWith("cli.js")).toBe(true);
   });
 
+  test("launches js Claude entrypoints with the current Node binary", () => {
+    expect(resolveClaudeLaunchCommand("/tmp/claude-cli.js")).toEqual([
+      process.execPath,
+      "/tmp/claude-cli.js",
+    ]);
+  });
+
+  test("launches native Claude binaries directly", () => {
+    expect(resolveClaudeLaunchCommand("/tmp/claude-custom")).toEqual([
+      "/tmp/claude-custom",
+    ]);
+  });
+
   test("ClaudeWrapper commands use the resolved executable path", () => {
     const wrapper = new ClaudeWrapper({
       claudeExecutable: "/tmp/claude-custom",
@@ -60,6 +77,32 @@ describe("claude executable resolution", () => {
       "high",
       "--permission-mode",
       "acceptEdits",
+      "--session-id",
+      "abc-123",
+    ]);
+  });
+
+  test("ClaudeWrapper commands launch js entrypoints through Node", () => {
+    const wrapper = new ClaudeWrapper({
+      claudeExecutable: "/tmp/claude-custom.js",
+      claudeArgs: [],
+      model: "opus",
+      permissionMode: "default",
+      workingDir: "/tmp",
+      terminalBackend: "tmux",
+      tmuxSession: "claudraband-working-session",
+      paneWidth: 80,
+      paneHeight: 24,
+    });
+
+    const command = (wrapper as unknown as { buildCmd: (...args: string[]) => string[] })
+      .buildCmd("--session-id", "abc-123");
+
+    expect(command).toEqual([
+      process.execPath,
+      "/tmp/claude-custom.js",
+      "--model",
+      "opus",
       "--session-id",
       "abc-123",
     ]);
