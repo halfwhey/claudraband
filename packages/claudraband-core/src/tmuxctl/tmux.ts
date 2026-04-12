@@ -59,6 +59,10 @@ function hasPane(id: string): boolean {
   );
 }
 
+function windowTarget(sessionName: string, windowName: string): string {
+  return `${sessionName}:${windowName}`;
+}
+
 export async function killSession(name: string): Promise<void> {
   if (!hasSession(name)) return;
   await tmux("kill-session", "-t", name);
@@ -136,6 +140,7 @@ export class Session {
     }
 
     const format = "#{window_id}\t#{pane_id}";
+    const target = windowTarget(name, windowName);
     const result = hasSession(name)
       ? await tmux(
         "new-window",
@@ -148,6 +153,28 @@ export class Session {
         windowName,
         ...(workingDir ? ["-c", workingDir] : []),
         ...command,
+        ";",
+        "set-option",
+        "-q",
+        "-t",
+        name,
+        "destroy-unattached",
+        "off",
+        ";",
+        "set-option",
+        "-q",
+        "-t",
+        name,
+        "status",
+        "off",
+        ";",
+        "resize-window",
+        "-t",
+        target,
+        "-x",
+        String(width),
+        "-y",
+        String(height),
       )
       : await tmux(
         "new-session",
@@ -165,28 +192,34 @@ export class Session {
         String(height),
         ...(workingDir ? ["-c", workingDir] : []),
         ...command,
+        ";",
+        "set-option",
+        "-q",
+        "-t",
+        name,
+        "destroy-unattached",
+        "off",
+        ";",
+        "set-option",
+        "-q",
+        "-t",
+        name,
+        "status",
+        "off",
+        ";",
+        "resize-window",
+        "-t",
+        target,
+        "-x",
+        String(width),
+        "-y",
+        String(height),
       );
 
     const [windowId, paneId] = result.stdout.trim().split(/\s+/, 2);
     if (!windowId || !paneId) {
       throw new Error(`tmuxctl: failed to parse tmux target ids: ${result.stdout}`);
     }
-
-    try {
-      await tmux("set-option", "-t", name, "status", "off");
-    } catch {
-      // non-fatal
-    }
-
-    await tmux(
-      "resize-window",
-      "-t",
-      windowId,
-      "-x",
-      String(width),
-      "-y",
-      String(height),
-    );
 
     return new Session(name, command, windowId, paneId);
   }
