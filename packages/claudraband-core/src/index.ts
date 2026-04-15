@@ -37,6 +37,7 @@ const DEFAULT_PANE_WIDTH = 120;
 const DEFAULT_PANE_HEIGHT = 40;
 const IDLE_TIMEOUT_MS = 3000;
 const SHARED_TMUX_SESSION = "claudraband-working-session";
+const READY_MODE_PROMPT_RE = /(?:^|[^A-Za-z0-9_])(INSERT|NORMAL)\s*$/;
 
 export { EventKind };
 export { hasPendingNativePrompt };
@@ -372,7 +373,7 @@ class ClaudrabandRuntime implements Claudraband {
     const session = new ClaudrabandSessionImpl(
       wrapper,
       wrapper.claudeSessionId,
-      cfg.cwd,
+      wrapper.workingDir,
       backend,
       cfg.model,
       cfg.permissionMode,
@@ -408,7 +409,7 @@ class ClaudrabandRuntime implements Claudraband {
     const session = new ClaudrabandSessionImpl(
       wrapper,
       sessionId,
-      cfg.cwd,
+      wrapper.workingDir,
       backend,
       cfg.model,
       cfg.permissionMode,
@@ -600,6 +601,12 @@ class ClaudrabandSessionImpl implements ClaudrabandSession {
       return { stopReason: "cancelled" };
     }
 
+    if (await this.isReadyForFreshInput()) {
+      this.activePrompt = null;
+      this.promptAbortController = null;
+      return { stopReason: "end_turn" };
+    }
+
     this.logger.info("awaitTurn", "sid", this.sessionId);
 
     try {
@@ -744,6 +751,9 @@ class ClaudrabandSessionImpl implements ClaudrabandSession {
       ?? known?.title
       ?? await extractSessionTitle(transcriptPath)
       ?? undefined;
+    const owner = alive
+      ? await this.resolveSessionOwner()
+      : existing?.owner ?? known?.owner ?? await this.resolveSessionOwner();
 
     await writeKnownSessionRecord({
       version: 1,
@@ -754,13 +764,14 @@ class ClaudrabandSessionImpl implements ClaudrabandSession {
       createdAt: existing?.createdAt ?? known?.createdAt ?? now,
       updatedAt: now,
       transcriptPath,
+      owner,
     });
 
     if (!alive) {
       await deleteSessionRecord(this.sessionId);
       return;
     }
-    const owner = await this.resolveSessionOwner();
+
     await writeSessionRecord({
       version: 1,
       sessionId: this.sessionId,
@@ -801,6 +812,31 @@ class ClaudrabandSessionImpl implements ClaudrabandSession {
       pending: pendingQuestion || pendingNativePrompt,
       source: pendingQuestion || pendingNativePrompt ? "terminal" : "none",
     };
+  }
+
+  private async isReadyForFreshInput(): Promise<boolean> {
+    if (!this.wrapper.isProcessAlive()) {
+      return false;
+    }
+
+    const jsonlPath = sessionPath(this.cwd, this.sessionId);
+    if (await hasPendingQuestion(jsonlPath)) {
+      return false;
+    }
+    if (await hasTranscriptTurnInProgress(jsonlPath)) {
+      return false;
+    }
+
+    // If the transcript shows no turn in progress and no pending question,
+    // the session is idle. The TUI mode indicator (INSERT/NORMAL) is not
+    // required here -- it's a separate concern used at startup in
+    // waitForReady and is brittle across TUI layouts and ANSI rendering.
+    const pane = await this.wrapper.capturePane().catch(() => "");
+    if (pane && hasPendingNativePrompt(pane)) {
+      return false;
+    }
+
+    return true;
   }
 
   async setModel(model: string): Promise<void> {
@@ -1209,7 +1245,7 @@ class ClaudrabandSessionImpl implements ClaudrabandSession {
       }
       try {
         const pane = await this.wrapper.capturePane();
-        if (pane.includes("INSERT") || pane.includes("NORMAL")) return true;
+        if (hasReadyModePrompt(pane)) return true;
       } catch {}
       await new Promise((r) => setTimeout(r, POLL_MS));
     }
@@ -1338,6 +1374,58 @@ function buildAskUserQuestionOptions(
   ];
 }
 
+function hasReadyModePrompt(paneText: string): boolean {
+  // Strip ANSI/CSI escape sequences (xterm serialize output includes them)
+  // and carriage returns before looking for the TUI mode indicator.
+  const stripped = paneText
+    .replace(/\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)/g, "")
+    .replace(/\x1b\[[0-9;?]*[ -/]*[@-~]/g, "")
+    .replace(/\x1b[()][A-Za-z0-9]/g, "")
+    .replace(/\r/g, "");
+  const lines = stripped.split("\n");
+  // Scan the trailing non-empty lines. Some TUI frames render trailing
+  // border or padding lines after the status bar, so don't require the mode
+  // indicator to be literally the last non-empty line.
+  let scanned = 0;
+  for (let index = lines.length - 1; index >= 0 && scanned < 5; index--) {
+    const line = lines[index]?.trimEnd() ?? "";
+    if (!line.trim()) continue;
+    scanned++;
+    if (READY_MODE_PROMPT_RE.test(line)) return true;
+  }
+  return false;
+}
+
+async function hasTranscriptTurnInProgress(jsonlPath: string): Promise<boolean> {
+  let data: string;
+  try {
+    data = await readFile(jsonlPath, "utf-8");
+  } catch {
+    return false;
+  }
+
+  let inProgress = false;
+  for (const line of data.split("\n")) {
+    for (const event of parseLineEvents(line)) {
+      switch (event.kind) {
+        case EventKind.UserMessage:
+        case EventKind.AssistantText:
+        case EventKind.AssistantThinking:
+        case EventKind.ToolCall:
+        case EventKind.ToolResult:
+        case EventKind.TurnStart:
+          inProgress = true;
+          break;
+        case EventKind.TurnEnd:
+          inProgress = false;
+          break;
+      }
+    }
+  }
+
+  return inProgress;
+}
+
 async function discoverSessions(cwdFilter?: string): Promise<SessionSummary[]> {
   await reconcileLiveLocalSessions(cwdFilter);
   const live = (await refreshSessionRecords(await listSessionRecords()))
@@ -1369,7 +1457,15 @@ async function inspectSession(
 
   const history = await discoverHistoricalSessions(cwd);
   const matches = history.filter((session) => session.sessionId === sessionId);
-  return matches[0] ?? null;
+  const match = matches[0] ?? null;
+  if (!match) return null;
+  if (match.owner.kind === "daemon") {
+    return {
+      ...match,
+      source: "live",
+    };
+  }
+  return match;
 }
 
 async function closeSessionByRecord(sessionId: string): Promise<boolean> {
@@ -1421,6 +1517,25 @@ async function reconcileLiveLocalSessions(cwdFilter?: string): Promise<void> {
     const title = existing?.title ?? known?.title ?? session.title;
     const createdAt = existing?.createdAt ?? known?.createdAt ?? session.createdAt;
     const updatedAt = session.updatedAt ?? existing?.updatedAt ?? known?.updatedAt ?? session.createdAt;
+    // Preserve a daemon owner if one is already recorded AND that daemon
+    // is still alive. Otherwise this reconciliation pass (which only
+    // inspects tmux panes) would silently demote daemon-owned sessions to
+    // local on every call, and also wrongly keep a daemon owner around
+    // after the daemon has died.
+    const candidateDaemonOwner =
+      existing?.owner.kind === "daemon"
+        ? existing.owner
+        : known?.owner?.kind === "daemon"
+          ? known.owner
+          : null;
+    const daemonOwner =
+      candidateDaemonOwner && isPidAlive(candidateDaemonOwner.serverPid)
+        ? candidateDaemonOwner
+        : null;
+    const owner: SessionOwnerRecord = daemonOwner ?? {
+      kind: "local",
+      pid: session.owner.kind === "local" ? session.owner.pid : undefined,
+    };
 
     await writeKnownSessionRecord({
       version: 1,
@@ -1431,6 +1546,7 @@ async function reconcileLiveLocalSessions(cwdFilter?: string): Promise<void> {
       createdAt,
       updatedAt,
       transcriptPath,
+      owner,
     });
 
     await writeSessionRecord({
@@ -1444,10 +1560,7 @@ async function reconcileLiveLocalSessions(cwdFilter?: string): Promise<void> {
       lastKnownAlive: true,
       reattachable: session.reattachable,
       transcriptPath,
-      owner: {
-        kind: "local",
-        pid: session.owner.kind === "local" ? session.owner.pid : undefined,
-      },
+      owner,
     });
   }
 }
@@ -1472,7 +1585,7 @@ async function discoverHistoricalSessions(cwdFilter?: string): Promise<SessionSu
         source: "history",
         alive: false,
         reattachable: false,
-        owner: { kind: "local" },
+        owner: record.owner ?? { kind: "local" },
       });
     } catch {
       continue;

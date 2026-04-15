@@ -5,6 +5,7 @@ import {
   __test,
   resolveClaudeExecutable,
   resolveClaudeLaunchCommand,
+  resolveJavaScriptLauncher,
 } from "./resolve";
 
 const require = createRequire(import.meta.url);
@@ -40,9 +41,32 @@ describe("claude executable resolution", () => {
     expect(executable.endsWith("cli.js")).toBe(true);
   });
 
-  test("launches js Claude entrypoints with the current Node binary", () => {
+  test("uses the current execPath for js entrypoints outside Bun", () => {
+    expect(resolveJavaScriptLauncher({
+      bunRuntime: false,
+      execPath: "/tmp/node",
+    })).toBe("/tmp/node");
+  });
+
+  test("prefers the bun binary for js entrypoints under Bun", () => {
+    expect(resolveJavaScriptLauncher({
+      bunRuntime: true,
+      bunPath: "/tmp/bun",
+      execPath: "/tmp/node",
+    })).toBe("/tmp/bun");
+  });
+
+  test("falls back to bun on PATH for js entrypoints under Bun", () => {
+    expect(resolveJavaScriptLauncher({
+      bunRuntime: true,
+      bunPath: null,
+      execPath: "/tmp/node",
+    })).toBe("bun");
+  });
+
+  test("launches js Claude entrypoints through the resolved js runtime", () => {
     expect(resolveClaudeLaunchCommand("/tmp/claude-cli.js")).toEqual([
-      process.execPath,
+      resolveJavaScriptLauncher(),
       "/tmp/claude-cli.js",
     ]);
   });
@@ -82,7 +106,7 @@ describe("claude executable resolution", () => {
     ]);
   });
 
-  test("ClaudeWrapper commands launch js entrypoints through Node", () => {
+  test("ClaudeWrapper commands launch js entrypoints through the resolved js runtime", () => {
     const wrapper = new ClaudeWrapper({
       claudeExecutable: "/tmp/claude-custom.js",
       claudeArgs: [],
@@ -99,7 +123,7 @@ describe("claude executable resolution", () => {
       .buildCmd("--session-id", "abc-123");
 
     expect(command).toEqual([
-      process.execPath,
+      resolveJavaScriptLauncher(),
       "/tmp/claude-custom.js",
       "--model",
       "opus",

@@ -85,6 +85,34 @@ describe("terminal backend selection", () => {
     }
   });
 
+  test("tmux host reports the actual pane cwd", async () => {
+    const sessionName = `claudraband-terminal-${randomUUID()}`;
+    const host = createTerminalHost({
+      backend: "tmux",
+      tmuxSessionName: sessionName,
+      tmuxWindowName: "claude-session-cwd",
+    });
+    const signal = new AbortController();
+
+    try {
+      await host.start(["bash", "-c", "sleep 3"], {
+        cwd: "/tmp/",
+        cols: 80,
+        rows: 24,
+        signal: signal.signal,
+      });
+
+      expect(await host.currentPath()).toBe("/tmp");
+    } catch (err) {
+      if (isSandboxTmuxError(err)) return;
+      throw err;
+    } finally {
+      signal.abort();
+      await host.stop().catch(() => {});
+      await killSession(sessionName).catch(() => {});
+    }
+  });
+
   test("backend drivers expose reconnect capability", async () => {
     const tmuxDriver = createTerminalBackendDriver({
       backend: "tmux",
@@ -129,5 +157,15 @@ describe("terminal backend selection", () => {
 
     expect(terminalInputs).toEqual(["2", "\r", "\u0003"]);
     expect(transportWrites).toEqual([]);
+  });
+
+  test("xterm host reports its configured cwd", async () => {
+    const host = __test.createXtermTerminalHost() as unknown as {
+      currentPath(): Promise<string | undefined>;
+      cwd?: string;
+    };
+
+    host.cwd = "/tmp";
+    expect(await host.currentPath()).toBe("/tmp");
   });
 });

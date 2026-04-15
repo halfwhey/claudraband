@@ -5,6 +5,26 @@ import { createRequire } from "node:module";
 const require = createRequire(import.meta.url);
 const ENV_OVERRIDE = "CLAUDRABAND_CLAUDE_PATH";
 
+export function resolveJavaScriptLauncher(options?: {
+  bunRuntime?: boolean;
+  bunPath?: string | null;
+  execPath?: string;
+}): string {
+  const bunRuntime = options?.bunRuntime ?? typeof Bun !== "undefined";
+  if (bunRuntime) {
+    const bunPath = options && Object.prototype.hasOwnProperty.call(options, "bunPath")
+      ? options.bunPath
+      : (typeof Bun !== "undefined" && typeof Bun.which === "function"
+        ? Bun.which("bun")
+        : null);
+    if (bunPath) {
+      return bunPath;
+    }
+    return "bun";
+  }
+  return options?.execPath ?? process.execPath;
+}
+
 export function resolveClaudeExecutable(explicitPath?: string): string {
   if (explicitPath) {
     return explicitPath;
@@ -46,7 +66,7 @@ export function resolveClaudeExecutable(explicitPath?: string): string {
 export function resolveClaudeLaunchCommand(explicitPath?: string): string[] {
   const executable = resolveClaudeExecutable(explicitPath);
   if (executable.endsWith(".js")) {
-    return [process.execPath, executable];
+    return [resolveJavaScriptLauncher(), executable];
   }
   return [executable];
 }

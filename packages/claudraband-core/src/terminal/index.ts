@@ -31,6 +31,7 @@ export interface TerminalHost {
   send(input: string): Promise<void>;
   interrupt(): Promise<void>;
   capture(): Promise<string>;
+  currentPath(): Promise<string | undefined>;
   /** Poll capture() until the pane content stabilizes. */
   awaitIdle(options?: PaneActivityOptions): Promise<ActivityResult>;
   alive(): boolean;
@@ -230,6 +231,25 @@ class TmuxTerminalHost implements TerminalHost {
       command,
       this.windowName,
     );
+    // tmux reads pane_current_path from /proc/<pane_pid>/cwd. Immediately
+    // after new-session/new-window the child may not have exec'd yet, so
+    // that path can transiently reflect the tmux server's cwd instead of
+    // the pane's. Poll briefly so consumers that call currentPath() right
+    // after start observe the intended working directory.
+    if (options.cwd) {
+      await this.waitForPaneCwd(options.cwd, 300);
+    }
+  }
+
+  private async waitForPaneCwd(expected: string, maxWaitMs: number): Promise<void> {
+    if (!this.session) return;
+    const normalized = expected.replace(/\/+$/, "") || "/";
+    const deadline = Date.now() + maxWaitMs;
+    while (Date.now() < deadline) {
+      const actual = await this.session.currentPath().catch(() => "");
+      if (actual === normalized) return;
+      await new Promise((resolve) => setTimeout(resolve, 25));
+    }
   }
 
   async stop(): Promise<void> {
@@ -265,6 +285,11 @@ class TmuxTerminalHost implements TerminalHost {
     return this.session.capturePane();
   }
 
+  async currentPath(): Promise<string | undefined> {
+    if (!this.session) return undefined;
+    return this.session.currentPath().catch(() => undefined);
+  }
+
   async awaitIdle(options?: PaneActivityOptions): Promise<ActivityResult> {
     if (!this.session) throw new Error("tmux terminal is not started");
     return this.session.awaitIdle(options);
@@ -288,6 +313,7 @@ class XtermTerminalHost implements TerminalHost {
   private serializeAddon: SerializeAddon | null = null;
   private outputDrain: Promise<void> = Promise.resolve();
   private exited = false;
+  private cwd: string | undefined;
 
   async start(command: string[], options: TerminalStartOptions): Promise<void> {
     if (command.length === 0) {
@@ -310,6 +336,7 @@ class XtermTerminalHost implements TerminalHost {
     this.serializeAddon = new SerializeAddon();
     this.terminal.loadAddon(this.serializeAddon);
     this.exited = false;
+    this.cwd = options.cwd;
     this.transport = await createPtyTransport();
 
     // xterm is a terminal emulator, not just a buffer. Claude probes the
@@ -392,6 +419,10 @@ class XtermTerminalHost implements TerminalHost {
     return this.serializeAddon.serialize();
   }
 
+  async currentPath(): Promise<string | undefined> {
+    return this.cwd;
+  }
+
   async awaitIdle(options?: PaneActivityOptions): Promise<ActivityResult> {
     return awaitPaneIdle(() => this.capture(), options);
   }
@@ -410,6 +441,16 @@ async function createPtyTransport(): Promise<PtyTransport> {
     return new BunTerminalTransport();
   }
   return new NodePtyTransport();
+}
+
+function isOsPidAlive(pid: number | undefined): boolean {
+  if (!pid || pid <= 0) return false;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (err) {
+    return (err as NodeJS.ErrnoException).code === "EPERM";
+  }
 }
 
 class NodePtyTransport implements PtyTransport {
@@ -473,7 +514,14 @@ class NodePtyTransport implements PtyTransport {
   }
 
   alive(): boolean {
-    return this.pty !== null && this.aliveFlag;
+    if (this.pty === null || !this.aliveFlag) return false;
+    // node-pty's onExit can lag when a child process is SIGKILL'd and still
+    // holds open stdio via grandchildren. Cross-check by probing the pid.
+    if (!isOsPidAlive(this.pty.pid)) {
+      this.aliveFlag = false;
+      return false;
+    }
+    return true;
   }
 
   pid(): number | undefined {
@@ -555,7 +603,15 @@ class BunTerminalTransport implements PtyTransport {
   }
 
   alive(): boolean {
-    return this.terminal !== null && !this.terminal.closed && this.aliveFlag;
+    if (this.terminal === null || this.terminal.closed || !this.aliveFlag) {
+      return false;
+    }
+    const pid = (this.process as { pid?: number } | null)?.pid;
+    if (!isOsPidAlive(pid)) {
+      this.aliveFlag = false;
+      return false;
+    }
+    return true;
   }
 
   pid(): number | undefined {

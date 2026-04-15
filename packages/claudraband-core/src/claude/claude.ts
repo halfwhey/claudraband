@@ -1,5 +1,5 @@
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import { randomUUID } from "node:crypto";
 import { existsSync, statSync } from "node:fs";
 import { Tailer } from "./parser";
@@ -24,9 +24,13 @@ export interface ClaudeConfig {
   paneHeight: number;
 }
 
+export function normalizeSessionCwd(cwd: string): string {
+  return resolve(cwd);
+}
+
 export function sessionPath(cwd: string, sessionID: string): string {
   const home = homedir();
-  const escaped = cwd.replace(/\//g, "-");
+  const escaped = normalizeSessionCwd(cwd).replace(/\//g, "-");
   return join(home, ".claude", "projects", escaped, `${sessionID}.jsonl`);
 }
 
@@ -40,7 +44,10 @@ export class ClaudeWrapper implements Wrapper {
   private eventIterable: AsyncGenerator<Event> | null = null;
 
   constructor(cfg: ClaudeConfig) {
-    this.cfg = cfg;
+    this.cfg = {
+      ...cfg,
+      workingDir: normalizeSessionCwd(cfg.workingDir),
+    };
   }
 
   name(): string {
@@ -62,6 +69,10 @@ export class ClaudeWrapper implements Wrapper {
   /** The Claude Code session UUID used for the JSONL file. */
   get claudeSessionId(): string {
     return this._claudeSessionId;
+  }
+
+  get workingDir(): string {
+    return this.cfg.workingDir;
   }
 
   async start(signal: AbortSignal): Promise<void> {
@@ -91,6 +102,7 @@ export class ClaudeWrapper implements Wrapper {
       signal.addEventListener("abort", () => {
         this.abortController?.abort();
       });
+      await this.syncWorkingDirFromTerminal();
       const jsonlPath = sessionPath(this.cfg.workingDir, claudeSessionId);
       let tailOffset = 0;
       if (existsSync(jsonlPath)) {
@@ -181,6 +193,7 @@ export class ClaudeWrapper implements Wrapper {
       rows: this.cfg.paneHeight,
       signal,
     });
+    await this.syncWorkingDirFromTerminal();
 
     // Wait for Claude Code to be ready (showing INSERT mode or ❯ prompt)
     await this.waitForReady(signal);
@@ -197,6 +210,13 @@ export class ClaudeWrapper implements Wrapper {
       tailer.close();
       await terminal?.stop().catch(() => {});
     }, { once: true });
+  }
+
+  private async syncWorkingDirFromTerminal(): Promise<void> {
+    const actualWorkingDir = await this.terminal?.currentPath();
+    if (actualWorkingDir) {
+      this.cfg.workingDir = normalizeSessionCwd(actualWorkingDir);
+    }
   }
 
   /**

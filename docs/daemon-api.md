@@ -31,7 +31,7 @@ Request body:
 
 All fields are optional. Omitted fields fall back to the daemon's launch defaults.
 
-Response:
+Response (`201 Created`):
 
 ```json
 {
@@ -210,6 +210,8 @@ Response:
 
 Wait for the current in-progress turn to finish. No request body.
 
+If the session is already idle, the daemon returns immediately with `stopReason: "end_turn"`.
+
 Response:
 
 ```json
@@ -244,22 +246,24 @@ data: {"type":"ready"}
 Normal session events are emitted as JSON objects on `data:` lines. Session events include a monotonically increasing `seq` value:
 
 ```text
-data: {"seq":1,"kind":"AssistantText","time":"2025-01-15T10:00:00.000Z","text":"Hello"}
-data: {"seq":2,"kind":"ToolCall","time":"...","toolName":"Read","toolID":"tool_1","toolInput":"{...}"}
-data: {"seq":3,"kind":"ToolResult","time":"...","toolID":"tool_1","text":"file contents..."}
-data: {"seq":4,"kind":"TurnEnd","time":"...","text":""}
+data: {"seq":1,"kind":"assistant_text","time":"2025-01-15T10:00:00.000Z","text":"Hello"}
+data: {"seq":2,"kind":"tool_call","time":"...","toolName":"Read","toolID":"tool_1","toolInput":"{...}"}
+data: {"seq":3,"kind":"tool_result","time":"...","toolID":"tool_1","text":"file contents..."}
+data: {"seq":4,"kind":"turn_end","time":"...","text":""}
 ```
 
-Supported event kinds:
+Supported event kinds use snake_case:
 
-- `UserMessage`
-- `AssistantText`
-- `AssistantThinking`
-- `ToolCall`
-- `ToolResult`
-- `TurnEnd`
-- `System`
-- `Error`
+- `user_message`
+- `assistant_text`
+- `assistant_thinking`
+- `tool_call`
+- `tool_result`
+- `turn_end`
+- `system`
+- `error`
+
+`user_message` may appear when the underlying Claude transcript emits one. The daemon does not synthesize a `user_message` event just because `/prompt` was called.
 
 When Claude requests permission, the daemon pushes a permission event over the same stream:
 

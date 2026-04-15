@@ -29,6 +29,19 @@ function makeConfig(overrides: Partial<CliConfig> = {}): CliConfig {
 }
 
 describe("daemon server helpers", () => {
+  test("treats an empty optional JSON body as an empty object", () => {
+    expect(__test.parseOptionalJsonObject<Record<string, unknown>>("")).toEqual({});
+    expect(
+      __test.parseOptionalJsonObject<Record<string, unknown>>("   \n"),
+    ).toEqual({});
+  });
+
+  test("parses non-empty optional JSON bodies normally", () => {
+    expect(
+      __test.parseOptionalJsonObject<{ requireLive: boolean }>('{ "requireLive": true }'),
+    ).toEqual({ requireLive: true });
+  });
+
   test("defaults daemon backend to tmux unless explicitly requested", () => {
     expect(__test.resolveServerTerminalBackend(makeConfig())).toBe("tmux");
     expect(

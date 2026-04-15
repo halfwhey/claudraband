@@ -182,6 +182,59 @@ describe("session discovery", () => {
     }
   });
 
+  test("reclassifies live tmux sessions as local after a daemon owner goes stale", async () => {
+    const sessionId = randomUUID();
+    let session: Session | undefined;
+
+    try {
+      session = await Session.newSession(
+        "claudraband-working-session",
+        80,
+        24,
+        "/tmp",
+        ["bash", "-c", "sleep 5"],
+        sessionId,
+      );
+    } catch (err) {
+      if (isSandboxTmuxError(err)) return;
+      throw err;
+    }
+
+    try {
+      await Bun.sleep(200);
+      await writeKnownSessionRecord({
+        version: 1,
+        sessionId,
+        cwd: "/tmp",
+        backend: "tmux",
+        createdAt: "2026-04-12T00:00:00.000Z",
+        updatedAt: "2026-04-12T00:00:00.000Z",
+        transcriptPath: sessionPath("/tmp", sessionId),
+        owner: {
+          kind: "daemon",
+          serverUrl: "http://127.0.0.1:7842",
+          serverPid: 999_999,
+          serverInstanceId: "dead-daemon",
+        },
+      });
+
+      const runtime = createClaudraband({
+        terminalBackend: "tmux",
+      });
+      const sessions = await runtime.listSessions("/tmp");
+      const found = sessions.find((entry) => entry.sessionId === sessionId);
+      const record = await readSessionRecord(sessionId);
+
+      expect(found?.owner.kind).toBe("local");
+      expect(found?.source).toBe("live");
+      expect(found?.alive).toBe(true);
+      expect(record?.owner.kind).toBe("local");
+      expect(record?.lastKnownAlive).toBe(true);
+    } finally {
+      await session?.kill().catch(() => {});
+    }
+  });
+
   test("closes live tmux sessions through the runtime", async () => {
     const sessionId = randomUUID();
     let session: Session | undefined;
@@ -334,6 +387,144 @@ describe("session discovery", () => {
     } finally {
       await rm(join(transcript, ".."), { recursive: true, force: true });
       await rm(join(unrelatedTranscript, ".."), { recursive: true, force: true });
+    }
+  });
+
+  test("inspects a dead daemon-owned session without losing daemon ownership", async () => {
+    const sessionId = randomUUID();
+    const cwd = `/tmp/claudraband-daemon-history-${sessionId}`;
+    const transcript = sessionPath(cwd, sessionId);
+
+    try {
+      await mkdir(join(transcript, ".."), { recursive: true });
+      await writeFile(
+        transcript,
+        `${JSON.stringify({
+          type: "assistant",
+          message: {
+            content: [{
+              type: "text",
+              text: "daemon-owned history session output that is long enough to pass the size filter",
+            }],
+          },
+          session_id: sessionId,
+        })}\n`,
+      );
+      await writeKnownSessionRecord({
+        version: 1,
+        sessionId,
+        cwd,
+        backend: "tmux",
+        createdAt: "2026-04-12T00:00:00.000Z",
+        updatedAt: "2026-04-12T00:00:00.000Z",
+        transcriptPath: transcript,
+        owner: {
+          kind: "daemon",
+          serverUrl: "http://127.0.0.1:7842",
+          serverPid: 12345,
+          serverInstanceId: "daemon-test",
+        },
+      });
+
+      const runtime = createClaudraband();
+      const found = await runtime.inspectSession(sessionId, cwd);
+
+      expect(found?.owner.kind).toBe("daemon");
+      expect(found?.source).toBe("live");
+      expect(found?.alive).toBe(false);
+    } finally {
+      await rm(join(transcript, ".."), { recursive: true, force: true });
+    }
+  });
+
+  test("awaitTurn returns immediately when the session is already idle", async () => {
+    class IdleReadyWrapper extends FakeSessionWrapper {
+      override async capturePane(): Promise<string> {
+        return "Claude is idle\nNORMAL";
+      }
+    }
+
+    const session = __test.createSession(new IdleReadyWrapper() as never);
+    const result = await Promise.race([
+      session.awaitTurn(),
+      Bun.sleep(250).then(() => "timeout" as const),
+    ]);
+
+    expect(result).toEqual({ stopReason: "end_turn" });
+  });
+
+  test("awaitTurn waits for TurnEnd when the transcript is mid-turn", async () => {
+    // isReadyForFreshInput should not short-circuit when the JSONL transcript
+    // is still mid-turn. We simulate that by pointing the session at a
+    // transcript that has a UserMessage + AssistantText but no TurnEnd yet.
+    const { writeFile, mkdir, rm } = await import("node:fs/promises");
+    const { join } = await import("node:path");
+    const { homedir } = await import("node:os");
+    const sessionId = randomUUID();
+    const fakeCwd = `/tmp/claudraband-await-test-${sessionId}`;
+    const transcript = join(
+      homedir(),
+      ".claude",
+      "projects",
+      fakeCwd.replace(/\//g, "-"),
+      `${sessionId}.jsonl`,
+    );
+
+    try {
+      await mkdir(join(transcript, ".."), { recursive: true });
+      await writeFile(
+        transcript,
+        [
+          JSON.stringify({
+            type: "user",
+            message: { role: "user", content: "prompt" },
+            session_id: sessionId,
+          }),
+          JSON.stringify({
+            type: "assistant",
+            message: {
+              role: "assistant",
+              content: [{ type: "text", text: "working..." }],
+            },
+            session_id: sessionId,
+          }),
+          "",
+        ].join("\n"),
+      );
+
+      class MidTurnWrapper extends FakeSessionWrapper {
+        private scheduled = false;
+        override async capturePane(): Promise<string> {
+          if (!this.scheduled) {
+            this.scheduled = true;
+            setTimeout(() => {
+              this.emit({
+                kind: EventKind.TurnEnd,
+                time: new Date(),
+                text: "",
+                toolName: "",
+                toolID: "",
+                toolInput: "",
+                role: "assistant",
+              });
+              this.finish();
+            }, 200);
+          }
+          return "Assistant: still working...\nINSERT";
+        }
+      }
+
+      const session = __test.createSession(
+        new MidTurnWrapper() as never,
+        { sessionId, cwd: fakeCwd },
+      );
+      const startedAt = Date.now();
+      const result = await session.awaitTurn();
+
+      expect(result).toEqual({ stopReason: "end_turn" });
+      expect(Date.now() - startedAt).toBeGreaterThanOrEqual(150);
+    } finally {
+      await rm(join(transcript, ".."), { recursive: true, force: true });
     }
   });
 
@@ -700,5 +891,11 @@ describe("session discovery", () => {
     await flushPromise;
 
     expect(flushed).toBe(true);
+  });
+});
+
+describe("session transcript paths", () => {
+  test("normalizes cwd before deriving the Claude project transcript path", () => {
+    expect(sessionPath("/tmp/", "abc-123")).toBe(sessionPath("/tmp", "abc-123"));
   });
 });

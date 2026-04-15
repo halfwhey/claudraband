@@ -11,6 +11,8 @@ export interface TmuxWindowSummary {
   panePid?: number;
 }
 
+const FIELD_DELIM = "__CLAUDRABAND_FIELD__";
+
 async function tmux(...args: string[]): Promise<{ stdout: string; stderr: string }> {
   return new Promise((resolve, reject) => {
     const proc = spawn("bash", ["-lc", shellCommand("tmux", ...args)]);
@@ -50,13 +52,17 @@ export function hasSession(name: string): boolean {
 }
 
 function hasPane(id: string): boolean {
-  return (
-    spawnSync(
-      "bash",
-      ["-lc", shellCommand("tmux", "display-message", "-p", "-t", id, "#{pane_id}")],
-      { stdio: "pipe" },
-    ).status === 0
+  // `tmux display-message -t <pane>` returns exit 0 even for unknown pane
+  // ids (it just renders the format with an empty substitution). Check the
+  // resolved pane id matches the requested one to confirm existence.
+  const result = spawnSync(
+    "bash",
+    ["-lc", shellCommand("tmux", "display-message", "-p", "-t", id, "#{pane_id}")],
+    { stdio: "pipe" },
   );
+  if (result.status !== 0) return false;
+  const resolved = (result.stdout?.toString() ?? "").trim();
+  return resolved.length > 0 && resolved === id;
 }
 
 function windowTarget(sessionName: string, windowName: string): string {
@@ -76,7 +82,14 @@ export async function listWindows(name: string): Promise<TmuxWindowSummary[]> {
     "-t",
     name,
     "-F",
-    "#{window_id}\t#{pane_id}\t#{window_name}\t#{pane_current_path}\t#{window_activity}\t#{pane_pid}",
+    [
+      "#{window_id}",
+      "#{pane_id}",
+      "#{window_name}",
+      "#{pane_current_path}",
+      "#{window_activity}",
+      "#{pane_pid}",
+    ].join(FIELD_DELIM),
   );
 
   return result.stdout
@@ -91,7 +104,7 @@ export async function listWindows(name: string): Promise<TmuxWindowSummary[]> {
         paneCurrentPath,
         windowActivity,
         panePid,
-      ] = line.split("\t", 6);
+      ] = line.split(FIELD_DELIM, 6);
       return {
         windowId,
         paneId,
@@ -139,7 +152,7 @@ export class Session {
       throw new Error("tmuxctl: command is required");
     }
 
-    const format = "#{window_id}\t#{pane_id}";
+    const format = ["#{window_id}", "#{pane_id}"].join(FIELD_DELIM);
     const target = windowTarget(name, windowName);
     const result = hasSession(name)
       ? await tmux(
@@ -216,7 +229,7 @@ export class Session {
         String(height),
       );
 
-    const [windowId, paneId] = result.stdout.trim().split(/\s+/, 2);
+    const [windowId, paneId] = result.stdout.trim().split(FIELD_DELIM, 2);
     if (!windowId || !paneId) {
       throw new Error(`tmuxctl: failed to parse tmux target ids: ${result.stdout}`);
     }
@@ -239,10 +252,10 @@ export class Session {
         "-t",
         sessionName,
         "-F",
-        "#{window_id}\t#{pane_id}\t#{window_name}",
+        ["#{window_id}", "#{pane_id}", "#{window_name}"].join(FIELD_DELIM),
       );
       for (const line of result.stdout.trim().split("\n")) {
-        const [windowId, paneId, name] = line.split("\t", 3);
+        const [windowId, paneId, name] = line.split(FIELD_DELIM, 3);
         if (name === windowName && windowId && paneId) {
           const session = new Session(sessionName, [], windowId, paneId);
           if (session.isAlive) return session;
@@ -323,5 +336,16 @@ export class Session {
       "#{pane_pid}",
     );
     return parseInt(result.stdout.trim(), 10);
+  }
+
+  async currentPath(): Promise<string> {
+    const result = await tmux(
+      "display-message",
+      "-p",
+      "-t",
+      this.paneId,
+      "#{pane_current_path}",
+    );
+    return result.stdout.trim();
   }
 }

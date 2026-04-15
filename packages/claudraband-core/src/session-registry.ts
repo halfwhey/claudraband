@@ -49,6 +49,7 @@ export interface KnownSessionRecord {
   createdAt: string;
   updatedAt: string;
   transcriptPath?: string;
+  owner?: SessionOwnerRecord;
 }
 
 function registryRoot(): string {

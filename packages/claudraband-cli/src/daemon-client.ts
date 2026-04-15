@@ -309,7 +309,7 @@ class DaemonSessionProxy implements ClaudrabandSession {
   private closeEvents(): void {
     this.closed = true;
     for (const waiter of this.eventWaiters) {
-      waiter({ value: undefined, done: true } as IteratorResult<ClaudrabandEvent>);
+      waiter({ value: undefined, done: true } as IteratorResult<QueuedDaemonEvent>);
     }
     this.eventWaiters = [];
   }

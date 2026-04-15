@@ -13,6 +13,21 @@ import {
 } from "claudraband-core";
 import type { CliConfig } from "./args";
 
+const UUID_RE =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+function looksLikeDeadSessionError(msg: string): boolean {
+  return (
+    /can't find pane/i.test(msg) ||
+    /no such (window|pane)/i.test(msg) ||
+    /session .* is not live/i.test(msg) ||
+    /terminal is not started/i.test(msg) ||
+    /claude: not started/i.test(msg) ||
+    /pane .* not found/i.test(msg) ||
+    /pty .* exited/i.test(msg)
+  );
+}
+
 interface DaemonSession {
   session: ClaudrabandSession;
   sseClients: Set<ServerResponse>;
@@ -30,6 +45,15 @@ interface SessionRequestBody {
   model?: string;
   permissionMode?: string;
   requireLive?: boolean;
+}
+
+function parseOptionalJsonObject<T = Record<string, unknown>>(
+  rawBody: string,
+): T {
+  if (!rawBody.trim()) {
+    return {} as T;
+  }
+  return JSON.parse(rawBody) as T;
 }
 
 function resolveSessionConfig(
@@ -87,14 +111,24 @@ function sessionSummaryToJson(session: SessionSummary): Record<string, unknown> 
 function extractLastAssistantTurn(events: ClaudrabandEvent[]): string | null {
   const chunks: string[] = [];
   let inLastTurn = false;
+  // Iterate newest-to-oldest. Enter "last turn" on the final TurnEnd.
+  // Leave the turn on any upstream signal that a new turn is starting:
+  // an earlier TurnEnd, a TurnStart, or a UserMessage.
   for (let i = events.length - 1; i >= 0; i--) {
     const ev = events[i];
     if (ev.kind === EventKind.TurnEnd) {
       if (inLastTurn) break;
       inLastTurn = true;
+      continue;
     }
-    if (ev.kind === EventKind.TurnStart && inLastTurn) break;
-    if (inLastTurn && ev.kind === EventKind.AssistantText) {
+    if (!inLastTurn) continue;
+    if (
+      ev.kind === EventKind.TurnStart ||
+      ev.kind === EventKind.UserMessage
+    ) {
+      break;
+    }
+    if (ev.kind === EventKind.AssistantText) {
       chunks.unshift(ev.text);
     }
   }
@@ -168,6 +202,58 @@ function createDaemonServer(
     json(res, status, { error: message });
   }
 
+  function requireLiveSession(
+    res: ServerResponse,
+    sessionId: string,
+    ds: DaemonSession,
+  ): boolean {
+    if (ds.session.isProcessAlive()) {
+      return true;
+    }
+    // Session is dead; drop it from tracking so subsequent requests see 404
+    // instead of 409, matching the registry-backed view.
+    dropDeadSession(sessionId, ds);
+    err(res, 409, `session ${sessionId} is not live`);
+    return false;
+  }
+
+  function dropDeadSession(sessionId: string, ds: DaemonSession): void {
+    if (sessions.get(sessionId) !== ds) return;
+    sessions.delete(sessionId);
+    ds.pendingPermission?.resolve({ outcome: "cancelled" });
+    ds.pendingPermission = null;
+    for (const client of ds.sseClients) {
+      try { client.end(); } catch { /* client already gone */ }
+    }
+    ds.sseClients.clear();
+    // Best-effort detach so the runtime releases any tailer/file handles
+    // held for this session.
+    void ds.session.detach().catch(() => {});
+  }
+
+  async function runSessionOp<T>(
+    res: ServerResponse,
+    sessionId: string,
+    ds: DaemonSession,
+    op: () => Promise<T>,
+  ): Promise<{ ok: true; value: T } | { ok: false }> {
+    try {
+      const value = await op();
+      return { ok: true, value };
+    } catch (e) {
+      const message = e instanceof Error ? e.message : String(e);
+      // If the underlying terminal died between the live-check and the op,
+      // or if the error itself indicates a dead backend, return a clean 409
+      // rather than leaking the raw tmux/pty error as a 500.
+      if (!ds.session.isProcessAlive() || looksLikeDeadSessionError(message)) {
+        dropDeadSession(sessionId, ds);
+        err(res, 409, `session ${sessionId} is not live`);
+        return { ok: false };
+      }
+      throw e;
+    }
+  }
+
   const server = createServer(async (req, res) => {
     const url = new URL(req.url ?? "/", `http://localhost:${config.port}`);
     const path = url.pathname;
@@ -176,7 +262,15 @@ function createDaemonServer(
     try {
       // POST /sessions -- create new session
       if (method === "POST" && path === "/sessions") {
-        const body = JSON.parse(await readBody(req)) as SessionRequestBody;
+        const body = parseOptionalJsonObject<SessionRequestBody>(await readBody(req));
+        if (body.sessionId !== undefined && !UUID_RE.test(body.sessionId)) {
+          err(
+            res,
+            400,
+            `sessionId must be a UUID (got ${JSON.stringify(body.sessionId)})`,
+          );
+          return;
+        }
         const sessionConfig = resolveSessionConfig(config, body);
         const sessionOwner = {
           kind: "daemon" as const,
@@ -215,7 +309,7 @@ function createDaemonServer(
         };
         sessions.set(session.sessionId, ds);
         attachEventStream(ds);
-        json(res, 200, {
+        json(res, 201, {
           sessionId: session.sessionId,
           backend: session.backend,
         });
@@ -225,10 +319,17 @@ function createDaemonServer(
       // GET /sessions -- list active daemon sessions
       if (method === "GET" && path === "/sessions") {
         const list = [];
-        for (const [id, ds] of sessions) {
+        // Take a snapshot before iterating so we can drop dead entries as
+        // we go without mutating the map during iteration.
+        for (const [id, ds] of [...sessions.entries()]) {
+          const alive = ds.session.isProcessAlive();
+          if (!alive) {
+            dropDeadSession(id, ds);
+            continue;
+          }
           list.push({
             sessionId: id,
-            alive: ds.session.isProcessAlive(),
+            alive,
             hasPendingPermission: ds.pendingPermission !== null,
           });
         }
@@ -281,8 +382,11 @@ function createDaemonServer(
 
       // POST /sessions/:id/resume
       if (method === "POST" && action === "resume") {
-        const body = JSON.parse(await readBody(req)) as SessionRequestBody;
-        const sessionConfig = resolveSessionConfig(config, body);
+        if (!UUID_RE.test(sessionId)) {
+          err(res, 400, `sessionId must be a UUID (got ${JSON.stringify(sessionId)})`);
+          return;
+        }
+        const body = parseOptionalJsonObject<SessionRequestBody>(await readBody(req));
         const ds = getSession(sessionId);
         if (ds && shouldReuseSession(ds)) {
           json(res, 200, {
@@ -293,17 +397,29 @@ function createDaemonServer(
           return;
         }
         if (ds) {
-          sessions.delete(sessionId);
-          ds.pendingPermission?.resolve({ outcome: "cancelled" });
-          ds.pendingPermission = null;
-          for (const client of ds.sseClients) {
-            client.end();
-          }
+          dropDeadSession(sessionId, ds);
+        }
+        // Look up the session's recorded cwd so a body-less resume targets
+        // the right project transcript. Also fast-fail unknown ids instead
+        // of blocking on a doomed `claude --resume` attempt.
+        const known = await runtime.inspectSession(sessionId, body.cwd);
+        if (!known && !body.cwd) {
+          err(
+            res,
+            404,
+            `session ${sessionId} not found; provide cwd to attempt a cold resume`,
+          );
+          return;
         }
         if (body.requireLive) {
           err(res, 409, `session ${sessionId} is not live on the daemon`);
           return;
         }
+        const effectiveBody: SessionRequestBody = {
+          ...body,
+          cwd: body.cwd ?? known?.cwd,
+        };
+        const sessionConfig = resolveSessionConfig(config, effectiveBody);
         const session = await runtime.resumeSession(sessionId, {
           cwd: sessionConfig.cwd,
           claudeArgs: sessionConfig.claudeArgs,
@@ -367,11 +483,16 @@ function createDaemonServer(
 
       // POST /sessions/:id/prompt
       if (method === "POST" && action === "prompt") {
+        if (!requireLiveSession(res, sessionId, ds)) return;
         const body = JSON.parse(await readBody(req)) as { text: string };
-        const result = await ds.session.prompt(body.text);
-        await ds.session.flushEvents();
+        const outcome = await runSessionOp(res, sessionId, ds, async () => {
+          const result = await ds.session.prompt(body.text);
+          await ds.session.flushEvents();
+          return result;
+        });
+        if (!outcome.ok) return;
         json(res, 200, {
-          ...result,
+          ...outcome.value,
           eventSeq: ds.lastEventSeq,
         });
         return;
@@ -379,10 +500,15 @@ function createDaemonServer(
 
       // POST /sessions/:id/await-turn
       if (method === "POST" && action === "await-turn") {
-        const result = await ds.session.awaitTurn();
-        await ds.session.flushEvents();
+        if (!requireLiveSession(res, sessionId, ds)) return;
+        const outcome = await runSessionOp(res, sessionId, ds, async () => {
+          const result = await ds.session.awaitTurn();
+          await ds.session.flushEvents();
+          return result;
+        });
+        if (!outcome.ok) return;
         json(res, 200, {
-          ...result,
+          ...outcome.value,
           eventSeq: ds.lastEventSeq,
         });
         return;
@@ -390,19 +516,28 @@ function createDaemonServer(
 
       // POST /sessions/:id/send
       if (method === "POST" && action === "send") {
+        if (!requireLiveSession(res, sessionId, ds)) return;
         const body = JSON.parse(await readBody(req)) as { text: string };
-        await ds.session.send(body.text);
+        const outcome = await runSessionOp(res, sessionId, ds, () =>
+          ds.session.send(body.text),
+        );
+        if (!outcome.ok) return;
         json(res, 200, { ok: true });
         return;
       }
 
       // POST /sessions/:id/send-and-await-turn
       if (method === "POST" && action === "send-and-await-turn") {
+        if (!requireLiveSession(res, sessionId, ds)) return;
         const body = JSON.parse(await readBody(req)) as { text: string };
-        const result = await ds.session.sendAndAwaitTurn(body.text);
-        await ds.session.flushEvents();
+        const outcome = await runSessionOp(res, sessionId, ds, async () => {
+          const result = await ds.session.sendAndAwaitTurn(body.text);
+          await ds.session.flushEvents();
+          return result;
+        });
+        if (!outcome.ok) return;
         json(res, 200, {
-          ...result,
+          ...outcome.value,
           eventSeq: ds.lastEventSeq,
         });
         return;
@@ -410,7 +545,11 @@ function createDaemonServer(
 
       // POST /sessions/:id/interrupt
       if (method === "POST" && action === "interrupt") {
-        await ds.session.interrupt();
+        if (!requireLiveSession(res, sessionId, ds)) return;
+        const outcome = await runSessionOp(res, sessionId, ds, () =>
+          ds.session.interrupt(),
+        );
+        if (!outcome.ok) return;
         json(res, 200, { ok: true });
         return;
       }
@@ -516,6 +655,7 @@ export async function startServer(config: CliConfig): Promise<void> {
 
 export const __test = {
   formatHostForUrl,
+  parseOptionalJsonObject,
   resolveSessionConfig,
   resolveServerTerminalBackend,
   shouldReuseSession,
