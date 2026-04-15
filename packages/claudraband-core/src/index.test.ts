@@ -7,6 +7,7 @@ import { join } from "node:path";
 import { createClaudraband, EventKind, __test } from "./index";
 import { sessionPath } from "./claude";
 import { readSessionRecord, writeKnownSessionRecord } from "./session-registry";
+import { awaitPaneIdle } from "./terminal/activity";
 import { Session } from "./tmuxctl";
 import type { Event } from "./wrap/event";
 
@@ -72,6 +73,10 @@ class FakeSessionWrapper {
 
   async capturePane(): Promise<string> {
     return "";
+  }
+
+  async awaitIdle(options?: Parameters<typeof awaitPaneIdle>[1]) {
+    return awaitPaneIdle(() => this.capturePane(), options);
   }
 
   setModel(_model: string): void {}
@@ -753,9 +758,12 @@ describe("session discovery", () => {
     expect(wrapper.sent).toEqual(["1"]);
   });
 
-  test("prompt waits for explicit turn end instead of idling out after assistant text", async () => {
-    class TurnEndWrapper extends PromptLifecycleWrapper {
+  test("prompt waits for the terminal to stabilize before ending the turn", async () => {
+    class StableTerminalWrapper extends PromptLifecycleWrapper {
+      private startedAt = 0;
+
       override async send(input: string): Promise<void> {
+        this.startedAt = Date.now();
         await super.send(input);
         this.emit({
           kind: EventKind.AssistantText,
@@ -794,6 +802,44 @@ describe("session discovery", () => {
             toolInput: "",
             role: "assistant",
           });
+        }, 350);
+      }
+
+      override async capturePane(): Promise<string> {
+        const elapsed = Date.now() - this.startedAt;
+        if (elapsed < 250) {
+          return "Claude\nworking 1";
+        }
+        if (elapsed < 550) {
+          return "Claude\nworking 2";
+        }
+        return "Claude\nfinished";
+      }
+    }
+
+    const session = __test.createSession(new StableTerminalWrapper() as never);
+    const startedAt = Date.now();
+
+    const result = await session.prompt("inspect the repo");
+
+    expect(result).toEqual({ stopReason: "end_turn" });
+    expect(Date.now() - startedAt).toBeGreaterThanOrEqual(1000);
+  });
+
+  test("prompt still ends promptly on explicit TurnEnd before the terminal stabilizes", async () => {
+    class TurnEndWrapper extends PromptLifecycleWrapper {
+      override async send(input: string): Promise<void> {
+        await super.send(input);
+        this.emit({
+          kind: EventKind.AssistantText,
+          time: new Date(),
+          text: "Done",
+          toolName: "",
+          toolID: "",
+          toolInput: "",
+          role: "assistant",
+        });
+        setTimeout(() => {
           this.emit({
             kind: EventKind.TurnEnd,
             time: new Date(),
@@ -803,7 +849,12 @@ describe("session discovery", () => {
             toolInput: "",
             role: "assistant",
           });
-        }, 3500);
+          this.finish();
+        }, 200);
+      }
+
+      override async capturePane(): Promise<string> {
+        return `still-changing-${Date.now()}`;
       }
     }
 
@@ -813,8 +864,42 @@ describe("session discovery", () => {
     const result = await session.prompt("inspect the repo");
 
     expect(result).toEqual({ stopReason: "end_turn" });
-    expect(Date.now() - startedAt).toBeGreaterThanOrEqual(3400);
+    expect(Date.now() - startedAt).toBeLessThan(1000);
   });
+
+  test("events turn detection still completes from transcript-idle fallback", async () => {
+    class EventsModeWrapper extends FakeSessionWrapper {
+      override async send(input: string): Promise<void> {
+        if (input !== "2") {
+          throw new Error(`unexpected input: ${input}`);
+        }
+        this.emit({
+          kind: EventKind.AssistantText,
+          time: new Date(),
+          text: "Working on it",
+          toolName: "",
+          toolID: "",
+          toolInput: "",
+          role: "assistant",
+        });
+      }
+
+      override async capturePane(): Promise<string> {
+        return `still-changing-${Date.now()}`;
+      }
+    }
+
+    const session = __test.createSession(new EventsModeWrapper() as never, {
+      turnDetection: "events",
+    });
+    const startedAt = Date.now();
+
+    const result = await session.sendAndAwaitTurn("2");
+
+    expect(result).toEqual({ stopReason: "end_turn" });
+    expect(Date.now() - startedAt).toBeGreaterThanOrEqual(5900);
+    expect(Date.now() - startedAt).toBeLessThan(8000);
+  }, 10_000);
 
   test("stop lets queued events drain before ending events()", async () => {
     class QueueingWrapper extends FakeSessionWrapper {

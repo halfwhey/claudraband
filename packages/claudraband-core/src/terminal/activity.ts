@@ -5,11 +5,26 @@ export interface PaneActivityOptions {
   stableCount?: number;
   /** Maximum wait time in ms before giving up. Default: 60_000 */
   timeoutMs?: number;
+  /** Require at least one visible change before stability can count as idle. */
+  requireChangeBeforeIdle?: boolean;
   /** AbortSignal for cancellation. */
   signal?: AbortSignal;
 }
 
 export type ActivityResult = "idle" | "timeout" | "aborted";
+
+export function normalizePaneCapture(capture: string): string {
+  return capture
+    .replace(/\r/g, "")
+    .replace(/\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)/g, "")
+    .replace(/\x1b\[(\d+)C/g, (_match, count: string) =>
+      " ".repeat(Number.parseInt(count, 10) || 0))
+    .replace(/\x1b\[\?[0-9;]*[a-zA-Z]/g, "")
+    .replace(/\x1b\[[0-9;]*[ABDHJKf]/g, "")
+    .replace(/\x1b\[[0-9;]*m/g, "")
+    .replace(/\x1b\[[0-9;?]*[ -/]*[@-~]/g, "")
+    .replace(/\x1b[()][A-Za-z0-9]/g, "");
+}
 
 /**
  * Poll `capture()` until the pane content is stable for `stableCount`
@@ -29,13 +44,15 @@ export async function awaitPaneIdle(
   const intervalMs = options?.intervalMs ?? 250;
   const stableCount = options?.stableCount ?? 3;
   const timeoutMs = options?.timeoutMs ?? 60_000;
+  const requireChangeBeforeIdle = options?.requireChangeBeforeIdle ?? false;
   const signal = options?.signal;
 
   if (signal?.aborted) return "aborted";
 
   const deadline = Date.now() + timeoutMs;
-  let previous = await capture();
+  let previous = normalizePaneCapture(await capture());
   let consecutiveStable = 0;
+  let sawChange = false;
 
   while (Date.now() < deadline) {
     if (signal?.aborted) return "aborted";
@@ -62,14 +79,18 @@ export async function awaitPaneIdle(
 
     if (signal?.aborted) return "aborted";
 
-    const current = await capture();
+    const current = normalizePaneCapture(await capture());
 
     if (current === previous) {
       consecutiveStable++;
-      if (consecutiveStable >= stableCount) {
+      if (
+        consecutiveStable >= stableCount &&
+        (!requireChangeBeforeIdle || sawChange)
+      ) {
         return "idle";
       }
     } else {
+      sawChange = true;
       consecutiveStable = 0;
       previous = current;
     }

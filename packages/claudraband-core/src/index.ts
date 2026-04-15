@@ -16,6 +16,7 @@ import {
   type ResolvedTerminalBackend,
   type TerminalBackendDriver,
 } from "./terminal";
+import type { ActivityResult, PaneActivityOptions } from "./terminal/activity";
 import type { Event as ClaudrabandEvent } from "./wrap/event";
 import { EventKind } from "./wrap/event";
 import type { Wrapper } from "./wrap/wrapper";
@@ -38,6 +39,12 @@ const DEFAULT_PANE_HEIGHT = 40;
 const IDLE_TIMEOUT_MS = 3000;
 const SHARED_TMUX_SESSION = "claudraband-working-session";
 const READY_MODE_PROMPT_RE = /(?:^|[^A-Za-z0-9_])(INSERT|NORMAL)\s*$/;
+const TURN_IDLE_OPTIONS: PaneActivityOptions = {
+  intervalMs: 250,
+  stableCount: 3,
+  timeoutMs: 15_000,
+  requireChangeBeforeIdle: true,
+};
 
 export { EventKind };
 export { hasPendingNativePrompt };
@@ -76,6 +83,8 @@ export type PermissionMode =
   | "acceptEdits"
   | "dontAsk"
   | "bypassPermissions";
+
+export type TurnDetectionMode = "terminal" | "events";
 
 export type ToolKind =
   | "read"
@@ -127,6 +136,7 @@ export interface ClaudrabandOptions {
   claudeExecutable?: string;
   model?: string;
   permissionMode?: PermissionMode;
+  turnDetection?: TurnDetectionMode;
   allowTextResponses?: boolean;
   terminalBackend?: TerminalBackend;
   paneWidth?: number;
@@ -322,6 +332,10 @@ function normalizeOptions(
       (parsedClaudeArgs.permissionMode as PermissionMode | undefined) ??
       defaults.permissionMode ??
       "default",
+    turnDetection:
+      options?.turnDetection ??
+      defaults.turnDetection ??
+      "terminal",
     allowTextResponses:
       options?.allowTextResponses ??
       defaults.allowTextResponses ??
@@ -377,6 +391,7 @@ class ClaudrabandRuntime implements Claudraband {
       backend,
       cfg.model,
       cfg.permissionMode,
+      cfg.turnDetection,
       cfg.allowTextResponses,
       cfg.logger,
       cfg.onPermissionRequest,
@@ -413,6 +428,7 @@ class ClaudrabandRuntime implements Claudraband {
       backend,
       cfg.model,
       cfg.permissionMode,
+      cfg.turnDetection,
       cfg.allowTextResponses,
       cfg.logger,
       cfg.onPermissionRequest,
@@ -457,6 +473,7 @@ class ClaudrabandRuntime implements Claudraband {
 
 interface SessionWrapper extends Wrapper {
   capturePane(): Promise<string>;
+  awaitIdle(options?: PaneActivityOptions): Promise<ActivityResult>;
   setModel(model: string): void;
   setPermissionMode(mode: string): void;
   restart(): Promise<void>;
@@ -479,6 +496,7 @@ class ClaudrabandSessionImpl implements ClaudrabandSession {
   private readonly pumpPromise: Promise<void>;
   private _model: string;
   private _permissionMode: PermissionMode;
+  private turnDetection: TurnDetectionMode;
   private allowTextResponses: boolean;
   private sessionOwner?: SessionOwnerRecord;
   private lastNativePermissionFingerprint: string | null = null;
@@ -491,6 +509,7 @@ class ClaudrabandSessionImpl implements ClaudrabandSession {
     readonly backend: ResolvedTerminalBackend,
     model: string,
     permissionMode: PermissionMode,
+    turnDetection: TurnDetectionMode,
     allowTextResponses: boolean,
     logger: ClaudrabandLogger,
     onPermissionRequest: ClaudrabandOptions["onPermissionRequest"],
@@ -500,6 +519,7 @@ class ClaudrabandSessionImpl implements ClaudrabandSession {
     this.wrapper = wrapper;
     this._model = model;
     this._permissionMode = permissionMode;
+    this.turnDetection = turnDetection;
     this.allowTextResponses = allowTextResponses;
     this.logger = logger;
     this.onPermissionRequest = onPermissionRequest;
@@ -1057,6 +1077,115 @@ class ClaudrabandSessionImpl implements ClaudrabandSession {
     prompt: PromptWaiter,
     signal: AbortSignal,
   ): Promise<"end_turn" | "cancelled"> {
+    if (this.turnDetection === "events") {
+      return this.waitForPromptCompletionByEvents(prompt, signal);
+    }
+
+    let idleWait: Promise<ActivityResult> | null = null;
+    let idleAbort: AbortController | null = null;
+
+    const cancelIdleWait = (): void => {
+      idleAbort?.abort();
+      idleAbort = null;
+      idleWait = null;
+    };
+
+    const ensureIdleWait = (): Promise<ActivityResult> | null => {
+      if (!prompt.matchedUserEcho) {
+        cancelIdleWait();
+        return null;
+      }
+      if (!idleWait) {
+        idleAbort = new AbortController();
+        if (signal.aborted) {
+          idleAbort.abort();
+        } else {
+          signal.addEventListener("abort", () => idleAbort?.abort(), { once: true });
+        }
+        idleWait = this.wrapper.awaitIdle({
+          ...TURN_IDLE_OPTIONS,
+          signal: idleAbort.signal,
+        });
+      }
+      return idleWait;
+    };
+
+    while (true) {
+      if (signal.aborted) return "cancelled";
+      if (this.stopped) return "cancelled";
+      if (this.pumpDone) {
+        if (this.pumpError) {
+          this.logger.warn("prompt ending after pump shutdown", "sid", this.sessionId);
+        }
+        return "end_turn";
+      }
+      if (prompt.inputDeferred) {
+        return "end_turn";
+      }
+      if (prompt.turnEnded && prompt.pendingTools <= 0) {
+        return "end_turn";
+      }
+
+      const updateWait = this.waitForPromptUpdate(prompt, signal);
+      const paneIdleWait = ensureIdleWait();
+
+      if (!paneIdleWait) {
+        const result = await updateWait;
+        if (result === "abort") return "cancelled";
+        if (result === "done") return "end_turn";
+        continue;
+      }
+
+      const winner = await Promise.race([
+        updateWait.then((result) => ({ kind: "update" as const, result })),
+        paneIdleWait.then((result) => ({ kind: "idle" as const, result })),
+      ]);
+
+      if (winner.kind === "update") {
+        if (winner.result === "abort") {
+          cancelIdleWait();
+          return "cancelled";
+        }
+        if (winner.result === "done") {
+          cancelIdleWait();
+          return "end_turn";
+        }
+        continue;
+      }
+
+      cancelIdleWait();
+
+      if (winner.result === "aborted") {
+        return signal.aborted ? "cancelled" : "end_turn";
+      }
+
+      const handled = await this.pollNativePermission(prompt.lastPendingTool);
+      if (handled === "handled" || handled === "consumed") {
+        prompt.pendingTools = Math.max(0, prompt.pendingTools - 1);
+        prompt.gotResponse = true;
+        prompt.lastPendingTool = null;
+        this.notifyPrompt(prompt);
+        continue;
+      }
+      if (handled === "pending_clear") {
+        continue;
+      }
+      if (winner.result === "idle") {
+        return "end_turn";
+      }
+      if (prompt.turnEnded && prompt.pendingTools <= 0) {
+        return "end_turn";
+      }
+      if (prompt.gotResponse && prompt.pendingTools <= 0) {
+        return "end_turn";
+      }
+    }
+  }
+
+  private async waitForPromptCompletionByEvents(
+    prompt: PromptWaiter,
+    signal: AbortSignal,
+  ): Promise<"end_turn" | "cancelled"> {
     while (true) {
       if (signal.aborted) return "cancelled";
       if (this.stopped) return "cancelled";
@@ -1107,14 +1236,9 @@ class ClaudrabandSessionImpl implements ClaudrabandSession {
           }
           continue;
         }
-        // Idle fallback: if we received assistant output, no tools are
-        // pending, and two consecutive idle periods passed with no new
-        // events, treat this as turn completion even when the JSONL didn't
-        // include an explicit TurnEnd event.
         if (prompt.gotResponse && prompt.consecutiveIdles >= 2) {
           return "end_turn";
         }
-        continue;
       }
     }
   }
@@ -1327,6 +1451,7 @@ export const __test = {
       backend?: ResolvedTerminalBackend;
       model?: string;
       permissionMode?: PermissionMode;
+      turnDetection?: TurnDetectionMode;
       allowTextResponses?: boolean;
       logger?: ClaudrabandLogger;
       onPermissionRequest?: ClaudrabandOptions["onPermissionRequest"];
@@ -1340,6 +1465,7 @@ export const __test = {
       options.backend ?? "tmux",
       options.model ?? "sonnet",
       options.permissionMode ?? "default",
+      options.turnDetection ?? "terminal",
       options.allowTextResponses ?? false,
       options.logger ?? makeDefaultLogger(),
       options.onPermissionRequest,

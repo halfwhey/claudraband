@@ -10,6 +10,7 @@ import {
   type TerminalBackend,
   type TerminalHost,
 } from "../terminal";
+import type { ActivityResult, PaneActivityOptions } from "../terminal/activity";
 import { resolveClaudeLaunchCommand } from "./resolve";
 
 export interface ClaudeConfig {
@@ -317,6 +318,11 @@ export class ClaudeWrapper implements Wrapper {
   async capturePane(): Promise<string> {
     if (!this.terminal) throw new Error("claude: not started");
     return this.terminal.capture();
+  }
+
+  async awaitIdle(options?: PaneActivityOptions): Promise<ActivityResult> {
+    if (!this.terminal) throw new Error("claude: not started");
+    return this.terminal.awaitIdle(options);
   }
 
   async processId(): Promise<number | undefined> {

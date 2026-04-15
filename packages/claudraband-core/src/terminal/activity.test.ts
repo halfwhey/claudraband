@@ -117,4 +117,36 @@ describe("awaitPaneIdle", () => {
     // 1 initial capture + 5 stable checks
     expect(callCount).toBe(6);
   });
+
+  test("requires a visible change before declaring idle when configured", async () => {
+    const capture = () => Promise.resolve("unchanged");
+
+    const result = await awaitPaneIdle(capture, {
+      intervalMs: 10,
+      stableCount: 3,
+      timeoutMs: 100,
+      requireChangeBeforeIdle: true,
+    });
+
+    expect(result).toBe("timeout");
+  });
+
+  test("ignores ANSI noise when comparing captures", async () => {
+    let callCount = 0;
+    const capture = () => {
+      callCount++;
+      if (callCount === 1) {
+        return Promise.resolve("\u001b[31mhello\u001b[0m");
+      }
+      return Promise.resolve("hello");
+    };
+
+    const result = await awaitPaneIdle(capture, {
+      intervalMs: 10,
+      stableCount: 2,
+      timeoutMs: 2000,
+    });
+
+    expect(result).toBe("idle");
+  });
 });
