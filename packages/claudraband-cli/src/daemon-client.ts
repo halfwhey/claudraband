@@ -32,12 +32,15 @@ interface DaemonSessionRequestBody {
   requireLive?: boolean;
 }
 
-interface PendingQuestionResponse {
-  pending: boolean;
-  source: "none" | "permission_request" | "terminal";
+interface DaemonStatusResponse {
+  pendingInput: "none" | "question" | "permission";
 }
 
 interface DaemonPromptResult extends PromptResult {
+  sessionId: string;
+  cwd: string;
+  text: string | null;
+  pendingInput: "none" | "question" | "permission";
   eventSeq?: number;
 }
 
@@ -142,6 +145,37 @@ function isSelectionFlow(config: CliConfig): boolean {
     && Boolean(config.answer)
     && Boolean(config.sessionId)
   );
+}
+
+function renderPromptText(renderer: Renderer, text: string | null): void {
+  if (!text) return;
+  renderer.handleEvent({
+    kind: EventKind.AssistantText,
+    time: new Date(),
+    text,
+    toolName: "",
+    toolID: "",
+    toolInput: "",
+    role: "assistant",
+  });
+}
+
+function buildPermissionBody(
+  request: ClaudrabandPermissionRequest,
+  decision: ClaudrabandPermissionDecision,
+): { select: string; text?: string } | null {
+  if (decision.outcome === "deferred") {
+    return null;
+  }
+  if (decision.outcome === "selected") {
+    return { select: decision.optionId };
+  }
+  if (decision.outcome === "text") {
+    const option = request.options.find((candidate) => candidate.textInput);
+    return option ? { select: option.optionId, text: decision.text } : null;
+  }
+  const reject = request.options.find((candidate) => candidate.kind === "reject_once");
+  return reject ? { select: reject.optionId } : null;
 }
 
 function connectSSE(
@@ -264,11 +298,9 @@ class DaemonSessionProxy implements ClaudrabandSession {
     if (data.type === "permission_request" && this.permissionHandler) {
       const request = data as unknown as ClaudrabandPermissionRequest;
       this.permissionHandler(request).then((decision) => {
-        daemonPost(
-          this.server,
-          `/sessions/${this.sessionId}/permission`,
-          decision,
-        ).catch(() => {});
+        const body = buildPermissionBody(request, decision);
+        if (!body) return;
+        daemonPost(this.server, `/sessions/${this.sessionId}/send`, body).catch(() => {});
       });
       if (seq > 0) {
         this.lastRenderedSeq = Math.max(this.lastRenderedSeq, seq);
@@ -371,11 +403,11 @@ class DaemonSessionProxy implements ClaudrabandSession {
   async hasPendingInput(): Promise<{ pending: boolean; source: "none" | "terminal" }> {
     const result = (await daemonGet(
       this.server,
-      `/sessions/${this.sessionId}/pending-question`,
-    )) as PendingQuestionResponse;
+      `/sessions/${this.sessionId}/status`,
+    )) as DaemonStatusResponse;
     return {
-      pending: result.pending,
-      source: result.source === "none" ? "none" : "terminal",
+      pending: result.pendingInput !== "none",
+      source: result.pendingInput === "none" ? "none" : "terminal",
     };
   }
 
@@ -454,23 +486,26 @@ export async function runWithDaemon(
     sessionBackend = result.backend;
   }
 
-  const session = new DaemonSessionProxy(
-    config.connect,
-    sessionId,
-    config.cwd,
-    sessionBackend,
-    config.model,
-    config.permissionMode,
-    permissionHandler,
-  );
-  await session.startEventStream();
-
-  // Start event pump.
-  const eventPump = (async () => {
-    for await (const event of session.events()) {
-      renderer.handleEvent(event);
-    }
-  })().catch(() => {});
+  let session: DaemonSessionProxy | null = null;
+  let eventPump: Promise<void> | null = null;
+  if (config.command === "attach") {
+    session = new DaemonSessionProxy(
+      config.connect,
+      sessionId,
+      config.cwd,
+      sessionBackend,
+      config.model,
+      config.permissionMode,
+      permissionHandler,
+    );
+    await session.startEventStream();
+    const attachSession = session;
+    eventPump = (async () => {
+      for await (const event of attachSession.events()) {
+        renderer.handleEvent(event);
+      }
+    })().catch(() => {});
+  }
 
   if (config.command !== "prompt" && config.debug) {
     process.stderr.write(`session: ${sessionId}\n`);
@@ -478,53 +513,65 @@ export async function runWithDaemon(
 
   try {
     if (isSelectionFlow(config)) {
-      // Validate pending question.
-      const result = (await daemonGet(
+      const status = (await daemonGet(
         config.connect,
-        `/sessions/${sessionId}/pending-question`,
-      )) as PendingQuestionResponse;
-      if (!result.pending) {
-        process.stderr.write(`error: session ${sessionId} has no pending question.\n`);
+        `/sessions/${sessionId}/status`,
+      )) as DaemonStatusResponse;
+      if (status.pendingInput === "none") {
+        process.stderr.write(`error: session ${sessionId} has no pending question or permission prompt.\n`);
         process.exit(1);
       }
-      const turnResult = await session.answerPending(
-        config.answer,
-        config.prompt || undefined,
-      );
-      await session.waitForRenderedSeq((turnResult as DaemonPromptResult).eventSeq);
+      const turnResult = (await daemonPost(
+        config.connect,
+        `/sessions/${sessionId}/prompt`,
+        config.prompt ? { select: config.answer, text: config.prompt } : { select: config.answer },
+      )) as DaemonPromptResult;
+      renderPromptText(renderer, turnResult.text);
       renderer.ensureNewline();
       if (config.debug) {
         process.stderr.write(`stop: ${turnResult.stopReason}\n`);
       }
     } else if (config.command === "prompt") {
       if (config.sessionId) {
-        const pending = (await daemonGet(
+        const status = (await daemonGet(
           config.connect,
-          `/sessions/${sessionId}/pending-question`,
-        )) as PendingQuestionResponse;
-        if (pending.pending) {
+          `/sessions/${sessionId}/status`,
+        )) as DaemonStatusResponse;
+        if (status.pendingInput !== "none") {
           process.stderr.write(
             `error: session ${sessionId} has a pending question or permission prompt. Use 'cband prompt --session ${sessionId} --select <choice> [text]'.\n`,
           );
           process.exit(1);
         }
       }
-      const result = await session.prompt(config.prompt);
-      await session.waitForRenderedSeq((result as DaemonPromptResult).eventSeq);
+      const result = (await daemonPost(
+        config.connect,
+        `/sessions/${sessionId}/prompt`,
+        { text: config.prompt },
+      )) as DaemonPromptResult;
+      renderPromptText(renderer, result.text);
       renderer.ensureNewline();
       if (config.debug) {
         process.stderr.write(`stop: ${result.stopReason}\n`);
       }
     } else if (config.command === "send") {
       if (config.answer) {
-        await session.send(config.answer);
-      }
-      if (config.prompt) {
-        await session.send(config.prompt);
+        await daemonPost(
+          config.connect,
+          `/sessions/${sessionId}/send`,
+          config.prompt ? { select: config.answer, text: config.prompt } : { select: config.answer },
+        );
+      } else if (config.prompt) {
+        await daemonPost(config.connect, `/sessions/${sessionId}/send`, {
+          text: config.prompt,
+        });
       }
     }
 
     if (config.command === "attach") {
+      if (!session) {
+        throw new Error("attach session was not initialized");
+      }
       process.stderr.write("(interactive mode, Ctrl+C to cancel, Ctrl+D to exit)\n");
       process.stdin.setEncoding("utf8");
 
@@ -536,13 +583,14 @@ export async function runWithDaemon(
 
       for await (const line of rl) {
         if (!line.trim()) continue;
-        await session.prompt(line.trim());
+        const result = (await session.prompt(line.trim())) as DaemonPromptResult;
+        await session.waitForRenderedSeq(result.eventSeq);
         renderer.ensureNewline();
       }
       rl.close();
     }
 
-    await session.detach();
+    await session?.detach();
     await eventPump;
   } catch (err: unknown) {
     const msg = err instanceof Error ? err.message : JSON.stringify(err);

@@ -81,12 +81,13 @@ Send a prompt and wait for the assistant's reply. Without --session a new
 session is created. With --session the saved session is auto-resumed; if the
 id has no saved transcript, the command errors.
 
---select answers a pending AskUserQuestion before the optional follow-up text.
+--select answers a pending AskUserQuestion or permission prompt.
+If the selected option expects text, pass it as the trailing prompt argument.
 
 Options:
   -h, --help                     Show this help
   --session <id>                 Resume the saved session with this id
-  --select <choice>              Answer a pending question (1-based index; 0 = Other)
+  --select <choice>              Answer a pending question or permission prompt
   --model <model>                Override the model for this turn
   --permission-mode <mode>       Override Claude permission mode
   --backend <backend>            Local backend when starting a new session
@@ -101,7 +102,7 @@ Examples:
   cband prompt "review the staged diff"
   cband prompt --session abc-123 "keep going"
   cband prompt --session abc-123 --select 2
-  cband prompt --session abc-123 --select 0 "new direction"`,
+  cband prompt --session abc-123 --select 3 "new direction"`,
 
   send: `Usage:
   cband send [--session <id>] [--select <choice>] <text...>
@@ -109,20 +110,21 @@ Examples:
 Send text to the session without waiting for a response. Returns as soon as
 the input is delivered. Use status, last, or watch to observe the response.
 
---select answers a pending AskUserQuestion (fire-and-forget variant of
-'cband prompt --select'). Optional trailing text is sent after the selection.
+--select answers a pending AskUserQuestion or permission prompt
+(fire-and-forget variant of 'cband prompt --select'). If the selected option
+expects text, pass it as the trailing argument.
 
 Options:
   -h, --help                     Show this help
   --session <id>                 Resume the saved session with this id
-  --select <choice>              Fire a pending-question answer (1-based; 0 = Other)
+  --select <choice>              Fire a pending answer selection
   --cwd <dir>                    Working directory for new sessions
   --debug                        Show debug logging
 
 Examples:
   cband send --session abc-123 "quick note"
   cband send --session abc-123 --select 2
-  cband send --session abc-123 --select 0 "new direction"
+  cband send --session abc-123 --select 3 "new direction"
   cband send "begin a new background task"`,
 
   watch: `Usage:
@@ -130,7 +132,9 @@ Examples:
 
 Stream events from a session. When a daemon owns the session this connects to
 the SSE stream; otherwise it polls the local event iterator. One event per line
-as JSON by default.
+as JSON by default. For daemon-backed sessions, watch is the streaming
+companion to 'cband send'; 'cband prompt' already waits and prints the
+completed response.
 
 Options:
   -h, --help                     Show this help

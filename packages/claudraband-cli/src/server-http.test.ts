@@ -4,6 +4,7 @@ import type { AddressInfo } from "node:net";
 import type {
   Claudraband,
   ClaudrabandEvent,
+  ClaudrabandPermissionRequest,
   ClaudrabandSession,
   OpenSessionOptions,
   PromptResult,
@@ -45,9 +46,82 @@ function makeConfig(overrides: Partial<CliConfig> = {}): CliConfig {
   };
 }
 
-function makeMockSession(id: string): ClaudrabandSession {
-  const events: ClaudrabandEvent[] = [];
-  let alive = true;
+interface MockState {
+  alive: boolean;
+  lastText: string | null;
+  pendingInput: SessionStatus["pendingInput"];
+  turnInProgress: boolean;
+  permissionHandler?: OpenSessionOptions["onPermissionRequest"];
+}
+
+interface MockSession extends ClaudrabandSession {
+  awaitTurn(): Promise<PromptResult>;
+}
+
+interface MockRuntime extends Claudraband {
+  _lastSession: MockSession | null;
+  _state: MockState;
+  _triggerPermission(request: ClaudrabandPermissionRequest): Promise<void>;
+}
+
+function makeMockEvent(
+  kind: ClaudrabandEvent["kind"],
+  text = "",
+): ClaudrabandEvent {
+  return {
+    kind,
+    time: new Date("2026-04-12T10:00:00.000Z"),
+    text,
+    toolName: "",
+    toolID: "",
+    toolInput: "",
+    role: kind === EventKind.AssistantText ? "assistant" : "",
+  };
+}
+
+function makeMockSession(id: string, state: MockState): MockSession {
+  const subscribers = new Set<{
+    queue: ClaudrabandEvent[];
+    resolvers: Array<(result: IteratorResult<ClaudrabandEvent>) => void>;
+    closed: boolean;
+  }>();
+  const turnWaiters: Array<() => void> = [];
+
+  function emit(event: ClaudrabandEvent): void {
+    for (const subscriber of subscribers) {
+      if (subscriber.closed) continue;
+      const resolver = subscriber.resolvers.shift();
+      if (resolver) {
+        resolver({ value: event, done: false });
+      } else {
+        subscriber.queue.push(event);
+      }
+    }
+    if (event.kind === EventKind.TurnEnd) {
+      state.turnInProgress = false;
+      for (const resolve of turnWaiters.splice(0)) {
+        resolve();
+      }
+    }
+  }
+
+  function closeSubscribers(): void {
+    for (const subscriber of subscribers) {
+      subscriber.closed = true;
+      for (const resolve of subscriber.resolvers.splice(0)) {
+        resolve({ value: undefined, done: true } as IteratorResult<ClaudrabandEvent>);
+      }
+    }
+    subscribers.clear();
+  }
+
+  function emitAssistantTurn(text: string): void {
+    state.lastText = text;
+    state.turnInProgress = true;
+    emit(makeMockEvent(EventKind.AssistantText, text));
+    emit(makeMockEvent(EventKind.TurnEnd));
+  }
+
   return {
     sessionId: id,
     cwd: "/test-cwd",
@@ -55,44 +129,133 @@ function makeMockSession(id: string): ClaudrabandSession {
     model: "haiku",
     permissionMode: "default",
     async *events() {
-      for (const e of events) yield e;
+      const subscriber = {
+        queue: [] as ClaudrabandEvent[],
+        resolvers: [] as Array<(result: IteratorResult<ClaudrabandEvent>) => void>,
+        closed: false,
+      };
+      subscribers.add(subscriber);
+      try {
+        while (true) {
+          if (subscriber.queue.length > 0) {
+            yield subscriber.queue.shift()!;
+            continue;
+          }
+          if (subscriber.closed) return;
+          const next = await new Promise<IteratorResult<ClaudrabandEvent>>((resolve) => {
+            subscriber.resolvers.push(resolve);
+          });
+          if (next.done) return;
+          yield next.value;
+        }
+      } finally {
+        subscriber.closed = true;
+        subscribers.delete(subscriber);
+      }
     },
-    async prompt(_text: string): Promise<PromptResult> {
+    async prompt(text: string): Promise<PromptResult> {
+      state.pendingInput = "none";
+      emitAssistantTurn(`reply: ${text}`);
       return { stopReason: "end_turn" };
     },
-    async send(_text: string) {},
-    async answerPending(_choice: string, _text?: string): Promise<PromptResult> {
+    async send(_text: string) {
+      if (state.pendingInput === "question") {
+        state.pendingInput = "none";
+      }
+    },
+    async answerPending(choice: string, text?: string): Promise<PromptResult> {
+      state.pendingInput = "none";
+      emitAssistantTurn(text ? `selected ${choice}: ${text}` : `selected ${choice}`);
       return { stopReason: "end_turn" };
     },
-    async interrupt() {},
+    async awaitTurn(): Promise<PromptResult> {
+      if (!state.turnInProgress) {
+        return { stopReason: "end_turn" };
+      }
+      await new Promise<void>((resolve) => {
+        turnWaiters.push(resolve);
+      });
+      return { stopReason: "end_turn" };
+    },
+    async interrupt() {
+      state.turnInProgress = false;
+      for (const resolve of turnWaiters.splice(0)) {
+        resolve();
+      }
+    },
     async stop() {
-      alive = false;
+      state.alive = false;
+      state.turnInProgress = false;
+      closeSubscribers();
     },
     async detach() {},
     isProcessAlive() {
-      return alive;
+      return state.alive;
     },
     async capturePane() {
       return "";
     },
     async hasPendingInput() {
-      return { pending: false as const, source: "none" as const };
+      return {
+        pending: state.pendingInput === "question",
+        source: state.pendingInput === "question" ? "terminal" as const : "none" as const,
+      };
     },
     async setModel() {},
     async setPermissionMode() {},
-    async flushEvents() {},
+    async flushEvents() {
+      while ([...subscribers].some((subscriber) => subscriber.queue.length > 0)) {
+        await Promise.resolve();
+      }
+    },
   };
 }
 
-function makeMockRuntime(): Claudraband & { _lastSession: ClaudrabandSession | null } {
-  const rt: Claudraband & { _lastSession: ClaudrabandSession | null } = {
+function makeMockRuntime(): MockRuntime {
+  const state: MockState = {
+    alive: true,
+    lastText: "latest answer",
+    pendingInput: "none",
+    turnInProgress: false,
+  };
+
+  const rt: MockRuntime = {
     _lastSession: null,
+    _state: state,
+    async _triggerPermission(request: ClaudrabandPermissionRequest) {
+      state.pendingInput = "permission";
+      state.turnInProgress = true;
+      const handler = state.permissionHandler;
+      if (!handler) return;
+      const decision = await handler(request);
+      if (decision.outcome === "deferred") {
+        return;
+      }
+      state.pendingInput = "none";
+      if (decision.outcome === "selected") {
+        const session = rt._lastSession as MockSession | null;
+        if (session) {
+          await session.answerPending(decision.optionId);
+        }
+        return;
+      }
+      if (decision.outcome === "text") {
+        const session = rt._lastSession as MockSession | null;
+        if (session) {
+          await session.answerPending("text", decision.text);
+        }
+        return;
+      }
+      state.turnInProgress = false;
+    },
     async openSession(options?: OpenSessionOptions) {
       const id = options?.sessionId ?? randomUUID();
       if (options?.sessionId && rt._lastSession?.sessionId !== options.sessionId) {
         throw new SessionNotFoundError(options.sessionId);
       }
-      const session = makeMockSession(id);
+      state.alive = true;
+      state.permissionHandler = options?.onPermissionRequest;
+      const session = makeMockSession(id, state);
       rt._lastSession = session;
       return session;
     },
@@ -127,44 +290,28 @@ function makeMockRuntime(): Claudraband & { _lastSession: ClaudrabandSession | n
       if (!summary) return null;
       const status: SessionStatus = {
         ...summary,
-        turnInProgress: false,
-        pendingInput: "none",
+        turnInProgress: state.turnInProgress,
+        pendingInput: state.pendingInput,
       };
       return status;
     },
-    async getLastMessage(sessionId: string, cwd: string) {
-      const events = await rt.replaySession(sessionId, cwd);
-      const { extractLastAssistantTurn } = await import("claudraband-core");
-      return extractLastAssistantTurn(events);
+    async getLastMessage(sessionId: string) {
+      if (rt._lastSession?.sessionId !== sessionId) {
+        return null;
+      }
+      return state.lastText;
     },
     async closeSession() {
       return true;
     },
     async replaySession(sessionId) {
-      if (rt._lastSession?.sessionId !== sessionId) {
+      if (rt._lastSession?.sessionId !== sessionId || state.lastText === null) {
         return [];
       }
-      const base = { toolName: "", toolID: "", toolInput: "", role: "" as const };
       return [
-        {
-          ...base,
-          kind: EventKind.TurnStart,
-          time: new Date("2026-04-12T10:00:00.000Z"),
-          text: "",
-        },
-        {
-          ...base,
-          kind: EventKind.AssistantText,
-          time: new Date("2026-04-12T10:00:01.000Z"),
-          text: "latest answer",
-          role: "assistant" as const,
-        },
-        {
-          ...base,
-          kind: EventKind.TurnEnd,
-          time: new Date("2026-04-12T10:00:02.000Z"),
-          text: "",
-        },
+        makeMockEvent(EventKind.TurnStart),
+        makeMockEvent(EventKind.AssistantText, state.lastText),
+        makeMockEvent(EventKind.TurnEnd),
       ];
     },
   };
@@ -314,6 +461,35 @@ describe("daemon HTTP API", () => {
     expect(body.owner.kind).toBe("daemon");
   });
 
+  test("status surfaces daemon-held permission prompts", async () => {
+    const { runtime } = await startTestServer();
+    const createRes = await fetch(`${baseUrl}/sessions`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({}),
+    });
+    const { sessionId } = await createRes.json();
+
+    void runtime._triggerPermission({
+      source: "native_prompt",
+      sessionId,
+      toolCallId: "tool_1",
+      title: "Run bash command",
+      kind: "execute",
+      content: [{ type: "text", text: "Run bash command" }],
+      options: [
+        { kind: "allow_once", optionId: "1", name: "Allow" },
+        { kind: "reject_once", optionId: "2", name: "Deny" },
+      ],
+    });
+    await Promise.resolve();
+
+    const res = await fetch(`${baseUrl}/sessions/${sessionId}/status`);
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.pendingInput).toBe("permission");
+  });
+
   test("status returns 404 for unknown session", async () => {
     await startTestServer();
     const res = await fetch(`${baseUrl}/sessions/missing/status`);
@@ -339,6 +515,25 @@ describe("daemon HTTP API", () => {
     expect(body.sessionId).toBe(sessionId);
     expect(body.cwd).toBe("/test-cwd");
     expect(body.text).toBe("latest answer");
+    expect(body.pendingInput).toBe("none");
+  });
+
+  test("last returns null text and pending input when no assistant turn is available", async () => {
+    const { runtime } = await startTestServer();
+    const createRes = await fetch(`${baseUrl}/sessions`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({}),
+    });
+    const { sessionId } = await createRes.json();
+    runtime._state.lastText = null;
+    runtime._state.pendingInput = "question";
+
+    const res = await fetch(`${baseUrl}/sessions/${sessionId}/last`);
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.text).toBeNull();
+    expect(body.pendingInput).toBe("question");
   });
 
   test("last returns 404 for unknown session", async () => {
@@ -351,7 +546,7 @@ describe("daemon HTTP API", () => {
 
   // --- POST /sessions/:id/prompt ---
 
-  test("prompt returns stopReason", async () => {
+  test("prompt returns stopReason and assistant text", async () => {
     await startTestServer();
     const createRes = await fetch(`${baseUrl}/sessions`, {
       method: "POST",
@@ -368,6 +563,8 @@ describe("daemon HTTP API", () => {
     expect(res.status).toBe(200);
     const body = await res.json();
     expect(body.stopReason).toBe("end_turn");
+    expect(body.text).toBe("reply: hello");
+    expect(body.pendingInput).toBe("none");
   });
 
   // --- POST /sessions/:id/send ---
@@ -414,13 +611,14 @@ describe("daemon HTTP API", () => {
   // --- POST /sessions/:id/prompt with `select` (replaces removed /answer) ---
 
   test("prompt with select answers a pending question", async () => {
-    await startTestServer();
+    const { runtime } = await startTestServer();
     const createRes = await fetch(`${baseUrl}/sessions`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({}),
     });
     const { sessionId } = await createRes.json();
+    runtime._state.pendingInput = "question";
 
     const res = await fetch(`${baseUrl}/sessions/${sessionId}/prompt`, {
       method: "POST",
@@ -430,16 +628,19 @@ describe("daemon HTTP API", () => {
     expect(res.status).toBe(200);
     const body = await res.json();
     expect(body.stopReason).toBe("end_turn");
+    expect(body.text).toBe("selected 1");
+    expect(body.pendingInput).toBe("none");
   });
 
   test("prompt with select+text answers and sends follow-up text", async () => {
-    await startTestServer();
+    const { runtime } = await startTestServer();
     const createRes = await fetch(`${baseUrl}/sessions`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({}),
     });
     const { sessionId } = await createRes.json();
+    runtime._state.pendingInput = "question";
 
     const res = await fetch(`${baseUrl}/sessions/${sessionId}/prompt`, {
       method: "POST",
@@ -449,6 +650,46 @@ describe("daemon HTTP API", () => {
     expect(res.status).toBe(200);
     const body = await res.json();
     expect(body.stopReason).toBe("end_turn");
+    expect(body.text).toBe("selected 0: use the blue theme");
+  });
+
+  test("prompt with select answers a pending permission request", async () => {
+    const { runtime } = await startTestServer();
+    const createRes = await fetch(`${baseUrl}/sessions`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({}),
+    });
+    const { sessionId } = await createRes.json();
+
+    void runtime._triggerPermission({
+      source: "native_prompt",
+      sessionId,
+      toolCallId: "tool_1",
+      title: "Run bash command",
+      kind: "execute",
+      content: [{ type: "text", text: "Run bash command" }],
+      options: [
+        { kind: "allow_once", optionId: "1", name: "Allow" },
+        { kind: "reject_once", optionId: "2", name: "Deny" },
+      ],
+    });
+    await Promise.resolve();
+
+    const statusRes = await fetch(`${baseUrl}/sessions/${sessionId}/status`);
+    const statusBody = await statusRes.json();
+    expect(statusBody.pendingInput).toBe("permission");
+
+    const res = await fetch(`${baseUrl}/sessions/${sessionId}/prompt`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ select: "1" }),
+    });
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.stopReason).toBe("end_turn");
+    expect(body.text).toBe("selected 1");
+    expect(body.pendingInput).toBe("none");
   });
 
   test("prompt without text or select returns 400", async () => {
@@ -471,7 +712,66 @@ describe("daemon HTTP API", () => {
     expect(body.error).toContain("select");
   });
 
+  test("prompt returns 409 and pendingInput when plain text is sent during a pending question", async () => {
+    const { runtime } = await startTestServer();
+    const createRes = await fetch(`${baseUrl}/sessions`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({}),
+    });
+    const { sessionId } = await createRes.json();
+    runtime._state.pendingInput = "question";
+
+    const res = await fetch(`${baseUrl}/sessions/${sessionId}/prompt`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ text: "hello" }),
+    });
+    expect(res.status).toBe(409);
+    const body = await res.json();
+    expect(body.pendingInput).toBe("question");
+  });
+
+  test("prompt with select returns 409 when nothing is pending", async () => {
+    await startTestServer();
+    const createRes = await fetch(`${baseUrl}/sessions`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({}),
+    });
+    const { sessionId } = await createRes.json();
+
+    const res = await fetch(`${baseUrl}/sessions/${sessionId}/prompt`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ select: "2" }),
+    });
+    expect(res.status).toBe(409);
+    const body = await res.json();
+    expect(body.pendingInput).toBe("none");
+  });
+
   test("send with select fires the choice", async () => {
+    const { runtime } = await startTestServer();
+    const createRes = await fetch(`${baseUrl}/sessions`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({}),
+    });
+    const { sessionId } = await createRes.json();
+    runtime._state.pendingInput = "question";
+
+    const res = await fetch(`${baseUrl}/sessions/${sessionId}/send`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ select: "2" }),
+    });
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.ok).toBe(true);
+  });
+
+  test("send with select returns 409 when nothing is pending", async () => {
     await startTestServer();
     const createRes = await fetch(`${baseUrl}/sessions`, {
       method: "POST",
@@ -485,9 +785,9 @@ describe("daemon HTTP API", () => {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ select: "2" }),
     });
-    expect(res.status).toBe(200);
+    expect(res.status).toBe(409);
     const body = await res.json();
-    expect(body.ok).toBe(true);
+    expect(body.pendingInput).toBe("none");
   });
 
   test("send without text or select returns 400", async () => {
@@ -546,9 +846,7 @@ describe("daemon HTTP API", () => {
     expect(body.ok).toBe(true);
   });
 
-  // --- GET /sessions/:id/pending-question ---
-
-  test("pending-question returns no pending when none", async () => {
+  test("removed /pending-question route returns 404", async () => {
     await startTestServer();
     const createRes = await fetch(`${baseUrl}/sessions`, {
       method: "POST",
@@ -558,15 +856,10 @@ describe("daemon HTTP API", () => {
     const { sessionId } = await createRes.json();
 
     const res = await fetch(`${baseUrl}/sessions/${sessionId}/pending-question`);
-    expect(res.status).toBe(200);
-    const body = await res.json();
-    expect(body.pending).toBe(false);
-    expect(body.source).toBe("none");
+    expect(res.status).toBe(404);
   });
 
-  // --- POST /sessions/:id/permission ---
-
-  test("permission with none pending returns 409", async () => {
+  test("removed /permission route returns 404", async () => {
     await startTestServer();
     const createRes = await fetch(`${baseUrl}/sessions`, {
       method: "POST",
@@ -578,11 +871,9 @@ describe("daemon HTTP API", () => {
     const res = await fetch(`${baseUrl}/sessions/${sessionId}/permission`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ outcome: "cancelled" }),
+      body: JSON.stringify({ select: "1" }),
     });
-    expect(res.status).toBe(409);
-    const body = await res.json();
-    expect(body.error).toContain("no pending permission");
+    expect(res.status).toBe(404);
   });
 
   // --- DELETE /sessions/:id ---

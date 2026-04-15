@@ -9,6 +9,7 @@ import {
   type ClaudrabandPermissionDecision,
   type ClaudrabandPermissionRequest,
   type ClaudrabandSession,
+  type InternalClaudrabandSession,
   type SessionStatus,
   type TurnDetectionMode,
 } from "claudraband-core";
@@ -32,6 +33,7 @@ function looksLikeDeadSessionError(msg: string): boolean {
 interface DaemonSession {
   session: ClaudrabandSession;
   sseClients: Set<ServerResponse>;
+  responseCaptures: Set<{ text: string }>;
   pendingPermission: {
     request: ClaudrabandPermissionRequest;
     resolve: (decision: ClaudrabandPermissionDecision) => void;
@@ -47,6 +49,11 @@ interface SessionRequestBody {
   permissionMode?: string;
   turnDetection?: TurnDetectionMode;
   requireLive?: boolean;
+}
+
+interface PromptRequestBody {
+  text?: string;
+  select?: string;
 }
 
 function parseOptionalJsonObject<T = Record<string, unknown>>(
@@ -141,6 +148,11 @@ function createDaemonServer(
     payload: Record<string, unknown>,
   ): number {
     ds.lastEventSeq++;
+    if (payload.kind === "assistant_text" && typeof payload.text === "string") {
+      for (const capture of ds.responseCaptures) {
+        capture.text += payload.text;
+      }
+    }
     const data = JSON.stringify({
       seq: ds.lastEventSeq,
       ...payload,
@@ -149,6 +161,69 @@ function createDaemonServer(
       res.write(`data: ${data}\n\n`);
     }
     return ds.lastEventSeq;
+  }
+
+  async function getPendingInput(
+    ds: DaemonSession,
+  ): Promise<SessionStatus["pendingInput"]> {
+    if (ds.pendingPermission) {
+      return "permission";
+    }
+    const pendingState = await ds.session.hasPendingInput();
+    return pendingState.pending ? "question" : "none";
+  }
+
+  async function getStatusWithDaemonPending(
+    sessionId: string,
+    cwd?: string,
+  ): Promise<SessionStatus | null> {
+    const status = await runtime.getStatus(sessionId, cwd);
+    if (!status) return null;
+    const ds = getSession(sessionId);
+    if (!ds || !ds.session.isProcessAlive()) {
+      return status;
+    }
+    return {
+      ...status,
+      pendingInput: await getPendingInput(ds),
+    };
+  }
+
+  function permissionDecisionFromSelect(
+    request: ClaudrabandPermissionRequest,
+    select: string,
+    text: string | undefined,
+  ): ClaudrabandPermissionDecision {
+    const option = request.options.find((candidate) => candidate.optionId === select);
+    if (!option) {
+      throw new Error(`invalid selection ${JSON.stringify(select)}`);
+    }
+    if (option.textInput) {
+      if (!text) {
+        throw new Error(`selection ${JSON.stringify(select)} requires \`text\``);
+      }
+      return { outcome: "text", text };
+    }
+    if (text !== undefined) {
+      throw new Error(`selection ${JSON.stringify(select)} does not accept \`text\``);
+    }
+    return { outcome: "selected", optionId: option.optionId };
+  }
+
+  function promptConflictBody(
+    sessionId: string,
+    cwd: string,
+    pendingInput: SessionStatus["pendingInput"],
+  ): Record<string, unknown> {
+    return {
+      error:
+        pendingInput === "none"
+          ? `session ${sessionId} has no pending input`
+          : `session ${sessionId} has pending ${pendingInput} input; use \`select\` to answer it`,
+      sessionId,
+      cwd,
+      pendingInput,
+    };
   }
 
   async function handlePermission(
@@ -277,6 +352,7 @@ function createDaemonServer(
         const ds: DaemonSession = {
           session: null as unknown as ClaudrabandSession,
           sseClients: new Set(),
+          responseCaptures: new Set(),
           pendingPermission: null,
           lastEventSeq: 0,
         };
@@ -347,7 +423,7 @@ function createDaemonServer(
 
       // GET /sessions/:id/status
       if (method === "GET" && action === "status") {
-        const status = await runtime.getStatus(sessionId, cwd);
+        const status = await getStatusWithDaemonPending(sessionId, cwd);
         if (!status) {
           err(res, 404, `session ${sessionId} not found`);
           return;
@@ -363,15 +439,13 @@ function createDaemonServer(
           err(res, 404, `session ${sessionId} not found`);
           return;
         }
+        const status = await getStatusWithDaemonPending(sessionId, summary.cwd);
         const text = await runtime.getLastMessage(sessionId, summary.cwd);
-        if (text === null) {
-          err(res, 404, `no assistant message found for session ${sessionId}`);
-          return;
-        }
         json(res, 200, {
           sessionId,
           cwd: summary.cwd,
           text,
+          pendingInput: status?.pendingInput ?? "none",
         });
         return;
       }
@@ -414,23 +488,76 @@ function createDaemonServer(
       // - text only: standard prompt + wait.
       if (method === "POST" && action === "prompt") {
         if (!requireLiveSession(res, sessionId, ds)) return;
-        const body = parseOptionalJsonObject<{ text?: string; select?: string }>(
+        const body = parseOptionalJsonObject<PromptRequestBody>(
           await readBody(req),
         );
         if (!body.text && !body.select) {
           err(res, 400, "prompt requires `text` or `select` in the request body");
           return;
         }
+        const pendingInput = await getPendingInput(ds);
+        if (!body.select && pendingInput !== "none") {
+          json(res, 409, promptConflictBody(sessionId, ds.session.cwd, pendingInput));
+          return;
+        }
+        let permissionDecision: ClaudrabandPermissionDecision | null = null;
+        if (body.select && pendingInput === "permission") {
+          const pending = ds.pendingPermission;
+          if (!pending) {
+            json(res, 409, promptConflictBody(sessionId, ds.session.cwd, "none"));
+            return;
+          }
+          try {
+            permissionDecision = permissionDecisionFromSelect(
+              pending.request,
+              body.select,
+              body.text,
+            );
+          } catch (error) {
+            err(
+              res,
+              400,
+              error instanceof Error ? error.message : String(error),
+            );
+            return;
+          }
+        }
+        if (body.select && pendingInput === "none") {
+          json(res, 409, promptConflictBody(sessionId, ds.session.cwd, "none"));
+          return;
+        }
+        const capture = { text: "" };
+        ds.responseCaptures.add(capture);
         const outcome = await runSessionOp(res, sessionId, ds, async () => {
-          const result = body.select
-            ? await ds.session.answerPending(body.select, body.text)
-            : await ds.session.prompt(body.text!);
-          await ds.session.flushEvents();
-          return result;
+          try {
+            const result = body.select
+              ? pendingInput === "permission"
+                ? await (async () => {
+                  const pending = ds.pendingPermission;
+                  if (!pending || !permissionDecision) {
+                    throw new Error("pending permission disappeared");
+                  }
+                  ds.pendingPermission = null;
+                  pending.resolve(permissionDecision);
+                  return (ds.session as InternalClaudrabandSession).awaitTurn();
+                })()
+                : ds.session.answerPending(body.select, body.text)
+              : ds.session.prompt(body.text!);
+            const settled = await result;
+            await ds.session.flushEvents();
+            return settled;
+          } finally {
+            ds.responseCaptures.delete(capture);
+          }
         });
         if (!outcome.ok) return;
+        const nextPendingInput = await getPendingInput(ds);
         json(res, 200, {
-          ...outcome.value,
+          sessionId,
+          cwd: ds.session.cwd,
+          stopReason: outcome.value.stopReason,
+          text: capture.text || null,
+          pendingInput: nextPendingInput,
           eventSeq: ds.lastEventSeq,
         });
         return;
@@ -442,14 +569,54 @@ function createDaemonServer(
       // first, then the optional `text` (matching `cband send --select`).
       if (method === "POST" && action === "send") {
         if (!requireLiveSession(res, sessionId, ds)) return;
-        const body = parseOptionalJsonObject<{ text?: string; select?: string }>(
+        const body = parseOptionalJsonObject<PromptRequestBody>(
           await readBody(req),
         );
         if (!body.text && !body.select) {
           err(res, 400, "send requires `text` or `select` in the request body");
           return;
         }
+        const pendingInput = await getPendingInput(ds);
+        if (!body.select && pendingInput !== "none") {
+          json(res, 409, promptConflictBody(sessionId, ds.session.cwd, pendingInput));
+          return;
+        }
+        let permissionDecision: ClaudrabandPermissionDecision | null = null;
+        if (body.select && pendingInput === "permission") {
+          const pending = ds.pendingPermission;
+          if (!pending) {
+            json(res, 409, promptConflictBody(sessionId, ds.session.cwd, "none"));
+            return;
+          }
+          try {
+            permissionDecision = permissionDecisionFromSelect(
+              pending.request,
+              body.select,
+              body.text,
+            );
+          } catch (error) {
+            err(
+              res,
+              400,
+              error instanceof Error ? error.message : String(error),
+            );
+            return;
+          }
+        }
+        if (body.select && pendingInput === "none") {
+          json(res, 409, promptConflictBody(sessionId, ds.session.cwd, "none"));
+          return;
+        }
         const outcome = await runSessionOp(res, sessionId, ds, async () => {
+          if (body.select && pendingInput === "permission") {
+            const pending = ds.pendingPermission;
+            if (!pending || !permissionDecision) {
+              throw new Error("pending permission disappeared");
+            }
+            ds.pendingPermission = null;
+            pending.resolve(permissionDecision);
+            return;
+          }
           if (body.select) {
             await ds.session.send(body.select);
           }
@@ -483,33 +650,6 @@ function createDaemonServer(
           client.end();
         }
         json(res, 200, { ok: true });
-        return;
-      }
-
-      // POST /sessions/:id/permission
-      if (method === "POST" && action === "permission") {
-        if (!ds.pendingPermission) {
-          err(res, 409, "no pending permission request");
-          return;
-        }
-        const body = JSON.parse(await readBody(req)) as ClaudrabandPermissionDecision;
-        ds.pendingPermission.resolve(body);
-        ds.pendingPermission = null;
-        json(res, 200, { ok: true });
-        return;
-      }
-
-      // GET /sessions/:id/pending-question
-      if (method === "GET" && action === "pending-question") {
-        if (ds.pendingPermission !== null) {
-          json(res, 200, { pending: true, source: "permission_request" });
-          return;
-        }
-        const pendingState = await ds.session.hasPendingInput();
-        json(res, 200, {
-          pending: pendingState.pending,
-          source: pendingState.source,
-        });
         return;
       }
 

@@ -27,7 +27,7 @@ Send a prompt and wait for Claude to finish its turn.
 
 - Without `--session`, a new session is created.
 - With `--session <id>`, the saved session is auto-resumed. If the id has no saved transcript, the command errors with `session not found`.
-- With `--select <choice>`, answers a pending `AskUserQuestion` or permission prompt, then returns the turn that follows. Optional trailing text is sent after the selection.
+- With `--select <choice>`, answers a pending `AskUserQuestion` or permission prompt, then returns the turn that follows. If the selected option accepts free text, pass it as the trailing prompt argument.
 
 Examples:
 
@@ -36,7 +36,7 @@ cband prompt "review the staged diff"
 cband prompt --session abc-123 "keep going"
 cband prompt --session abc-123 --select 2
 cband prompt --session abc-123 --select 3 "xyz"
-cband prompt --session abc-123 --select 0 "new direction"
+cband prompt --session abc-123 --select 3 "new direction"
 ```
 
 ### `cband send [--session <id>] [--select <choice>] <text...>`
@@ -44,19 +44,21 @@ cband prompt --session abc-123 --select 0 "new direction"
 Send input without waiting for a turn to complete. Returns as soon as the input is delivered. Use `watch`, `status`, or `last` to observe the response.
 
 - `--session <id>` auto-resumes the saved session (errors if missing).
-- `--select <choice>` fires a pending-answer selection. Optional trailing text is sent after the selection.
+- `--select <choice>` fires a pending-answer selection. If the selected option accepts free text, pass it as the trailing argument.
 
 Examples:
 
 ```sh
 cband send --session abc-123 "quick note"
 cband send --session abc-123 --select 2
-cband send --session abc-123 --select 0 "new direction"
+cband send --session abc-123 --select 3 "new direction"
 ```
 
 ### `cband watch --session <id> [--pretty] [--no-follow]`
 
 Stream events from a session. When a daemon owns the session this connects to the SSE stream; otherwise it replays the local transcript. One event per line as JSON by default.
+
+For daemon-backed sessions, `watch` is mainly the streaming companion to `send`. `prompt` already waits for the turn and prints the completed assistant response directly.
 
 - `--pretty` renders events as human-readable text.
 - `--no-follow` exits after the next `turn_end`.
@@ -144,7 +146,7 @@ Run `claudraband` as an ACP server over stdio.
 | Flag | Description |
 |---|---|
 | `--session <id>` | Resume the saved session with this id |
-| `--select <choice>` | Answer a pending question. `0` is the sentinel for Other and requires trailing text. Requires `--session`. |
+| `--select <choice>` | Answer a pending question or permission prompt. If that option expects text, pass it as the trailing argument. Requires `--session`. |
 | `--connect <host:port>` | Route the session through a running daemon. Valid for new sessions. |
 
 ### `watch`

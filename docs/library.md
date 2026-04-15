@@ -65,7 +65,7 @@ Returned by `openSession`.
 |---|---|
 | `prompt(text)` | Send a prompt and wait for the turn to complete |
 | `send(text)` | Send raw input to the terminal without waiting |
-| `answerPending(choice, text?)` | Answer a pending `AskUserQuestion`. Optional `text` is sent after the selection (used for the "Other" option, choice `"0"`). |
+| `answerPending(choice, text?)` | Answer a pending `AskUserQuestion`. Optional `text` is sent after the selection when the chosen option accepts free text. |
 | `interrupt()` | Send Ctrl-C to cancel the in-progress turn |
 | `stop()` | Kill the Claude Code process |
 | `detach()` | Disconnect without killing (tmux window stays alive) |
@@ -177,7 +177,7 @@ const session = await runtime.openSession({
 // Select a numbered option
 { outcome: "selected", optionId: "1" }
 
-// Send free-text (for AskUserQuestion's "Type a response" option)
+// Send free-text for a text-input option
 { outcome: "text", text: "use the blue theme" }
 
 // Leave the question pending (session stays alive, answer later)

@@ -26,7 +26,7 @@ The HTTP surface mirrors the CLI verbs. Every aligned verb has a matching CLI co
 | Last | `GET /sessions/:id/last` | `last` | `runtime.getLastMessage(id, cwd)` |
 | Status | `GET /sessions/:id/status` | `status` | `runtime.getStatus(id, cwd?)` |
 
-`/prompt` and `/send` mirror the CLI verbs exactly. The only difference is when the response returns: `/prompt` waits for the assistant's turn to complete, `/send` returns as soon as the input is delivered. Both accept `select` in the request body for answering a pending question (the daemon equivalent of the CLI `--select` flag).
+Use `/prompt` when you want a single request/response call that returns the completed assistant text as JSON. Use `/send` when you want fire-and-forget delivery and pair it with `/watch` for live streaming. Both endpoints accept `select` in the request body for answering pending questions or permission prompts.
 
 ## Sessions
 
@@ -120,7 +120,7 @@ Response:
 }
 ```
 
-`pendingInput` is one of `"none"`, `"question"` (the transcript has an unresolved `AskUserQuestion`), or `"permission"` (a native permission prompt is visible in the live pane).
+`pendingInput` is one of `"none"`, `"question"` (the transcript has an unresolved `AskUserQuestion`), or `"permission"` (the daemon is currently holding an unresolved native permission prompt).
 
 ### `GET /sessions/:id/last`
 
@@ -136,11 +136,12 @@ Response:
 {
   "sessionId": "abc-123",
   "cwd": "/path/to/project",
-  "text": "The riskiest part of this change is the migration ordering..."
+  "text": "The riskiest part of this change is the migration ordering...",
+  "pendingInput": "none"
 }
 ```
 
-If the session exists but has no completed assistant turn yet, the daemon returns `404`.
+`text` is `null` when the session exists but has no completed assistant turn yet.
 
 ## Prompting
 
@@ -154,16 +155,16 @@ Request body:
 { "text": "explain the auth middleware" }
 ```
 
-To answer a pending `AskUserQuestion` (the daemon equivalent of `cband prompt --select`), pass `select` instead of (or alongside) `text`:
+To answer a pending `AskUserQuestion` or permission prompt, pass `select` instead of (or alongside) `text`:
 
 ```json
 { "select": "2" }
 ```
 
-For the "Other" option (`select: "0"`), pass the free-text answer in `text`:
+When the selected option expects free text, include `text` as well:
 
 ```json
-{ "select": "0", "text": "use the blue theme" }
+{ "select": "3", "text": "use the blue theme" }
 ```
 
 The body must contain `text`, `select`, or both. Empty bodies return `400`.
@@ -172,16 +173,22 @@ Response:
 
 ```json
 {
+  "sessionId": "abc-123",
+  "cwd": "/path/to/project",
   "stopReason": "end_turn",
+  "text": "The auth middleware rejects unauthenticated requests before the route handler runs.",
+  "pendingInput": "none",
   "eventSeq": 42
 }
 ```
 
-`eventSeq` is the last SSE sequence number emitted for this completed turn. The official daemon client uses it to wait until all matching events have been rendered before disconnecting.
+`text` is the assistant text produced by this completed turn. `pendingInput` signals whether Claude ended by asking for more input. `eventSeq` is the last SSE sequence number emitted for that turn; it is only useful for clients that are also consuming `/watch`.
+
+If the session is already blocked on a pending question or permission prompt and the request body omits `select`, the daemon returns `409` and includes `pendingInput` in the JSON error body.
 
 ### `POST /sessions/:id/send`
 
-Write input and return as soon as it is delivered. Mirrors `cband send`. Does not wait for a turn to finish.
+Write input and return as soon as it is delivered. Mirrors `cband send`. Does not wait for a turn to finish. Pair this with `/watch` when you want live streamed output.
 
 Request body shape is identical to `/prompt`:
 
@@ -189,14 +196,14 @@ Request body shape is identical to `/prompt`:
 { "text": "2" }
 ```
 
-Or with `select` (and optional follow-up `text`) to fire a pending-question answer without waiting:
+Or with `select` (and optional follow-up `text`) to answer a pending question or permission prompt without waiting:
 
 ```json
 { "select": "2" }
 ```
 
 ```json
-{ "select": "0", "text": "use the blue theme" }
+{ "select": "3", "text": "use the blue theme" }
 ```
 
 The body must contain `text`, `select`, or both. Empty bodies return `400`.
@@ -221,7 +228,7 @@ Response:
 
 ### `GET /sessions/:id/watch`
 
-Open an SSE stream for live session events. This is the daemon side of the `watch` verb.
+Open an SSE stream for live session events. This is the daemon side of the `watch` verb and is the streaming companion to `/send`.
 
 The daemon sends a ready event immediately after the stream opens:
 
@@ -259,57 +266,6 @@ data: {"seq":5,"type":"permission_request","title":"Run bash command","options":
 
 If a permission request is already pending when the SSE connection opens, it is sent immediately after the ready event.
 
-## Permissions and pending input
-
-### `GET /sessions/:id/pending-question`
-
-Check whether the live session is blocked on user input.
-
-Response:
-
-```json
-{
-  "pending": true,
-  "source": "permission_request"
-}
-```
-
-`source` is one of:
-
-- `"none"`
-- `"permission_request"`
-- `"terminal"`
-
-### `POST /sessions/:id/permission`
-
-Resolve a pending permission request that was surfaced over SSE.
-
-Select an option:
-
-```json
-{ "outcome": "selected", "optionId": "1" }
-```
-
-Send free text:
-
-```json
-{ "outcome": "text", "text": "use the blue theme" }
-```
-
-Cancel:
-
-```json
-{ "outcome": "cancelled" }
-```
-
-Response:
-
-```json
-{ "ok": true }
-```
-
-Returns `409` if no permission request is pending.
-
 ## Errors
 
 All errors return a JSON body:
@@ -322,5 +278,5 @@ All errors return a JSON body:
 |---|---|
 | `400` | Bad request, such as a non-UUID `sessionId` |
 | `404` | Session not found, or unknown route |
-| `409` | Conflict, such as no pending permission |
+| `409` | Conflict, such as missing `select` while input is pending, or `select` with no pending input |
 | `500` | Internal server error |
