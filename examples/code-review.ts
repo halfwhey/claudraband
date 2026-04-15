@@ -27,7 +27,7 @@ const runtime = createClaudraband({
   permissionMode: "acceptEdits",
 });
 
-const session = await runtime.startSession({
+const session = await runtime.openSession({
   cwd: process.cwd(),
   onPermissionRequest: async (request) => ({
     outcome: "selected" as const,

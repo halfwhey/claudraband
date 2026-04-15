@@ -5,10 +5,12 @@ import type {
   Claudraband,
   ClaudrabandEvent,
   ClaudrabandSession,
+  OpenSessionOptions,
   PromptResult,
+  SessionStatus,
   SessionSummary,
 } from "claudraband-core";
-import { EventKind } from "claudraband-core";
+import { EventKind, SessionNotFoundError } from "claudraband-core";
 import type { CliConfig } from "./args";
 import { __test } from "./server";
 
@@ -22,14 +24,19 @@ function makeConfig(overrides: Partial<CliConfig> = {}): CliConfig {
     cwd: "/test-cwd",
     hasExplicitCwd: false,
     debug: false,
+    json: false,
+    pretty: false,
+    follow: true,
     claudeArgs: [],
     hasExplicitClaudeArgs: false,
     hasExplicitModel: false,
     hasExplicitPermissionMode: false,
     hasExplicitTerminalBackend: false,
+    hasExplicitTurnDetection: false,
     model: "haiku",
     permissionMode: "default",
     terminalBackend: "xterm",
+    turnDetection: "terminal",
     connect: "",
     host: "127.0.0.1",
     port: 0, // random port
@@ -53,13 +60,10 @@ function makeMockSession(id: string): ClaudrabandSession {
     async prompt(_text: string): Promise<PromptResult> {
       return { stopReason: "end_turn" };
     },
-    async awaitTurn(): Promise<PromptResult> {
-      return { stopReason: "end_turn" };
-    },
-    async sendAndAwaitTurn(_text: string): Promise<PromptResult> {
-      return { stopReason: "end_turn" };
-    },
     async send(_text: string) {},
+    async answerPending(_choice: string, _text?: string): Promise<PromptResult> {
+      return { stopReason: "end_turn" };
+    },
     async interrupt() {},
     async stop() {
       alive = false;
@@ -83,21 +87,19 @@ function makeMockSession(id: string): ClaudrabandSession {
 function makeMockRuntime(): Claudraband & { _lastSession: ClaudrabandSession | null } {
   const rt: Claudraband & { _lastSession: ClaudrabandSession | null } = {
     _lastSession: null,
-    async startSession(_options) {
-      const id = randomUUID();
+    async openSession(options?: OpenSessionOptions) {
+      const id = options?.sessionId ?? randomUUID();
+      if (options?.sessionId && rt._lastSession?.sessionId !== options.sessionId) {
+        throw new SessionNotFoundError(options.sessionId);
+      }
       const session = makeMockSession(id);
-      rt._lastSession = session;
-      return session;
-    },
-    async resumeSession(sessionId, _options) {
-      const session = makeMockSession(sessionId);
       rt._lastSession = session;
       return session;
     },
     async listSessions() {
       return [];
     },
-    async inspectSession(sessionId) {
+    async inspectSession(sessionId: string) {
       if (rt._lastSession?.sessionId !== sessionId) {
         return null;
       }
@@ -119,6 +121,21 @@ function makeMockRuntime(): Claudraband & { _lastSession: ClaudrabandSession | n
         },
       };
       return session;
+    },
+    async getStatus(sessionId: string) {
+      const summary = await rt.inspectSession(sessionId);
+      if (!summary) return null;
+      const status: SessionStatus = {
+        ...summary,
+        turnInProgress: false,
+        pendingInput: "none",
+      };
+      return status;
+    },
+    async getLastMessage(sessionId: string, cwd: string) {
+      const events = await rt.replaySession(sessionId, cwd);
+      const { extractLastAssistantTurn } = await import("claudraband-core");
+      return extractLastAssistantTurn(events);
     },
     async closeSession() {
       return true;
@@ -221,20 +238,6 @@ describe("daemon HTTP API", () => {
     expect(res.status).toBe(201);
     const body = await res.json();
     expect(body.sessionId).toBeString();
-    expect(body.backend).toBe("xterm");
-  });
-
-  test("create session respects a caller-provided sessionId", async () => {
-    await startTestServer();
-    const callerSessionId = randomUUID();
-    const res = await fetch(`${baseUrl}/sessions`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ sessionId: callerSessionId }),
-    });
-    expect(res.status).toBe(201);
-    const body = await res.json();
-    expect(body.sessionId).toBe(callerSessionId);
     expect(body.backend).toBe("xterm");
   });
 
@@ -408,9 +411,9 @@ describe("daemon HTTP API", () => {
     expect(body.error).toContain("not live");
   });
 
-  // --- POST /sessions/:id/send-and-await-turn ---
+  // --- POST /sessions/:id/prompt with `select` (replaces removed /answer) ---
 
-  test("send-and-await-turn returns stopReason", async () => {
+  test("prompt with select answers a pending question", async () => {
     await startTestServer();
     const createRes = await fetch(`${baseUrl}/sessions`, {
       method: "POST",
@@ -419,19 +422,17 @@ describe("daemon HTTP API", () => {
     });
     const { sessionId } = await createRes.json();
 
-    const res = await fetch(`${baseUrl}/sessions/${sessionId}/send-and-await-turn`, {
+    const res = await fetch(`${baseUrl}/sessions/${sessionId}/prompt`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ text: "1" }),
+      body: JSON.stringify({ select: "1" }),
     });
     expect(res.status).toBe(200);
     const body = await res.json();
     expect(body.stopReason).toBe("end_turn");
   });
 
-  // --- POST /sessions/:id/await-turn ---
-
-  test("await-turn returns stopReason", async () => {
+  test("prompt with select+text answers and sends follow-up text", async () => {
     await startTestServer();
     const createRes = await fetch(`${baseUrl}/sessions`, {
       method: "POST",
@@ -440,12 +441,90 @@ describe("daemon HTTP API", () => {
     });
     const { sessionId } = await createRes.json();
 
-    const res = await fetch(`${baseUrl}/sessions/${sessionId}/await-turn`, {
+    const res = await fetch(`${baseUrl}/sessions/${sessionId}/prompt`, {
       method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ select: "0", text: "use the blue theme" }),
     });
     expect(res.status).toBe(200);
     const body = await res.json();
     expect(body.stopReason).toBe("end_turn");
+  });
+
+  test("prompt without text or select returns 400", async () => {
+    await startTestServer();
+    const createRes = await fetch(`${baseUrl}/sessions`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({}),
+    });
+    const { sessionId } = await createRes.json();
+
+    const res = await fetch(`${baseUrl}/sessions/${sessionId}/prompt`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({}),
+    });
+    expect(res.status).toBe(400);
+    const body = await res.json();
+    expect(body.error).toContain("text");
+    expect(body.error).toContain("select");
+  });
+
+  test("send with select fires the choice", async () => {
+    await startTestServer();
+    const createRes = await fetch(`${baseUrl}/sessions`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({}),
+    });
+    const { sessionId } = await createRes.json();
+
+    const res = await fetch(`${baseUrl}/sessions/${sessionId}/send`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ select: "2" }),
+    });
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.ok).toBe(true);
+  });
+
+  test("send without text or select returns 400", async () => {
+    await startTestServer();
+    const createRes = await fetch(`${baseUrl}/sessions`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({}),
+    });
+    const { sessionId } = await createRes.json();
+
+    const res = await fetch(`${baseUrl}/sessions/${sessionId}/send`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({}),
+    });
+    expect(res.status).toBe(400);
+    const body = await res.json();
+    expect(body.error).toContain("text");
+    expect(body.error).toContain("select");
+  });
+
+  test("removed /answer route returns 404", async () => {
+    await startTestServer();
+    const createRes = await fetch(`${baseUrl}/sessions`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({}),
+    });
+    const { sessionId } = await createRes.json();
+
+    const res = await fetch(`${baseUrl}/sessions/${sessionId}/answer`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ choice: "1" }),
+    });
+    expect(res.status).toBe(404);
   });
 
   // --- POST /sessions/:id/interrupt ---
@@ -538,9 +617,9 @@ describe("daemon HTTP API", () => {
     expect(res.status).toBe(404);
   });
 
-  // --- GET /sessions/:id/events (SSE) ---
+  // --- GET /sessions/:id/watch (SSE) ---
 
-  test("events stream sends ready event", async () => {
+  test("watch stream sends ready event", async () => {
     await startTestServer();
     const createRes = await fetch(`${baseUrl}/sessions`, {
       method: "POST",
@@ -550,7 +629,7 @@ describe("daemon HTTP API", () => {
     const { sessionId } = await createRes.json();
 
     const controller = new AbortController();
-    const res = await fetch(`${baseUrl}/sessions/${sessionId}/events`, {
+    const res = await fetch(`${baseUrl}/sessions/${sessionId}/watch`, {
       signal: controller.signal,
     });
     expect(res.status).toBe(200);
@@ -564,9 +643,7 @@ describe("daemon HTTP API", () => {
     controller.abort();
   });
 
-  // --- POST /sessions/:id/resume ---
-
-  test("resume live session returns reattached true", async () => {
+  test("removed /events route returns 404", async () => {
     await startTestServer();
     const createRes = await fetch(`${baseUrl}/sessions`, {
       method: "POST",
@@ -575,18 +652,13 @@ describe("daemon HTTP API", () => {
     });
     const { sessionId } = await createRes.json();
 
-    const res = await fetch(`${baseUrl}/sessions/${sessionId}/resume`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({}),
-    });
-    expect(res.status).toBe(200);
-    const body = await res.json();
-    expect(body.sessionId).toBe(sessionId);
-    expect(body.reattached).toBe(true);
+    const res = await fetch(`${baseUrl}/sessions/${sessionId}/events`);
+    expect(res.status).toBe(404);
   });
 
-  test("resume accepts an empty request body", async () => {
+  // --- POST /sessions with sessionId (resume path) ---
+
+  test("POST /sessions with existing sessionId returns resumed=true", async () => {
     await startTestServer();
     const createRes = await fetch(`${baseUrl}/sessions`, {
       method: "POST",
@@ -595,64 +667,27 @@ describe("daemon HTTP API", () => {
     });
     const { sessionId } = await createRes.json();
 
-    const res = await fetch(`${baseUrl}/sessions/${sessionId}/resume`, {
+    const res = await fetch(`${baseUrl}/sessions`, {
       method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ sessionId }),
     });
     expect(res.status).toBe(200);
     const body = await res.json();
     expect(body.sessionId).toBe(sessionId);
-    expect(body.reattached).toBe(true);
+    expect(body.resumed).toBe(true);
   });
 
-  test("resume non-existent session with requireLive returns 409", async () => {
-    await startTestServer();
-    const deadSessionId = randomUUID();
-    const res = await fetch(`${baseUrl}/sessions/${deadSessionId}/resume`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ requireLive: true, cwd: "/tmp" }),
-    });
-    expect(res.status).toBe(409);
-    const body = await res.json();
-    expect(body.error).toContain("not live");
-  });
-
-  test("resume non-existent session without requireLive creates new", async () => {
+  test("POST /sessions with unknown sessionId returns 404", async () => {
     await startTestServer();
     const orphanId = randomUUID();
-    const res = await fetch(`${baseUrl}/sessions/${orphanId}/resume`, {
+    const res = await fetch(`${baseUrl}/sessions`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ cwd: "/tmp" }),
-    });
-    expect(res.status).toBe(200);
-    const body = await res.json();
-    expect(body.sessionId).toBe(orphanId);
-    expect(body.reattached).toBe(false);
-  });
-
-  test("resume of an unknown session without cwd returns 404", async () => {
-    await startTestServer();
-    const orphanId = randomUUID();
-    const res = await fetch(`${baseUrl}/sessions/${orphanId}/resume`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({}),
+      body: JSON.stringify({ sessionId: orphanId }),
     });
     expect(res.status).toBe(404);
     const body = await res.json();
     expect(body.error).toContain("not found");
-  });
-
-  test("resume with a non-UUID sessionId returns 400", async () => {
-    await startTestServer();
-    const res = await fetch(`${baseUrl}/sessions/not-a-uuid/resume`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ cwd: "/tmp" }),
-    });
-    expect(res.status).toBe(400);
-    const body = await res.json();
-    expect(body.error).toContain("UUID");
   });
 });

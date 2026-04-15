@@ -39,7 +39,19 @@ describe("claudraband cli help", () => {
     expect(captureHelp(["sessions", "close", "--help"])).toBe(renderHelp("session-close"));
   });
 
-  test("prints continue help", () => {
-    expect(captureHelp(["continue", "--help"])).toBe(renderHelp("continue"));
+  test("prints prompt help", () => {
+    expect(captureHelp(["prompt", "--help"])).toBe(renderHelp("prompt"));
+  });
+
+  test("prints send help", () => {
+    expect(captureHelp(["send", "--help"])).toBe(renderHelp("send"));
+  });
+
+  test("prints watch help", () => {
+    expect(captureHelp(["watch", "--help"])).toBe(renderHelp("watch"));
+  });
+
+  test("prints interrupt help", () => {
+    expect(captureHelp(["interrupt", "--help"])).toBe(renderHelp("interrupt"));
   });
 });

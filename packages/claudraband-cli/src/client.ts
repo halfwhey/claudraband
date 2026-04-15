@@ -57,7 +57,7 @@ export async function requestPermission(
   // answer it later from the CLI.
   if (!config.interactive) {
     process.stderr.write(
-      "  -> deferred (use 'cband continue <id> --select <choice> [text]' to answer)\n",
+      "  -> deferred (use 'cband prompt --session <id> --select <choice> [text]' to answer)\n",
     );
     return { outcome: "deferred" };
   }

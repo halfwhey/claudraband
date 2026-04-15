@@ -9,6 +9,7 @@ import type {
   PermissionMode,
   PromptResult,
   ResolvedTerminalBackend,
+  TurnDetectionMode,
 } from "claudraband-core";
 import { EventKind } from "claudraband-core";
 import type { CliConfig } from "./args";
@@ -17,7 +18,7 @@ import type { Renderer } from "./render";
 
 interface DaemonSessionInfo {
   sessionId: string;
-  reattached?: boolean;
+  resumed?: boolean;
   backend: ResolvedTerminalBackend;
 }
 
@@ -27,6 +28,7 @@ interface DaemonSessionRequestBody {
   claudeArgs?: string[];
   model?: string;
   permissionMode?: PermissionMode;
+  turnDetection?: TurnDetectionMode;
   requireLive?: boolean;
 }
 
@@ -125,30 +127,21 @@ function buildSessionRequestBody(
     ...(config.hasExplicitPermissionMode
       ? { permissionMode: config.permissionMode }
       : {}),
+    ...(config.hasExplicitTurnDetection
+      ? { turnDetection: config.turnDetection }
+      : {}),
     ...(options.requireLive !== undefined
       ? { requireLive: options.requireLive }
       : {}),
   };
 }
 
-async function answerPendingSelection(
-  session: Pick<ClaudrabandSession, "send" | "sendAndAwaitTurn">,
-  optionId: string,
-  text?: string,
-): Promise<PromptResult> {
-  if (optionId === "0" && text) {
-    await session.sendAndAwaitTurn(optionId);
-    return session.sendAndAwaitTurn(text);
-  }
-  if (text) {
-    await session.send(optionId);
-    return session.sendAndAwaitTurn(text);
-  }
-  return session.sendAndAwaitTurn(optionId);
-}
-
 function isSelectionFlow(config: CliConfig): boolean {
-  return config.command === "continue" && Boolean(config.answer);
+  return (
+    config.command === "prompt"
+    && Boolean(config.answer)
+    && Boolean(config.sessionId)
+  );
 }
 
 function connectSSE(
@@ -157,7 +150,7 @@ function connectSSE(
   onEvent: (data: Record<string, unknown>) => void,
   onClose: () => void,
 ): { abort: () => void; ready: Promise<void> } {
-  const url = new URL(daemonUrl(server, `/sessions/${sessionId}/events`));
+  const url = new URL(daemonUrl(server, `/sessions/${sessionId}/watch`));
   let readyResolved = false;
   let resolveReady!: () => void;
   let rejectReady!: (error: unknown) => void;
@@ -337,22 +330,19 @@ class DaemonSessionProxy implements ClaudrabandSession {
     return result as DaemonPromptResult;
   }
 
-  async awaitTurn(): Promise<PromptResult> {
-    const result = await daemonPost(this.server, `/sessions/${this.sessionId}/await-turn`);
-    return result as DaemonPromptResult;
-  }
-
-  async sendAndAwaitTurn(text: string): Promise<PromptResult> {
-    const result = await daemonPost(
-      this.server,
-      `/sessions/${this.sessionId}/send-and-await-turn`,
-      { text },
-    );
-    return result as DaemonPromptResult;
-  }
-
   async send(text: string): Promise<void> {
     await daemonPost(this.server, `/sessions/${this.sessionId}/send`, { text });
+  }
+
+  async answerPending(choice: string, text?: string): Promise<PromptResult> {
+    // Mirror the CLI: pending-question answers go through /prompt with a
+    // `select` field. The daemon dispatches to `session.answerPending`.
+    const result = await daemonPost(
+      this.server,
+      `/sessions/${this.sessionId}/prompt`,
+      text !== undefined ? { select: choice, text } : { select: choice },
+    );
+    return result as DaemonPromptResult;
   }
 
   async interrupt(): Promise<void> {
@@ -440,25 +430,25 @@ export async function runWithDaemon(
   let sessionId: string;
   let sessionBackend: ResolvedTerminalBackend;
 
-  if (config.command === "continue" || config.command === "attach") {
-    // Resume existing session on daemon.
-    const result = (await daemonPost(config.connect, `/sessions/${config.sessionId}/resume`, {
-      ...buildSessionRequestBody(config, { requireLive: isSelectionFlow(config) }),
+  if (config.sessionId) {
+    // Resume existing session (or reattach if already live on the daemon).
+    const result = (await daemonPost(config.connect, "/sessions", {
+      ...buildSessionRequestBody(config, { sessionId: config.sessionId }),
     })) as DaemonSessionInfo;
-    if (isSelectionFlow(config) && result.reattached !== true) {
+    if (isSelectionFlow(config) && result.resumed !== true) {
       process.stderr.write(
         `error: session ${config.sessionId} is not live on the daemon. Cannot use --select on a pending question.\n`,
       );
       process.exit(1);
     }
-    sessionId = config.sessionId;
+    sessionId = result.sessionId;
     sessionBackend = result.backend;
   } else {
     // Create new session on daemon.
-    sessionId = randomUUID();
-    process.stderr.write(`session: ${sessionId}\n`);
+    const newId = randomUUID();
+    process.stderr.write(`session: ${newId}\n`);
     const result = (await daemonPost(config.connect, "/sessions", {
-      ...buildSessionRequestBody(config, { sessionId }),
+      ...buildSessionRequestBody(config, { sessionId: newId }),
     })) as DaemonSessionInfo;
     sessionId = result.sessionId;
     sessionBackend = result.backend;
@@ -497,27 +487,24 @@ export async function runWithDaemon(
         process.stderr.write(`error: session ${sessionId} has no pending question.\n`);
         process.exit(1);
       }
-      const turnResult = result.source === "permission_request"
-        ? await session.awaitTurn()
-        : await answerPendingSelection(
-          session,
-          config.answer,
-          config.prompt || undefined,
-        );
+      const turnResult = await session.answerPending(
+        config.answer,
+        config.prompt || undefined,
+      );
       await session.waitForRenderedSeq((turnResult as DaemonPromptResult).eventSeq);
       renderer.ensureNewline();
       if (config.debug) {
         process.stderr.write(`stop: ${turnResult.stopReason}\n`);
       }
-    } else if (config.command === "prompt" || config.command === "continue") {
-      if (config.command === "continue") {
+    } else if (config.command === "prompt") {
+      if (config.sessionId) {
         const pending = (await daemonGet(
           config.connect,
           `/sessions/${sessionId}/pending-question`,
         )) as PendingQuestionResponse;
         if (pending.pending) {
           process.stderr.write(
-            `error: session ${sessionId} has a pending question or permission prompt. Use 'cband continue ${sessionId} --select <choice> [text]'.\n`,
+            `error: session ${sessionId} has a pending question or permission prompt. Use 'cband prompt --session ${sessionId} --select <choice> [text]'.\n`,
           );
           process.exit(1);
         }
@@ -527,6 +514,13 @@ export async function runWithDaemon(
       renderer.ensureNewline();
       if (config.debug) {
         process.stderr.write(`stop: ${result.stopReason}\n`);
+      }
+    } else if (config.command === "send") {
+      if (config.answer) {
+        await session.send(config.answer);
+      }
+      if (config.prompt) {
+        await session.send(config.prompt);
       }
     }
 
@@ -557,7 +551,66 @@ export async function runWithDaemon(
   }
 }
 
+export async function runWatchWithDaemon(
+  server: string,
+  sessionId: string,
+  pretty: boolean,
+  follow: boolean,
+): Promise<void> {
+  let exitOnNextTurnEnd = !follow;
+  const sawTurnEnd = { done: false };
+  await new Promise<void>((resolve, reject) => {
+    const { abort, ready } = connectSSE(
+      server,
+      sessionId,
+      (data) => {
+        if (data.type === "ready") return;
+        if (data.type === "permission_request") {
+          // Render permission request as its own kind so watchers see it.
+          writeSseEvent(data, pretty);
+          return;
+        }
+        writeSseEvent(data, pretty);
+        if (exitOnNextTurnEnd && data.kind === "turn_end") {
+          sawTurnEnd.done = true;
+          abort();
+          resolve();
+        }
+      },
+      () => {
+        if (!sawTurnEnd.done) resolve();
+      },
+    );
+    ready.catch((err) => {
+      abort();
+      reject(err);
+    });
+    process.on("SIGINT", () => {
+      exitOnNextTurnEnd = false;
+      abort();
+      resolve();
+    });
+  });
+}
+
+function writeSseEvent(data: Record<string, unknown>, pretty: boolean): void {
+  if (pretty) {
+    const kind = String(data.kind ?? data.type ?? "?");
+    const text = data.text ? String(data.text).replace(/\n/g, "\\n") : "";
+    const time = data.time ? String(data.time) : new Date().toISOString();
+    process.stdout.write(`${time} ${kind} ${text}\n`);
+    return;
+  }
+  process.stdout.write(`${JSON.stringify(data)}\n`);
+}
+
+export async function runInterruptWithDaemon(
+  server: string,
+  sessionId: string,
+): Promise<void> {
+  await daemonPost(server, `/sessions/${sessionId}/interrupt`);
+}
+
 export const __test = {
-  answerPendingSelection,
   buildSessionRequestBody,
 };

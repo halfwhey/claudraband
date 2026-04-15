@@ -14,7 +14,7 @@ npm install @halfwhey/claudraband
 import { createClaudraband } from "@halfwhey/claudraband";
 
 const runtime = createClaudraband({ model: "sonnet" });
-const session = await runtime.startSession({ cwd: "/my/project" });
+const session = await runtime.openSession({ cwd: "/my/project" });
 
 const result = await session.prompt("explain the entry point");
 console.log(result.stopReason); // "end_turn"
@@ -43,30 +43,30 @@ By default, the runtime resolves bundled Claude Code `@anthropic-ai/claude-code@
 
 | Method | Description |
 |---|---|
-| `startSession(options?)` | Start a new Claude Code session |
-| `resumeSession(sessionId, options?)` | Reattach to an existing session |
+| `openSession(options?)` | Start a new session, or auto-resume when `options.sessionId` is provided. Throws `SessionNotFoundError` if the id has no saved transcript. |
 | `listSessions(cwd?)` | List live registry-backed sessions plus transcript-backed history |
-| `inspectSession(sessionId, cwd?)` | Inspect one live or historical session |
+| `inspectSession(sessionId, cwd?)` | Inspect one live or historical session (lower-level than `getStatus`) |
+| `getStatus(sessionId, cwd?)` | Merged status: `SessionSummary` plus `turnInProgress` and `pendingInput` |
+| `getLastMessage(sessionId, cwd)` | Text of the most recent complete assistant turn, or `null` |
 | `closeSession(sessionId)` | Close a tracked live session through its recorded owner |
 | `replaySession(sessionId, cwd)` | Parse a session's JSONL into events without starting Claude |
 
-CLI note:
+CLI and daemon parity:
 
-- `cband status <session-id>` is built on `inspectSession(...)`
-- `cband last <session-id>` is built on `inspectSession(...)` plus `replaySession(...)`
-- the daemon HTTP API now exposes matching endpoints at `GET /sessions/:id/status` and `GET /sessions/:id/last`
+- `cband status --session <id>` and `GET /sessions/:id/status` are built on `getStatus(...)`
+- `cband last --session <id>` and `GET /sessions/:id/last` are built on `getLastMessage(...)`
+- `cband prompt --session <id>` and `POST /sessions { sessionId }` are built on `openSession({ sessionId })`
 
 ### `ClaudrabandSession`
 
-Returned by `startSession` and `resumeSession`.
+Returned by `openSession`.
 
 | Method | Description |
 |---|---|
 | `prompt(text)` | Send a prompt and wait for the turn to complete |
-| `awaitTurn()` | Wait for an in-progress turn to finish |
-| `sendAndAwaitTurn(text)` | Send raw terminal input and wait for the next turn to complete |
-| `send(text)` | Send raw text to the terminal (low-level) |
-| `interrupt()` | Send Ctrl+C |
+| `send(text)` | Send raw input to the terminal without waiting |
+| `answerPending(choice, text?)` | Answer a pending `AskUserQuestion`. Optional `text` is sent after the selection (used for the "Other" option, choice `"0"`). |
+| `interrupt()` | Send Ctrl-C to cancel the in-progress turn |
 | `stop()` | Kill the Claude Code process |
 | `detach()` | Disconnect without killing (tmux window stays alive) |
 | `events()` | Async iterable of session events |
@@ -78,6 +78,35 @@ Returned by `startSession` and `resumeSession`.
 
 **Properties:** `sessionId`, `cwd`, `backend`, `model`, `permissionMode`
 
+### `SessionStatus`
+
+Returned by `runtime.getStatus(...)` and emitted by `GET /sessions/:id/status`.
+
+```typescript
+interface SessionStatus extends SessionSummary {
+  turnInProgress: boolean;
+  pendingInput: "none" | "question" | "permission";
+}
+```
+
+`pendingInput` is `"question"` when the transcript contains an unresolved `AskUserQuestion`, `"permission"` when a native permission prompt is visible in the live pane, and `"none"` otherwise.
+
+### `SessionNotFoundError`
+
+Thrown by `openSession({ sessionId })` when no saved transcript exists for `sessionId`.
+
+```typescript
+import { SessionNotFoundError } from "@halfwhey/claudraband";
+
+try {
+  await runtime.openSession({ sessionId: "missing" });
+} catch (err) {
+  if (err instanceof SessionNotFoundError) {
+    console.log(`no saved session ${err.sessionId}`);
+  }
+}
+```
+
 ## Streaming events
 
 `session.events()` returns an `AsyncIterable<ClaudrabandEvent>`. Events keep flowing regardless of whether a prompt is active.
@@ -86,7 +115,7 @@ Returned by `startSession` and `resumeSession`.
 import { createClaudraband, EventKind } from "@halfwhey/claudraband";
 
 const runtime = createClaudraband();
-const session = await runtime.startSession({ cwd: "." });
+const session = await runtime.openSession({ cwd: "." });
 
 // Start consuming events in the background
 const stream = (async () => {
@@ -128,7 +157,7 @@ await stream;
 When Claude requests permission for a tool (or asks a question via `AskUserQuestion`), the `onPermissionRequest` callback fires.
 
 ```typescript
-const session = await runtime.startSession({
+const session = await runtime.openSession({
   cwd: ".",
   onPermissionRequest: async (request) => {
     console.log(`Permission: ${request.title}`);
@@ -154,7 +183,7 @@ const session = await runtime.startSession({
 // Leave the question pending (session stays alive, answer later)
 { outcome: "deferred" }
 
-// Cancel (sends Ctrl+C)
+// Cancel (sends Ctrl-C)
 { outcome: "cancelled" }
 ```
 
@@ -162,18 +191,24 @@ const session = await runtime.startSession({
 
 ```typescript
 // Start fresh
-const session = await runtime.startSession({ cwd: "/project" });
+const session = await runtime.openSession({ cwd: "/project" });
 
 // Detach -- Claude keeps running in tmux
 await session.detach();
 
-// Later: reattach to the same session
-const resumed = await runtime.resumeSession(session.sessionId, { cwd: "/project" });
+// Later: auto-resume the same session by id
+const resumed = await runtime.openSession({
+  sessionId: session.sessionId,
+  cwd: "/project",
+});
 await resumed.prompt("what were you working on?");
 await resumed.detach();
 
 // When you're done for good
-const final = await runtime.resumeSession(session.sessionId, { cwd: "/project" });
+const final = await runtime.openSession({
+  sessionId: session.sessionId,
+  cwd: "/project",
+});
 await final.stop(); // kills the process
 ```
 
@@ -197,16 +232,20 @@ for (const event of events) {
     process.stdout.write(event.text);
   }
 }
+
+// Or just grab the last assistant turn's text
+const text = await runtime.getLastMessage(sessionId, "/my/project");
 ```
 
 ## Options reference
 
-### `ClaudrabandOptions`
+### `OpenSessionOptions`
 
-Passed to `createClaudraband()` as defaults or to individual session methods as overrides.
+Passed to `runtime.openSession(...)`.
 
 | Option | Type | Default | Description |
 |---|---|---|---|
+| `sessionId` | `string` | `undefined` | When set, auto-resume this saved session. Throws `SessionNotFoundError` if missing. |
 | `cwd` | `string` | `process.cwd()` | Working directory for Claude |
 | `model` | `string` | `"sonnet"` | Claude model |
 | `claudeArgs` | `string[]` | `[]` | Extra flags passed to `claude` CLI |
@@ -218,6 +257,8 @@ Passed to `createClaudraband()` as defaults or to individual session methods as 
 | `logger` | `ClaudrabandLogger` | no-op | Logging interface |
 | `onPermissionRequest` | callback | `undefined` | Permission handler |
 | `sessionOwner` | owner record | inferred | Internal routing metadata for session ownership |
+
+`ClaudrabandOptions` is the same shape minus `sessionId`, and is what `createClaudraband(defaults)` accepts.
 
 ### `PermissionMode`
 
@@ -233,6 +274,7 @@ Passed to `createClaudraband()` as defaults or to individual session methods as 
 
 | Export | Description |
 |---|---|
+| `extractLastAssistantTurn(events)` | Pure helper that finds the last complete assistant turn in an event list |
 | `sessionPath(cwd, sessionId)` | Path to a session's JSONL file |
 | `hasPendingQuestion(jsonlPath)` | Whether the JSONL has an unresolved AskUserQuestion |
 | `hasLiveProcess(sessionId)` | Whether a tmux window exists for this session |

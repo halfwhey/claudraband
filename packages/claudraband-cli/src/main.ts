@@ -3,16 +3,13 @@ import { openSync, mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import * as acp from "@agentclientprotocol/sdk";
 import type {
+  ClaudrabandEvent,
   ClaudrabandLogger,
   ClaudrabandPermissionRequest,
-  PromptResult,
   ClaudrabandSession,
   SessionSummary,
 } from "claudraband-core";
-import {
-  createClaudraband,
-  EventKind,
-} from "claudraband-core";
+import { createClaudraband } from "claudraband-core";
 import type { TerminalBackend } from "claudraband-core";
 import { Bridge } from "./acpbridge";
 import { parseArgs, type CliConfig } from "./args";
@@ -103,6 +100,7 @@ async function runAcpServer(config: ReturnType<typeof parseArgs>): Promise<void>
     model: config.model,
     permissionMode: config.permissionMode,
     terminalBackend: config.terminalBackend,
+    turnDetection: config.turnDetection,
   });
   bridge.setLogger(logger);
 
@@ -156,23 +154,11 @@ function isInteractiveCommand(command: CliConfig["command"]): boolean {
 }
 
 function isSelectionFlow(config: CliConfig): boolean {
-  return config.command === "continue" && Boolean(config.answer);
-}
-
-async function answerPendingSelection(
-  session: Pick<ClaudrabandSession, "send" | "sendAndAwaitTurn">,
-  optionId: string,
-  text?: string,
-) : Promise<PromptResult> {
-  if (optionId === "0" && text) {
-    await session.sendAndAwaitTurn(optionId);
-    return session.sendAndAwaitTurn(text);
-  }
-  if (text) {
-    await session.send(optionId);
-    return session.sendAndAwaitTurn(text);
-  }
-  return session.sendAndAwaitTurn(optionId);
+  return (
+    config.command === "prompt"
+    && Boolean(config.sessionId)
+    && Boolean(config.answer)
+  );
 }
 
 async function resolveTrackedSession(
@@ -185,6 +171,7 @@ async function resolveTrackedSession(
   const runtime = createClaudraband({
     logger,
     terminalBackend: config.terminalBackend,
+    turnDetection: config.turnDetection,
   });
   const sessions = await runtime.listSessions(
     config.hasExplicitCwd ? config.cwd : undefined,
@@ -271,34 +258,42 @@ async function showStatus(
   cwd: string | undefined,
   terminalBackend: TerminalBackend,
   logger: ClaudrabandLogger,
+  asJson: boolean,
 ): Promise<void> {
   const runtime = createClaudraband({ logger, terminalBackend });
-  const session = await runtime.inspectSession(sessionId, cwd);
-  if (!session) {
+  const status = await runtime.getStatus(sessionId, cwd);
+  if (!status) {
     process.stderr.write(`error: session ${sessionId} not found.\n`);
     process.exit(1);
   }
 
+  if (asJson) {
+    process.stdout.write(`${JSON.stringify(status, null, 2)}\n`);
+    return;
+  }
+
   const lines: string[] = [
-    `session  ${session.sessionId}`,
-    `source   ${session.source}`,
-    `alive    ${session.alive}`,
-    `backend  ${session.backend}`,
-    `cwd      ${session.cwd}`,
+    `session           ${status.sessionId}`,
+    `source            ${status.source}`,
+    `alive             ${status.alive}`,
+    `backend           ${status.backend}`,
+    `cwd               ${status.cwd}`,
+    `turnInProgress    ${status.turnInProgress}`,
+    `pendingInput      ${status.pendingInput}`,
   ];
 
-  if (session.owner.kind === "local") {
-    lines.push(`pid      ${session.owner.pid ?? "unknown"}`);
+  if (status.owner.kind === "local") {
+    lines.push(`pid               ${status.owner.pid ?? "unknown"}`);
   } else {
-    lines.push(`daemon   ${session.owner.serverUrl}`);
-    if (session.owner.serverPid !== undefined) {
-      lines.push(`pid      ${session.owner.serverPid}`);
+    lines.push(`daemon            ${status.owner.serverUrl}`);
+    if (status.owner.serverPid !== undefined) {
+      lines.push(`pid               ${status.owner.serverPid}`);
     }
   }
 
-  if (session.createdAt) lines.push(`created  ${new Date(session.createdAt).toLocaleString()}`);
-  if (session.updatedAt) lines.push(`updated  ${new Date(session.updatedAt).toLocaleString()}`);
-  if (session.title) lines.push(`title    ${session.title}`);
+  if (status.createdAt) lines.push(`created           ${new Date(status.createdAt).toLocaleString()}`);
+  if (status.updatedAt) lines.push(`updated           ${new Date(status.updatedAt).toLocaleString()}`);
+  if (status.title) lines.push(`title             ${status.title}`);
 
   for (const line of lines) {
     process.stdout.write(`${line}\n`);
@@ -310,40 +305,132 @@ async function showLast(
   cwd: string | undefined,
   terminalBackend: TerminalBackend,
   logger: ClaudrabandLogger,
+  asJson: boolean,
 ): Promise<void> {
   const runtime = createClaudraband({ logger, terminalBackend });
-  const session = await runtime.inspectSession(sessionId, cwd);
-  if (!session) {
+  const summary = await runtime.inspectSession(sessionId, cwd);
+  if (!summary) {
     process.stderr.write(`error: session ${sessionId} not found.\n`);
     process.exit(1);
   }
 
-  const events = await runtime.replaySession(sessionId, session.cwd);
+  const text = await runtime.getLastMessage(sessionId, summary.cwd);
 
-  // Walk backwards to find the last assistant turn's text.
-  const chunks: string[] = [];
-  let inLastTurn = false;
-  for (let i = events.length - 1; i >= 0; i--) {
-    const ev = events[i];
-    if (ev.kind === EventKind.TurnEnd) {
-      if (inLastTurn) break;
-      inLastTurn = true;
+  if (text === null) {
+    if (asJson) {
+      process.stdout.write(`${JSON.stringify({ sessionId, cwd: summary.cwd, text: null })}\n`);
+    } else {
+      process.stderr.write("no assistant message found.\n");
     }
-    if (ev.kind === EventKind.TurnStart && inLastTurn) break;
-    if (inLastTurn && ev.kind === EventKind.AssistantText) {
-      chunks.unshift(ev.text);
-    }
-  }
-
-  if (chunks.length === 0) {
-    process.stderr.write("no assistant message found.\n");
     process.exit(1);
   }
 
-  process.stdout.write(chunks.join(""));
-  if (!chunks[chunks.length - 1].endsWith("\n")) {
+  if (asJson) {
+    process.stdout.write(`${JSON.stringify({ sessionId, cwd: summary.cwd, text })}\n`);
+    return;
+  }
+
+  process.stdout.write(text);
+  if (!text.endsWith("\n")) {
     process.stdout.write("\n");
   }
+}
+
+async function runWatch(
+  sessionId: string,
+  cwd: string | undefined,
+  terminalBackend: TerminalBackend,
+  logger: ClaudrabandLogger,
+  pretty: boolean,
+  follow: boolean,
+  connect: string,
+): Promise<void> {
+  if (connect) {
+    const { runWatchWithDaemon } = await import("./daemon-client");
+    await runWatchWithDaemon(connect, sessionId, pretty, follow);
+    return;
+  }
+
+  const runtime = createClaudraband({ logger, terminalBackend });
+  const summary = await runtime.inspectSession(sessionId, cwd);
+  if (!summary) {
+    process.stderr.write(`error: session ${sessionId} not found.\n`);
+    process.exit(1);
+  }
+
+  if (summary.owner.kind === "daemon") {
+    const { runWatchWithDaemon } = await import("./daemon-client");
+    await runWatchWithDaemon(summary.owner.serverUrl, sessionId, pretty, follow);
+    return;
+  }
+
+  const events = await runtime.replaySession(sessionId, summary.cwd);
+  for (const ev of events) {
+    writeWatchEvent(ev, pretty);
+  }
+  if (!follow) return;
+  // For local non-daemon sessions we don't have a live tailer handle through
+  // the runtime without opening the session, so historical replay is the best
+  // effort here; use `attach` for interactive follow on local sessions.
+}
+
+function writeWatchEvent(ev: ClaudrabandEvent, pretty: boolean): void {
+  if (pretty) {
+    const tag = ev.kind;
+    const body = ev.text ? ev.text.replace(/\n/g, "\\n") : "";
+    process.stdout.write(`${ev.time.toISOString()} ${tag} ${body}\n`);
+    return;
+  }
+  process.stdout.write(`${JSON.stringify({
+    kind: ev.kind,
+    time: ev.time.toISOString(),
+    text: ev.text || undefined,
+    toolName: ev.toolName || undefined,
+    toolID: ev.toolID || undefined,
+    toolInput: ev.toolInput || undefined,
+    role: ev.role || undefined,
+  })}\n`);
+}
+
+async function runInterrupt(
+  sessionId: string,
+  cwd: string | undefined,
+  terminalBackend: TerminalBackend,
+  logger: ClaudrabandLogger,
+  connect: string,
+): Promise<void> {
+  if (connect) {
+    const { runInterruptWithDaemon } = await import("./daemon-client");
+    await runInterruptWithDaemon(connect, sessionId);
+    return;
+  }
+
+  const runtime = createClaudraband({ logger, terminalBackend });
+  const summary = await runtime.inspectSession(sessionId, cwd);
+  if (!summary) {
+    process.stderr.write(`error: session ${sessionId} not found.\n`);
+    process.exit(1);
+  }
+
+  if (summary.owner.kind === "daemon") {
+    const { runInterruptWithDaemon } = await import("./daemon-client");
+    await runInterruptWithDaemon(summary.owner.serverUrl, sessionId);
+    return;
+  }
+
+  if (!summary.alive || !summary.reattachable) {
+    process.stderr.write(`error: session ${sessionId} is not live.\n`);
+    process.exit(1);
+  }
+
+  const session = await runtime.openSession({
+    sessionId,
+    cwd: summary.cwd,
+    terminalBackend,
+    logger,
+  });
+  await session.interrupt();
+  await session.detach();
 }
 
 async function repl(
@@ -414,6 +501,7 @@ export async function runCli(argv: string[] = process.argv.slice(2)): Promise<vo
       config.hasExplicitCwd ? config.cwd : undefined,
       config.terminalBackend,
       logger,
+      config.json,
     );
     return;
   }
@@ -424,6 +512,31 @@ export async function runCli(argv: string[] = process.argv.slice(2)): Promise<vo
       config.hasExplicitCwd ? config.cwd : undefined,
       config.terminalBackend,
       logger,
+      config.json,
+    );
+    return;
+  }
+
+  if (config.command === "watch") {
+    await runWatch(
+      config.sessionId,
+      config.hasExplicitCwd ? config.cwd : undefined,
+      config.terminalBackend,
+      logger,
+      config.pretty,
+      config.follow,
+      config.connect,
+    );
+    return;
+  }
+
+  if (config.command === "interrupt") {
+    await runInterrupt(
+      config.sessionId,
+      config.hasExplicitCwd ? config.cwd : undefined,
+      config.terminalBackend,
+      logger,
+      config.connect,
     );
     return;
   }
@@ -433,14 +546,12 @@ export async function runCli(argv: string[] = process.argv.slice(2)): Promise<vo
     config.cwd = trackedSession.cwd;
   }
 
+  // If the session has a daemon owner and is live, route through that daemon.
   if (
     trackedSession?.owner.kind === "daemon"
     && trackedSession.source === "live"
     && trackedSession.alive
-    && (
-      config.command === "continue"
-      || config.command === "attach"
-    )
+    && config.sessionId
   ) {
     config.connect = trackedSession.owner.serverUrl;
   }
@@ -448,13 +559,13 @@ export async function runCli(argv: string[] = process.argv.slice(2)): Promise<vo
   if (config.command === "attach" || isSelectionFlow(config)) {
     if (!trackedSession) {
       process.stderr.write(
-        `error: session ${config.sessionId} is not tracked. Use 'cband continue ${config.sessionId} ...' to resume it locally.\n`,
+        `error: session ${config.sessionId} is not tracked. Start a fresh session or pass --session <id> with a known session.\n`,
       );
       process.exit(1);
     }
     if (trackedSession.source !== "live" || !trackedSession.alive || !trackedSession.reattachable) {
       process.stderr.write(
-        `error: session ${config.sessionId} is not live. Use 'cband continue ${config.sessionId} ...' to resume it.\n`,
+        `error: session ${config.sessionId} is not live.\n`,
       );
       process.exit(1);
     }
@@ -486,6 +597,7 @@ export async function runCli(argv: string[] = process.argv.slice(2)): Promise<vo
     model: config.model,
     permissionMode: config.permissionMode,
     terminalBackend: config.terminalBackend,
+    turnDetection: config.turnDetection,
   });
 
   let session: ClaudrabandSession | null = null;
@@ -519,6 +631,7 @@ export async function runCli(argv: string[] = process.argv.slice(2)): Promise<vo
       permissionMode: config.permissionMode,
       allowTextResponses: true,
       terminalBackend: config.terminalBackend,
+      turnDetection: config.turnDetection,
       logger,
       onPermissionRequest: (request: ClaudrabandPermissionRequest) =>
         requestPermission(renderer, {
@@ -528,60 +641,66 @@ export async function runCli(argv: string[] = process.argv.slice(2)): Promise<vo
         }, request),
     };
 
-    session =
-      config.command === "prompt"
-        ? await runtime.startSession(sessionOptions)
-        : await runtime.resumeSession(config.sessionId, sessionOptions);
+    session = await runtime.openSession({
+      ...sessionOptions,
+      ...(config.sessionId ? { sessionId: config.sessionId } : {}),
+    });
 
     const eventPump = pumpEvents(session, renderer);
 
-    if (config.command === "prompt") {
+    if (!config.sessionId) {
       process.stderr.write(`session: ${session.sessionId}\n`);
     } else if (config.debug) {
       process.stderr.write(`session: ${session.sessionId}\n`);
     }
 
-    if (config.command === "prompt" || (config.command === "continue" && !config.answer)) {
-      if (config.command === "continue") {
+    if (config.command === "send") {
+      if (config.answer) {
+        await session.send(config.answer);
+      }
+      if (config.prompt) {
+        await session.send(config.prompt);
+      }
+    } else if (config.command === "prompt") {
+      if (isSelectionFlow(config)) {
         const pendingInput = await session.hasPendingInput();
-        if (pendingInput.pending) {
+        if (!pendingInput.pending) {
           await session.detach().catch(() => {});
           process.stderr.write(
-            `error: session ${config.sessionId} has a pending question or permission prompt. Use 'cband continue ${config.sessionId} --select <choice> [text]'.\n`,
+            `error: session ${config.sessionId} has no pending question or permission prompt.\n`,
           );
           process.exit(1);
         }
-      }
-      promptActive = true;
-      sigintCount = 0;
-      const result = await session.prompt(config.prompt);
-      promptActive = false;
-      renderer.ensureNewline();
-      if (config.debug) {
-        process.stderr.write(`stop: ${result.stopReason}\n`);
-      }
-    } else if (isSelectionFlow(config)) {
-      const pendingInput = await session.hasPendingInput();
-      if (!pendingInput.pending) {
-        await session.detach().catch(() => {});
-        process.stderr.write(
-          `error: session ${config.sessionId} has no pending question or permission prompt.\n`,
+        promptActive = true;
+        sigintCount = 0;
+        const result = await session.answerPending(
+          config.answer,
+          config.prompt || undefined,
         );
-        process.exit(1);
-      }
-
-      // Send the selection directly to the live Claude TUI.
-      promptActive = true;
-      sigintCount = 0;
-      const result = await answerPendingSelection(
-        session,
-        config.answer,
-        config.prompt || undefined,
-      );
-      promptActive = false;
-      renderer.ensureNewline();
-      if (config.debug) {
-        process.stderr.write(`stop: ${result.stopReason}\n`);
+        promptActive = false;
+        renderer.ensureNewline();
+        if (config.debug) {
+          process.stderr.write(`stop: ${result.stopReason}\n`);
+        }
+      } else {
+        if (config.sessionId) {
+          const pendingInput = await session.hasPendingInput();
+          if (pendingInput.pending) {
+            await session.detach().catch(() => {});
+            process.stderr.write(
+              `error: session ${config.sessionId} has a pending question or permission prompt. Use 'cband prompt --session ${config.sessionId} --select <choice> [text]'.\n`,
+            );
+            process.exit(1);
+          }
+        }
+        promptActive = true;
+        sigintCount = 0;
+        const result = await session.prompt(config.prompt);
+        promptActive = false;
+        renderer.ensureNewline();
+        if (config.debug) {
+          process.stderr.write(`stop: ${result.stopReason}\n`);
+        }
       }
     }
 

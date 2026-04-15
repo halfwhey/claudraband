@@ -12,16 +12,33 @@ The daemon defaults to `tmux`. `--backend xterm` is still supported, but it is c
 
 This document covers the raw HTTP API exposed by `cband serve`.
 
+## Aligned verbs
+
+The HTTP surface mirrors the CLI verbs. Every aligned verb has a matching CLI command and a matching library method.
+
+| Concept | HTTP | CLI | Library |
+|---|---|---|---|
+| Open or resume | `POST /sessions` | implicit via `--session` | `runtime.openSession({ sessionId? })` |
+| Prompt (or answer pending) | `POST /sessions/:id/prompt` | `prompt` | `session.prompt(text)` / `session.answerPending(choice, text?)` |
+| Send (or answer pending, fire-and-forget) | `POST /sessions/:id/send` | `send` | `session.send(text)` |
+| Watch (stream) | `GET /sessions/:id/watch` (SSE) | `watch` | `session.events()` |
+| Interrupt | `POST /sessions/:id/interrupt` | `interrupt` | `session.interrupt()` |
+| Last | `GET /sessions/:id/last` | `last` | `runtime.getLastMessage(id, cwd)` |
+| Status | `GET /sessions/:id/status` | `status` | `runtime.getStatus(id, cwd?)` |
+
+`/prompt` and `/send` mirror the CLI verbs exactly. The only difference is when the response returns: `/prompt` waits for the assistant's turn to complete, `/send` returns as soon as the input is delivered. Both accept `select` in the request body for answering a pending question (the daemon equivalent of the CLI `--select` flag).
+
 ## Sessions
 
 ### `POST /sessions`
 
-Start a new daemon-owned Claude Code session.
+Open a daemon-owned Claude Code session. Without `sessionId` this creates a new session. With `sessionId` it auto-resumes the saved session, or reattaches if the daemon already owns a live process for that id.
 
-Request body:
+Request body (all fields optional):
 
 ```json
 {
+  "sessionId": "abc-123",
   "cwd": "/path/to/project",
   "claudeArgs": ["--effort", "high"],
   "model": "sonnet",
@@ -29,16 +46,19 @@ Request body:
 }
 ```
 
-All fields are optional. Omitted fields fall back to the daemon's launch defaults.
-
-Response (`201 Created`):
+Response:
 
 ```json
 {
   "sessionId": "abc-123",
-  "backend": "tmux"
+  "backend": "tmux",
+  "resumed": true
 }
 ```
+
+`resumed` is `true` when the body included a `sessionId` (whether the daemon reattached an existing live process or cold-resumed from disk), `false` for new sessions.
+
+If `sessionId` is provided but no saved transcript exists for that id, the daemon returns `404`. If `sessionId` is not a valid UUID, the daemon returns `400`.
 
 ### `GET /sessions`
 
@@ -58,36 +78,6 @@ Response:
 }
 ```
 
-### `POST /sessions/:id/resume`
-
-Resume a known session. If the session is still alive on the daemon, the existing process is reused. If it is dead, the daemon starts a new Claude process with `--resume`.
-
-Request body:
-
-```json
-{
-  "cwd": "/path/to/project",
-  "claudeArgs": [],
-  "model": "sonnet",
-  "permissionMode": "default",
-  "requireLive": false
-}
-```
-
-Set `requireLive: true` to fail instead of restarting a dead session. This is what `continue --select` uses when it must target an already-live session.
-
-Response:
-
-```json
-{
-  "sessionId": "abc-123",
-  "reattached": true,
-  "backend": "tmux"
-}
-```
-
-`reattached: true` means the existing process was reused. `false` means a new process was started via `--resume`.
-
 ### `DELETE /sessions/:id`
 
 Stop a daemon-owned session and remove it from the daemon.
@@ -100,7 +90,7 @@ Response:
 
 ### `GET /sessions/:id/status`
 
-Inspect one session and return its current summary. This works for sessions the runtime can still inspect, not just sessions currently attached to this daemon process.
+Inspect one session and return its merged status. Works for sessions the runtime can still inspect, not just sessions currently attached to this daemon process.
 
 Optional query parameters:
 
@@ -124,13 +114,17 @@ Response:
     "serverUrl": "http://127.0.0.1:7842",
     "serverPid": 12345,
     "serverInstanceId": "daemon-1"
-  }
+  },
+  "turnInProgress": false,
+  "pendingInput": "none"
 }
 ```
 
+`pendingInput` is one of `"none"`, `"question"` (the transcript has an unresolved `AskUserQuestion`), or `"permission"` (a native permission prompt is visible in the live pane).
+
 ### `GET /sessions/:id/last`
 
-Return the last assistant message from a session transcript.
+Return the last complete assistant turn from a session transcript.
 
 Optional query parameters:
 
@@ -146,19 +140,33 @@ Response:
 }
 ```
 
-If the session exists but has no assistant message yet, the daemon returns `404`.
+If the session exists but has no completed assistant turn yet, the daemon returns `404`.
 
 ## Prompting
 
 ### `POST /sessions/:id/prompt`
 
-Send a normal prompt and wait for Claude's turn to complete.
+Send input and wait for Claude's turn to complete. Mirrors `cband prompt`.
 
 Request body:
 
 ```json
 { "text": "explain the auth middleware" }
 ```
+
+To answer a pending `AskUserQuestion` (the daemon equivalent of `cband prompt --select`), pass `select` instead of (or alongside) `text`:
+
+```json
+{ "select": "2" }
+```
+
+For the "Other" option (`select: "0"`), pass the free-text answer in `text`:
+
+```json
+{ "select": "0", "text": "use the blue theme" }
+```
+
+The body must contain `text`, `select`, or both. Empty bodies return `400`.
 
 Response:
 
@@ -173,13 +181,25 @@ Response:
 
 ### `POST /sessions/:id/send`
 
-Write raw terminal input. This does not wait for a turn to finish.
+Write input and return as soon as it is delivered. Mirrors `cband send`. Does not wait for a turn to finish.
 
-Request body:
+Request body shape is identical to `/prompt`:
 
 ```json
 { "text": "2" }
 ```
+
+Or with `select` (and optional follow-up `text`) to fire a pending-question answer without waiting:
+
+```json
+{ "select": "2" }
+```
+
+```json
+{ "select": "0", "text": "use the blue theme" }
+```
+
+The body must contain `text`, `select`, or both. Empty bodies return `400`.
 
 Response:
 
@@ -187,43 +207,9 @@ Response:
 { "ok": true }
 ```
 
-### `POST /sessions/:id/send-and-await-turn`
-
-Write raw terminal input and wait for the next turn to complete. This is used for flows like `continue --select`.
-
-Request body:
-
-```json
-{ "text": "2" }
-```
-
-Response:
-
-```json
-{
-  "stopReason": "end_turn",
-  "eventSeq": 45
-}
-```
-
-### `POST /sessions/:id/await-turn`
-
-Wait for the current in-progress turn to finish. No request body.
-
-If the session is already idle, the daemon returns immediately with `stopReason: "end_turn"`.
-
-Response:
-
-```json
-{
-  "stopReason": "end_turn",
-  "eventSeq": 45
-}
-```
-
 ### `POST /sessions/:id/interrupt`
 
-Send Ctrl+C to the Claude process. No request body.
+Send Ctrl-C to the Claude process. No request body.
 
 Response:
 
@@ -233,9 +219,9 @@ Response:
 
 ## Events
 
-### `GET /sessions/:id/events`
+### `GET /sessions/:id/watch`
 
-Open an SSE stream for live session events.
+Open an SSE stream for live session events. This is the daemon side of the `watch` verb.
 
 The daemon sends a ready event immediately after the stream opens:
 
@@ -296,7 +282,7 @@ Response:
 
 ### `POST /sessions/:id/permission`
 
-Resolve a pending permission request.
+Resolve a pending permission request that was surfaced over SSE.
 
 Select an option:
 
@@ -324,12 +310,6 @@ Response:
 
 Returns `409` if no permission request is pending.
 
-## Relationship to CLI and library
-
-- CLI `status` maps closely to `GET /sessions/:id/status`.
-- CLI `last` maps closely to `GET /sessions/:id/last`.
-- The TypeScript library exposes the same lower-level pieces as `inspectSession(...)` and `replaySession(...)`.
-
 ## Errors
 
 All errors return a JSON body:
@@ -340,6 +320,7 @@ All errors return a JSON body:
 
 | Status | Meaning |
 |---|---|
-| `404` | Session not found or unknown route |
-| `409` | Conflict, such as `requireLive` failure or no pending permission |
+| `400` | Bad request, such as a non-UUID `sessionId` |
+| `404` | Session not found, or unknown route |
+| `409` | Conflict, such as no pending permission |
 | `500` | Internal server error |

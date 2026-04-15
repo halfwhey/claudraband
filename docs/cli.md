@@ -2,10 +2,11 @@
 
 `claudraband` has one user model:
 
-- start work
-- continue tracked work
-- attach to live work
-- answer a pending question with `--select`
+- prompt new work
+- continue a saved session by passing `--session <id>`
+- send input without waiting
+- watch a session's event stream
+- interrupt an in-progress turn
 - inspect or close tracked sessions
 
 Live sessions live in `~/.claudraband/`. Existing live sessions route through that registry automatically. Historical transcripts can still be resumed or inspected when the command needs them, but `sessions` only lists live entries.
@@ -16,61 +17,95 @@ The package also installs `cband` as a shorthand alias for the same CLI.
 
 ## Commands
 
-### `claudraband [options] <prompt...>`
+### `cband [options] <prompt...>`
 
-Start a new session and send a prompt.
+Start a new session and send a prompt. This is shorthand for `cband prompt`.
 
-### `claudraband continue <session-id> [options] <prompt...>`
+### `cband prompt [--session <id>] [--select <choice>] <prompt...>`
 
-Resume a tracked session and send another prompt.
+Send a prompt and wait for Claude to finish its turn.
 
-If the recorded owner is a live daemon, `claudraband` reconnects there automatically. If the daemon is gone, `claudraband` resumes the Claude session locally.
+- Without `--session`, a new session is created.
+- With `--session <id>`, the saved session is auto-resumed. If the id has no saved transcript, the command errors with `session not found`.
+- With `--select <choice>`, answers a pending `AskUserQuestion` or permission prompt, then returns the turn that follows. Optional trailing text is sent after the selection.
 
-### `claudraband continue <session-id> --select <choice> [text]`
-
-Answer a pending `AskUserQuestion` or permission prompt in a live session.
-
-If the selected choice is a text-entry option, pass the response text after the choice:
+Examples:
 
 ```sh
-claudraband continue abc-123 --select 3 "xyz"
+cband prompt "review the staged diff"
+cband prompt --session abc-123 "keep going"
+cband prompt --session abc-123 --select 2
+cband prompt --session abc-123 --select 3 "xyz"
+cband prompt --session abc-123 --select 0 "new direction"
 ```
 
-If you want to cancel the pending prompt and then continue with fresh text, use:
+### `cband send [--session <id>] [--select <choice>] <text...>`
+
+Send input without waiting for a turn to complete. Returns as soon as the input is delivered. Use `watch`, `status`, or `last` to observe the response.
+
+- `--session <id>` auto-resumes the saved session (errors if missing).
+- `--select <choice>` fires a pending-answer selection. Optional trailing text is sent after the selection.
+
+Examples:
 
 ```sh
-claudraband continue abc-123 --select 0 "new direction"
+cband send --session abc-123 "quick note"
+cband send --session abc-123 --select 2
+cband send --session abc-123 --select 0 "new direction"
 ```
 
-### `claudraband attach <session-id>`
+### `cband watch --session <id> [--pretty] [--no-follow]`
+
+Stream events from a session. When a daemon owns the session this connects to the SSE stream; otherwise it replays the local transcript. One event per line as JSON by default.
+
+- `--pretty` renders events as human-readable text.
+- `--no-follow` exits after the next `turn_end`.
+
+### `cband interrupt --session <id>`
+
+Cancel the in-progress turn on a live session (equivalent to sending Ctrl-C inside Claude).
+
+### `cband status --session <id> [--json]`
+
+Show status and metadata for a session, including whether a turn is in progress and whether input is pending.
+
+- `--json` emits the same payload the daemon returns.
+
+Positional form `cband status <session-id>` is also accepted.
+
+### `cband last --session <id> [--json]`
+
+Print the last complete assistant turn from a session's transcript. Exits with status 1 if no completed turn is available.
+
+- `--json` emits `{ sessionId, cwd, text }` as JSON.
+
+Positional form `cband last <session-id>` is also accepted.
+
+### `cband attach <session-id>`
 
 Open a simple REPL against a live session.
 
-This does not reattach the original terminal UI. It just gives you an interactive
-way to keep talking to an already-live session, which is especially useful for
-daemon-hosted sessions.
+This does not reattach the original terminal UI. It just gives you an interactive way to keep talking to an already-live session, which is especially useful for daemon-hosted sessions. It does not restart dead sessions.
 
-This does not restart dead sessions. Use `continue` for that.
-
-### `claudraband sessions`
+### `cband sessions`
 
 List live tracked sessions from `~/.claudraband/`.
 
 Use `--cwd <dir>` to filter by working directory.
 
-### `claudraband sessions close <session-id>`
+### `cband sessions close <session-id>`
 
 Close one live tracked session.
 
-### `claudraband sessions close --cwd <dir>`
+### `cband sessions close --cwd <dir>`
 
 Close all live tracked sessions for one working directory.
 
-### `claudraband sessions close --all`
+### `cband sessions close --all`
 
 Close every live tracked session.
 
-### `claudraband serve [options]`
+### `cband serve [options]`
 
 Run the persistent daemon for headless sessions.
 
@@ -78,13 +113,13 @@ The daemon defaults to `tmux`. `xterm` is still available, but it is currently e
 
 For the raw HTTP reference, see [docs/daemon-api.md](daemon-api.md).
 
-Use `--connect <host:port>` with the top-level prompt command when you want to create a new session there:
+Use `--connect <host:port>` with `prompt` or `send` when you want to create a new session on a running daemon:
 
 ```sh
-claudraband --connect localhost:7842 "start a headless refactor"
+cband --connect localhost:7842 "start a headless refactor"
 ```
 
-### `claudraband acp [options]`
+### `cband acp [options]`
 
 Run `claudraband` as an ACP server over stdio.
 
@@ -93,21 +128,40 @@ Run `claudraband` as an ACP server over stdio.
 | Flag | Description |
 |---|---|
 | `-h`, `--help` | Show contextual help for the current command |
+| `--session <id>` | Resume (`prompt`, `send`) or target (`watch`, `interrupt`, `status`, `last`) a session |
 | `--cwd <dir>` | Working directory for new sessions, or filter for `sessions` |
 | `--model <model>` | `haiku`, `sonnet`, or `opus` |
 | `--permission-mode <mode>` | Claude permission mode |
 | `--backend <backend>` | `auto`, `tmux`, or `xterm` |
 | `-c`, `--claude <flags>` | Advanced Claude CLI passthrough flags |
+| `--json` | Emit JSON for `status`, `last`, `watch` |
 | `--debug` | Show debug logging |
 
 ## Command-specific flags
 
-### Prompt / continue
+### `prompt` and `send`
 
 | Flag | Description |
 |---|---|
-| `--connect <host:port>` | Start a new session on a running daemon. Only valid for new prompts. |
-| `--select <choice>` | Answer a pending question in a live tracked session |
+| `--session <id>` | Resume the saved session with this id |
+| `--select <choice>` | Answer a pending question. `0` is the sentinel for Other and requires trailing text. Requires `--session`. |
+| `--connect <host:port>` | Route the session through a running daemon. Valid for new sessions. |
+
+### `watch`
+
+| Flag | Description |
+|---|---|
+| `--session <id>` | Target session (required) |
+| `--pretty` | Human-readable output instead of JSON lines |
+| `--no-follow` | Exit after the next `turn_end` |
+
+### `status` and `last`
+
+| Flag | Description |
+|---|---|
+| `--session <id>` | Target session |
+| `--cwd <dir>` | Disambiguate if the id matches multiple cwds |
+| `--json` | Emit JSON payload |
 
 ### `sessions`
 
@@ -152,4 +206,5 @@ Run `claudraband` as an ACP server over stdio.
 
 - `tmux` is the first-class backend for both local sessions and the daemon.
 - `xterm` is experimental, both locally and under `serve`, while the backend continues to improve.
-- `attach` and `continue --select` require a live tracked session.
+- `attach` and `--select` require a live tracked session.
+- `prompt --select` waits for the turn that follows the selection. `send --select` is fire-and-forget.

@@ -17,7 +17,7 @@ Claude Code for the power user
 
 It provides:
 
-- Resumable non-interactive workflows. Essentially `claude -p` with session support: `cband continue <session-id> 'what was the result of the research?'`
+- Resumable non-interactive workflows. Essentially `claude -p` with session support: `cband prompt --session <session-id> 'what was the result of the research?'`
 - An HTTP daemon for remote or headless session control
 - An ACP server for editor and alternate frontend integration
 - A TypeScript library for building these workflows into your own tools
@@ -58,8 +58,10 @@ The two first-class paths are local `tmux` sessions and daemon-backed sessions.
 ```sh
 cband "audit the last commit and tell me what looks risky"
 cband sessions
-cband continue <session-id> "keep going"
-cband continue <session-id> --select 2
+cband prompt --session <session-id> "keep going"
+cband prompt --session <session-id> --select 2
+cband watch --session <session-id>
+cband interrupt --session <session-id>
 ```
 
 ### Daemon-backed sessions
@@ -68,10 +70,10 @@ cband continue <session-id> --select 2
 cband serve --host 127.0.0.1 --port 7842
 cband --connect localhost:7842 "start a migration plan"
 cband attach <session-id>
-cband continue <session-id> --select 2
+cband prompt --session <session-id> --select 2
 ```
 
-The daemon defaults to using `tmux` as the terminal runtime, just like the local path. Use `--connect` only when creating a new daemon-backed session; after that, tracked `continue`, `attach`, and `sessions` route through the recorded live owner automatically.
+The daemon defaults to using `tmux` as the terminal runtime, just like the local path. Use `--connect` only when creating a new daemon-backed session; after that, `prompt`, `send`, `watch`, `interrupt`, `attach`, and `sessions` route through the recorded live owner automatically.
 
 ## Experimental xterm.js Backend
 
@@ -95,7 +97,8 @@ Editor and ACP client support varies by frontend, but `claudraband` itself suppo
 Live sessions are tracked in `~/.claudraband/`.
 
 - `cband sessions` lists live tracked sessions
-- `continue` can resume an existing Claude Code session even when it is no longer live
+- `prompt --session <id>` and `send --session <id>` auto-resume a saved session, even when it is no longer live
+- `watch`, `interrupt`, `status`, `last` target a session by id
 - `attach` only works on live sessions
 - `sessions close ...` closes live tracked sessions, either local or daemon-backed
 
@@ -143,13 +146,18 @@ npm install -g @halfwhey/claudraband
 
 # local persistent sessions
 cband "audit the last commit"
-cband sessions 
+cband sessions
 cband sessions close --all # close all claudraband controlled sessions
-cband continue <session-id> "keep going"
+cband prompt --session <session-id> "keep going"
+cband send --session <session-id> "fire and forget"
+cband watch --session <session-id>
+cband interrupt --session <session-id>
+cband status --session <session-id>
+cband last --session <session-id>
 
 # answer pending prompts
-cband continue <session-id> --select 2
-cband continue <session-id> --select 3 "xyz"
+cband prompt --session <session-id> --select 2
+cband prompt --session <session-id> --select 3 "xyz"
 
 # daemon mode
 cband serve --host 127.0.0.1 --port 7842

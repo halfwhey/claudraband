@@ -161,8 +161,26 @@ export interface SessionSummary {
   owner: SessionOwnerRecord;
 }
 
+export interface SessionStatus extends SessionSummary {
+  turnInProgress: boolean;
+  pendingInput: "none" | "question" | "permission";
+}
+
+export class SessionNotFoundError extends Error {
+  readonly sessionId: string;
+  constructor(sessionId: string) {
+    super(`session ${sessionId} not found`);
+    this.name = "SessionNotFoundError";
+    this.sessionId = sessionId;
+  }
+}
+
 export interface PromptResult {
   stopReason: "end_turn" | "cancelled";
+}
+
+export interface OpenSessionOptions extends ClaudrabandOptions {
+  sessionId?: string;
 }
 
 export interface ClaudrabandSession {
@@ -172,10 +190,12 @@ export interface ClaudrabandSession {
   readonly model: string;
   readonly permissionMode: PermissionMode;
   events(): AsyncIterable<ClaudrabandEvent>;
+  /** Send input and wait for the turn to complete. */
   prompt(text: string): Promise<PromptResult>;
-  awaitTurn(): Promise<PromptResult>;
-  sendAndAwaitTurn(text: string): Promise<PromptResult>;
+  /** Send input without waiting. */
   send(text: string): Promise<void>;
+  /** Answer a pending AskUserQuestion; optionally follow with prompt text. */
+  answerPending(choice: string, text?: string): Promise<PromptResult>;
   interrupt(): Promise<void>;
   stop(): Promise<void>;
   /** Disconnect without killing the process. */
@@ -189,13 +209,18 @@ export interface ClaudrabandSession {
 }
 
 export interface Claudraband {
-  startSession(options?: ClaudrabandOptions): Promise<ClaudrabandSession>;
-  resumeSession(
-    sessionId: string,
-    options?: ClaudrabandOptions,
-  ): Promise<ClaudrabandSession>;
+  /**
+   * Open a session. If `options.sessionId` is provided, resume the saved
+   * session with that id; if no saved session exists, throws
+   * {@link SessionNotFoundError}. Otherwise starts a new session.
+   */
+  openSession(options?: OpenSessionOptions): Promise<ClaudrabandSession>;
   listSessions(cwd?: string): Promise<SessionSummary[]>;
   inspectSession(sessionId: string, cwd?: string): Promise<SessionSummary | null>;
+  /** Merged live + transcript status for a session. */
+  getStatus(sessionId: string, cwd?: string): Promise<SessionStatus | null>;
+  /** Last complete assistant turn's text; null if none. */
+  getLastMessage(sessionId: string, cwd: string): Promise<string | null>;
   closeSession(sessionId: string): Promise<boolean>;
   replaySession(sessionId: string, cwd: string): Promise<ClaudrabandEvent[]>;
 }
@@ -368,46 +393,18 @@ class ClaudrabandRuntime implements Claudraband {
     this.defaults = defaults;
   }
 
-  async startSession(options?: ClaudrabandOptions): Promise<ClaudrabandSession> {
-    const cfg = normalizeOptions(this.defaults, options);
+  async openSession(options?: OpenSessionOptions): Promise<ClaudrabandSession> {
+    const { sessionId, ...opts } = options ?? {};
+    const cfg = normalizeOptions(this.defaults, opts);
     const backend = resolveTerminalBackend(cfg.terminalBackend);
-    const wrapper = new ClaudeWrapper({
-      model: cfg.model,
-      claudeArgs: cfg.claudeArgs,
-      claudeExecutable: cfg.claudeExecutable || undefined,
-      permissionMode: cfg.permissionMode,
-      terminalBackend: cfg.terminalBackend,
-      workingDir: cfg.cwd,
-      tmuxSession: SHARED_TMUX_SESSION,
-      paneWidth: cfg.paneWidth,
-      paneHeight: cfg.paneHeight,
-    });
-    const lifetime = new AbortController();
-    await wrapper.start(lifetime.signal);
-    const session = new ClaudrabandSessionImpl(
-      wrapper,
-      wrapper.claudeSessionId,
-      wrapper.workingDir,
-      backend,
-      cfg.model,
-      cfg.permissionMode,
-      cfg.turnDetection,
-      cfg.allowTextResponses,
-      cfg.logger,
-      cfg.onPermissionRequest,
-      lifetime,
-      cfg.sessionOwner,
-    );
-    await session.syncSessionRecord();
-    return session;
-  }
 
-  async resumeSession(
-    sessionId: string,
-    options?: ClaudrabandOptions,
-  ): Promise<ClaudrabandSession> {
-    const cfg = normalizeOptions(this.defaults, options);
-    const backend = resolveTerminalBackend(cfg.terminalBackend);
+    if (sessionId) {
+      const existing = await inspectSession(sessionId, cfg.cwd);
+      if (!existing) {
+        throw new SessionNotFoundError(sessionId);
+      }
+    }
+
     const wrapper = new ClaudeWrapper({
       model: cfg.model,
       claudeArgs: cfg.claudeArgs,
@@ -420,10 +417,14 @@ class ClaudrabandRuntime implements Claudraband {
       paneHeight: cfg.paneHeight,
     });
     const lifetime = new AbortController();
-    await wrapper.startResume(sessionId, lifetime.signal);
+    if (sessionId) {
+      await wrapper.startResume(sessionId, lifetime.signal);
+    } else {
+      await wrapper.start(lifetime.signal);
+    }
     const session = new ClaudrabandSessionImpl(
       wrapper,
-      sessionId,
+      sessionId ?? wrapper.claudeSessionId,
       wrapper.workingDir,
       backend,
       cfg.model,
@@ -445,6 +446,26 @@ class ClaudrabandRuntime implements Claudraband {
 
   inspectSession(sessionId: string, cwd?: string): Promise<SessionSummary | null> {
     return inspectSession(sessionId, cwd);
+  }
+
+  async getStatus(sessionId: string, cwd?: string): Promise<SessionStatus | null> {
+    const summary = await inspectSession(sessionId, cwd);
+    if (!summary) return null;
+    const jsonlPath = sessionPath(summary.cwd, sessionId);
+    const [turnInProgress, pendingQuestion] = await Promise.all([
+      hasTranscriptTurnInProgress(jsonlPath),
+      hasPendingQuestion(jsonlPath),
+    ]);
+    return {
+      ...summary,
+      turnInProgress,
+      pendingInput: pendingQuestion ? "question" : "none",
+    };
+  }
+
+  async getLastMessage(sessionId: string, cwd: string): Promise<string | null> {
+    const events = await this.replaySession(sessionId, cwd);
+    return extractLastAssistantTurn(events);
   }
 
   closeSession(sessionId: string): Promise<boolean> {
@@ -470,6 +491,37 @@ class ClaudrabandRuntime implements Claudraband {
     return events;
   }
 }
+
+/** Extract the text of the last complete assistant turn, or null. */
+export function extractLastAssistantTurn(
+  events: ClaudrabandEvent[],
+): string | null {
+  const chunks: string[] = [];
+  let inLastTurn = false;
+  // Iterate newest-to-oldest. Enter "last turn" on the final TurnEnd.
+  // Leave the turn on any upstream signal that a new turn is starting:
+  // an earlier TurnEnd, a TurnStart, or a UserMessage.
+  for (let i = events.length - 1; i >= 0; i--) {
+    const ev = events[i];
+    if (ev.kind === EventKind.TurnEnd) {
+      if (inLastTurn) break;
+      inLastTurn = true;
+      continue;
+    }
+    if (!inLastTurn) continue;
+    if (
+      ev.kind === EventKind.TurnStart
+      || ev.kind === EventKind.UserMessage
+    ) {
+      break;
+    }
+    if (ev.kind === EventKind.AssistantText) {
+      chunks.unshift(ev.text);
+    }
+  }
+  return chunks.length === 0 ? null : chunks.join("");
+}
+
 
 interface SessionWrapper extends Wrapper {
   capturePane(): Promise<string>;
@@ -702,6 +754,23 @@ class ClaudrabandSessionImpl implements ClaudrabandSession {
 
   send(text: string): Promise<void> {
     return this.wrapper.send(text);
+  }
+
+  async answerPending(
+    choice: string,
+    text?: string,
+  ): Promise<PromptResult> {
+    // "0" is the sentinel for the "Other" option, which always needs a
+    // follow-up text payload (the free-form answer).
+    if (choice === "0" && text) {
+      await this.sendAndAwaitTurn(choice);
+      return this.sendAndAwaitTurn(text);
+    }
+    if (text) {
+      await this.wrapper.send(choice);
+      return this.sendAndAwaitTurn(text);
+    }
+    return this.sendAndAwaitTurn(choice);
   }
 
   private async prepareForInput(
@@ -1441,6 +1510,12 @@ class ClaudrabandSessionImpl implements ClaudrabandSession {
   }
 }
 
+/** Internal-only session methods exposed to tests. */
+export interface InternalClaudrabandSession extends ClaudrabandSession {
+  awaitTurn(): Promise<PromptResult>;
+  sendAndAwaitTurn(text: string): Promise<PromptResult>;
+}
+
 export const __test = {
   buildAskUserQuestionOptions,
   createSession(
@@ -1457,7 +1532,7 @@ export const __test = {
       onPermissionRequest?: ClaudrabandOptions["onPermissionRequest"];
       lifetime?: AbortController;
     } = {},
-  ): ClaudrabandSession {
+  ): InternalClaudrabandSession {
     return new ClaudrabandSessionImpl(
       wrapper,
       options.sessionId ?? "test-session",

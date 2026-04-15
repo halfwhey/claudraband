@@ -2,14 +2,15 @@ import { createServer, type IncomingMessage, type ServerResponse } from "node:ht
 import { randomUUID } from "node:crypto";
 import {
   createClaudraband,
+  SessionNotFoundError,
   type Claudraband,
   type ClaudrabandEvent,
   type ClaudrabandLogger,
   type ClaudrabandPermissionDecision,
   type ClaudrabandPermissionRequest,
   type ClaudrabandSession,
-  type SessionSummary,
-  EventKind,
+  type SessionStatus,
+  type TurnDetectionMode,
 } from "claudraband-core";
 import type { CliConfig } from "./args";
 
@@ -44,6 +45,7 @@ interface SessionRequestBody {
   claudeArgs?: string[];
   model?: string;
   permissionMode?: string;
+  turnDetection?: TurnDetectionMode;
   requireLive?: boolean;
 }
 
@@ -64,12 +66,14 @@ function resolveSessionConfig(
   claudeArgs: string[];
   model: string;
   permissionMode: string;
+  turnDetection: TurnDetectionMode;
 } {
   return {
     cwd: body.cwd ?? config.cwd,
     claudeArgs: body.claudeArgs ?? config.claudeArgs,
     model: body.model ?? config.model,
     permissionMode: body.permissionMode ?? config.permissionMode,
+    turnDetection: body.turnDetection ?? config.turnDetection,
   };
 }
 
@@ -93,46 +97,21 @@ interface DaemonServerHandle {
   close(): Promise<void>;
 }
 
-function sessionSummaryToJson(session: SessionSummary): Record<string, unknown> {
+function sessionStatusToJson(status: SessionStatus): Record<string, unknown> {
   return {
-    sessionId: session.sessionId,
-    cwd: session.cwd,
-    title: session.title,
-    createdAt: session.createdAt,
-    updatedAt: session.updatedAt,
-    backend: session.backend,
-    source: session.source,
-    alive: session.alive,
-    reattachable: session.reattachable,
-    owner: session.owner,
+    sessionId: status.sessionId,
+    cwd: status.cwd,
+    title: status.title,
+    createdAt: status.createdAt,
+    updatedAt: status.updatedAt,
+    backend: status.backend,
+    source: status.source,
+    alive: status.alive,
+    reattachable: status.reattachable,
+    owner: status.owner,
+    turnInProgress: status.turnInProgress,
+    pendingInput: status.pendingInput,
   };
-}
-
-function extractLastAssistantTurn(events: ClaudrabandEvent[]): string | null {
-  const chunks: string[] = [];
-  let inLastTurn = false;
-  // Iterate newest-to-oldest. Enter "last turn" on the final TurnEnd.
-  // Leave the turn on any upstream signal that a new turn is starting:
-  // an earlier TurnEnd, a TurnStart, or a UserMessage.
-  for (let i = events.length - 1; i >= 0; i--) {
-    const ev = events[i];
-    if (ev.kind === EventKind.TurnEnd) {
-      if (inLastTurn) break;
-      inLastTurn = true;
-      continue;
-    }
-    if (!inLastTurn) continue;
-    if (
-      ev.kind === EventKind.TurnStart ||
-      ev.kind === EventKind.UserMessage
-    ) {
-      break;
-    }
-    if (ev.kind === EventKind.AssistantText) {
-      chunks.unshift(ev.text);
-    }
-  }
-  return chunks.length === 0 ? null : chunks.join("");
 }
 
 function createDaemonServer(
@@ -260,7 +239,7 @@ function createDaemonServer(
     const method = req.method ?? "GET";
 
     try {
-      // POST /sessions -- create new session
+      // POST /sessions -- create new session or resume a saved one
       if (method === "POST" && path === "/sessions") {
         const body = parseOptionalJsonObject<SessionRequestBody>(await readBody(req));
         if (body.sessionId !== undefined && !UUID_RE.test(body.sessionId)) {
@@ -271,6 +250,23 @@ function createDaemonServer(
           );
           return;
         }
+
+        // If we already own a live daemon session with this id, reattach.
+        if (body.sessionId) {
+          const existing = getSession(body.sessionId);
+          if (existing && shouldReuseSession(existing)) {
+            json(res, 200, {
+              sessionId: body.sessionId,
+              backend: existing.session.backend,
+              resumed: true,
+            });
+            return;
+          }
+          if (existing) {
+            dropDeadSession(body.sessionId, existing);
+          }
+        }
+
         const sessionConfig = resolveSessionConfig(config, body);
         const sessionOwner = {
           kind: "daemon" as const,
@@ -278,40 +274,41 @@ function createDaemonServer(
           serverPid: process.pid,
           serverInstanceId,
         };
-        const session = body.sessionId
-          ? await runtime.resumeSession(body.sessionId, {
-            cwd: sessionConfig.cwd,
-            claudeArgs: sessionConfig.claudeArgs,
-            model: sessionConfig.model,
-            permissionMode: sessionConfig.permissionMode as typeof config.permissionMode,
-            allowTextResponses: true,
-            logger,
-            sessionOwner,
-            onPermissionRequest: (request) =>
-              handlePermission(ds, request),
-          })
-          : await runtime.startSession({
-            cwd: sessionConfig.cwd,
-            claudeArgs: sessionConfig.claudeArgs,
-            model: sessionConfig.model,
-            permissionMode: sessionConfig.permissionMode as typeof config.permissionMode,
-            allowTextResponses: true,
-            logger,
-            sessionOwner,
-            onPermissionRequest: (request) =>
-              handlePermission(ds, request),
-          });
         const ds: DaemonSession = {
-          session,
+          session: null as unknown as ClaudrabandSession,
           sseClients: new Set(),
           pendingPermission: null,
           lastEventSeq: 0,
         };
+        let session: ClaudrabandSession;
+        try {
+          session = await runtime.openSession({
+            sessionId: body.sessionId,
+            cwd: sessionConfig.cwd,
+            claudeArgs: sessionConfig.claudeArgs,
+            model: sessionConfig.model,
+            permissionMode: sessionConfig.permissionMode as typeof config.permissionMode,
+            turnDetection: sessionConfig.turnDetection,
+            allowTextResponses: true,
+            logger,
+            sessionOwner,
+            onPermissionRequest: (request: ClaudrabandPermissionRequest) =>
+              handlePermission(ds, request),
+          });
+        } catch (e: unknown) {
+          if (e instanceof SessionNotFoundError) {
+            err(res, 404, e.message);
+            return;
+          }
+          throw e;
+        }
+        ds.session = session;
         sessions.set(session.sessionId, ds);
         attachEventStream(ds);
         json(res, 201, {
           sessionId: session.sessionId,
           backend: session.backend,
+          resumed: Boolean(body.sessionId),
         });
         return;
       }
@@ -350,104 +347,31 @@ function createDaemonServer(
 
       // GET /sessions/:id/status
       if (method === "GET" && action === "status") {
-        const session = await runtime.inspectSession(sessionId, cwd);
-        if (!session) {
+        const status = await runtime.getStatus(sessionId, cwd);
+        if (!status) {
           err(res, 404, `session ${sessionId} not found`);
           return;
         }
-        json(res, 200, sessionSummaryToJson(session));
+        json(res, 200, sessionStatusToJson(status));
         return;
       }
 
       // GET /sessions/:id/last
       if (method === "GET" && action === "last") {
-        const session = await runtime.inspectSession(sessionId, cwd);
-        if (!session) {
+        const summary = await runtime.inspectSession(sessionId, cwd);
+        if (!summary) {
           err(res, 404, `session ${sessionId} not found`);
           return;
         }
-        const events = await runtime.replaySession(sessionId, session.cwd);
-        const text = extractLastAssistantTurn(events);
+        const text = await runtime.getLastMessage(sessionId, summary.cwd);
         if (text === null) {
           err(res, 404, `no assistant message found for session ${sessionId}`);
           return;
         }
         json(res, 200, {
           sessionId,
-          cwd: session.cwd,
+          cwd: summary.cwd,
           text,
-        });
-        return;
-      }
-
-      // POST /sessions/:id/resume
-      if (method === "POST" && action === "resume") {
-        if (!UUID_RE.test(sessionId)) {
-          err(res, 400, `sessionId must be a UUID (got ${JSON.stringify(sessionId)})`);
-          return;
-        }
-        const body = parseOptionalJsonObject<SessionRequestBody>(await readBody(req));
-        const ds = getSession(sessionId);
-        if (ds && shouldReuseSession(ds)) {
-          json(res, 200, {
-            sessionId,
-            reattached: true,
-            backend: ds.session.backend,
-          });
-          return;
-        }
-        if (ds) {
-          dropDeadSession(sessionId, ds);
-        }
-        // Look up the session's recorded cwd so a body-less resume targets
-        // the right project transcript. Also fast-fail unknown ids instead
-        // of blocking on a doomed `claude --resume` attempt.
-        const known = await runtime.inspectSession(sessionId, body.cwd);
-        if (!known && !body.cwd) {
-          err(
-            res,
-            404,
-            `session ${sessionId} not found; provide cwd to attempt a cold resume`,
-          );
-          return;
-        }
-        if (body.requireLive) {
-          err(res, 409, `session ${sessionId} is not live on the daemon`);
-          return;
-        }
-        const effectiveBody: SessionRequestBody = {
-          ...body,
-          cwd: body.cwd ?? known?.cwd,
-        };
-        const sessionConfig = resolveSessionConfig(config, effectiveBody);
-        const session = await runtime.resumeSession(sessionId, {
-          cwd: sessionConfig.cwd,
-          claudeArgs: sessionConfig.claudeArgs,
-          model: sessionConfig.model,
-          permissionMode: sessionConfig.permissionMode as typeof config.permissionMode,
-          allowTextResponses: true,
-          logger,
-          sessionOwner: {
-            kind: "daemon",
-            serverUrl,
-            serverPid: process.pid,
-            serverInstanceId,
-          },
-          onPermissionRequest: (request) =>
-            handlePermission(newDs, request),
-        });
-        const newDs: DaemonSession = {
-          session,
-          sseClients: new Set(),
-          pendingPermission: null,
-          lastEventSeq: 0,
-        };
-        sessions.set(sessionId, newDs);
-        attachEventStream(newDs);
-        json(res, 200, {
-          sessionId,
-          reattached: false,
-          backend: session.backend,
         });
         return;
       }
@@ -458,8 +382,8 @@ function createDaemonServer(
         return;
       }
 
-      // GET /sessions/:id/events -- SSE
-      if (method === "GET" && action === "events") {
+      // GET /sessions/:id/watch -- SSE
+      if (method === "GET" && action === "watch") {
         res.writeHead(200, {
           "Content-Type": "text/event-stream",
           "Cache-Control": "no-cache",
@@ -482,27 +406,25 @@ function createDaemonServer(
       }
 
       // POST /sessions/:id/prompt
+      // Body: { text?: string, select?: string }
+      // - select+text: answer the pending question with `select`, then wait for
+      //   the turn that follows. The optional `text` is sent after the choice
+      //   (used for the "Other" sentinel "0").
+      // - select only: same, no follow-up text.
+      // - text only: standard prompt + wait.
       if (method === "POST" && action === "prompt") {
         if (!requireLiveSession(res, sessionId, ds)) return;
-        const body = JSON.parse(await readBody(req)) as { text: string };
+        const body = parseOptionalJsonObject<{ text?: string; select?: string }>(
+          await readBody(req),
+        );
+        if (!body.text && !body.select) {
+          err(res, 400, "prompt requires `text` or `select` in the request body");
+          return;
+        }
         const outcome = await runSessionOp(res, sessionId, ds, async () => {
-          const result = await ds.session.prompt(body.text);
-          await ds.session.flushEvents();
-          return result;
-        });
-        if (!outcome.ok) return;
-        json(res, 200, {
-          ...outcome.value,
-          eventSeq: ds.lastEventSeq,
-        });
-        return;
-      }
-
-      // POST /sessions/:id/await-turn
-      if (method === "POST" && action === "await-turn") {
-        if (!requireLiveSession(res, sessionId, ds)) return;
-        const outcome = await runSessionOp(res, sessionId, ds, async () => {
-          const result = await ds.session.awaitTurn();
+          const result = body.select
+            ? await ds.session.answerPending(body.select, body.text)
+            : await ds.session.prompt(body.text!);
           await ds.session.flushEvents();
           return result;
         });
@@ -515,31 +437,28 @@ function createDaemonServer(
       }
 
       // POST /sessions/:id/send
+      // Body: { text?: string, select?: string }
+      // Fire-and-forget mirror of /prompt. With `select`, the choice is sent
+      // first, then the optional `text` (matching `cband send --select`).
       if (method === "POST" && action === "send") {
         if (!requireLiveSession(res, sessionId, ds)) return;
-        const body = JSON.parse(await readBody(req)) as { text: string };
-        const outcome = await runSessionOp(res, sessionId, ds, () =>
-          ds.session.send(body.text),
+        const body = parseOptionalJsonObject<{ text?: string; select?: string }>(
+          await readBody(req),
         );
+        if (!body.text && !body.select) {
+          err(res, 400, "send requires `text` or `select` in the request body");
+          return;
+        }
+        const outcome = await runSessionOp(res, sessionId, ds, async () => {
+          if (body.select) {
+            await ds.session.send(body.select);
+          }
+          if (body.text) {
+            await ds.session.send(body.text);
+          }
+        });
         if (!outcome.ok) return;
         json(res, 200, { ok: true });
-        return;
-      }
-
-      // POST /sessions/:id/send-and-await-turn
-      if (method === "POST" && action === "send-and-await-turn") {
-        if (!requireLiveSession(res, sessionId, ds)) return;
-        const body = JSON.parse(await readBody(req)) as { text: string };
-        const outcome = await runSessionOp(res, sessionId, ds, async () => {
-          const result = await ds.session.sendAndAwaitTurn(body.text);
-          await ds.session.flushEvents();
-          return result;
-        });
-        if (!outcome.ok) return;
-        json(res, 200, {
-          ...outcome.value,
-          eventSeq: ds.lastEventSeq,
-        });
         return;
       }
 
@@ -630,6 +549,7 @@ export async function startServer(config: CliConfig): Promise<void> {
     model: config.model,
     permissionMode: config.permissionMode,
     terminalBackend: resolveServerTerminalBackend(config),
+    turnDetection: config.turnDetection,
     logger,
   });
 
@@ -659,8 +579,7 @@ export const __test = {
   resolveSessionConfig,
   resolveServerTerminalBackend,
   shouldReuseSession,
-  sessionSummaryToJson,
-  extractLastAssistantTurn,
+  sessionStatusToJson,
   createDaemonServer,
 };
 

@@ -12,12 +12,16 @@ describe("claudraband cli args", () => {
     const args = parseArgs(["hello"]);
     expect(args.terminalBackend).toBe("auto");
     expect(args.hasExplicitTerminalBackend).toBe(false);
+    expect(args.turnDetection).toBe("terminal");
+    expect(args.hasExplicitTurnDetection).toBe(false);
   });
 
-  test("parses explicit backend and top-level flags", () => {
+  test("parses explicit backend, turn detection, and top-level flags", () => {
     const args = parseArgs([
       "--backend",
       "xterm",
+      "--turn-detection",
+      "events",
       "--model",
       "opus",
       "--permission-mode",
@@ -26,6 +30,8 @@ describe("claudraband cli args", () => {
     ]);
     expect(args.terminalBackend).toBe("xterm");
     expect(args.hasExplicitTerminalBackend).toBe(true);
+    expect(args.turnDetection).toBe("events");
+    expect(args.hasExplicitTurnDetection).toBe(true);
     expect(args.model).toBe("opus");
     expect(args.permissionMode).toBe("bypassPermissions");
     expect(args.prompt).toBe("hello");
@@ -59,11 +65,11 @@ describe("claudraband cli args", () => {
     expect(args.prompt).toBe("hello");
   });
 
-  test("parses continue command", () => {
-    const args = parseArgs(["continue", "abc-123", "continue"]);
+  test("parses prompt with --session auto-resumes", () => {
+    const args = parseArgs(["prompt", "--session", "abc-123", "continue"]);
     expect(args.sessionId).toBe("abc-123");
     expect(args.prompt).toBe("continue");
-    expect(args.command).toBe("continue");
+    expect(args.command).toBe("prompt");
   });
 
   test("rejects removed -s shorthand", () => {
@@ -74,20 +80,43 @@ describe("claudraband cli args", () => {
     expect(() => parseArgs(["answer", "abc-123", "2"], noopIo as never)).toThrow("exit(1)");
   });
 
-  test("parses continue selection flow", () => {
-    const args = parseArgs(["continue", "abc-123", "--select", "2"]);
-    expect(args.command).toBe("continue");
+  test("rejects removed continue command", () => {
+    expect(() => parseArgs(["continue", "abc-123", "keep going"], noopIo as never)).toThrow("exit(1)");
+  });
+
+  test("parses prompt --select selection flow", () => {
+    const args = parseArgs(["prompt", "--session", "abc-123", "--select", "2"]);
+    expect(args.command).toBe("prompt");
     expect(args.sessionId).toBe("abc-123");
     expect(args.answer).toBe("2");
     expect(args.prompt).toBe("");
   });
 
-  test("parses continue selection flow with text response", () => {
-    const args = parseArgs(["continue", "abc-123", "--select", "3", "xyz"]);
-    expect(args.command).toBe("continue");
+  test("parses prompt --select with text response", () => {
+    const args = parseArgs(["prompt", "--session", "abc-123", "--select", "3", "xyz"]);
+    expect(args.command).toBe("prompt");
     expect(args.sessionId).toBe("abc-123");
     expect(args.answer).toBe("3");
     expect(args.prompt).toBe("xyz");
+  });
+
+  test("parses send command", () => {
+    const args = parseArgs(["send", "--session", "abc-123", "quick note"]);
+    expect(args.command).toBe("send");
+    expect(args.sessionId).toBe("abc-123");
+    expect(args.prompt).toBe("quick note");
+  });
+
+  test("parses watch command", () => {
+    const args = parseArgs(["watch", "--session", "abc-123"]);
+    expect(args.command).toBe("watch");
+    expect(args.sessionId).toBe("abc-123");
+  });
+
+  test("parses interrupt command", () => {
+    const args = parseArgs(["interrupt", "--session", "abc-123"]);
+    expect(args.command).toBe("interrupt");
+    expect(args.sessionId).toBe("abc-123");
   });
 
   test("rejects removed -s shorthand with --select", () => {
@@ -174,7 +203,7 @@ describe("claudraband cli args", () => {
       .toThrow("exit(1)");
   });
 
-  test("--select is rejected without continue", () => {
+  test("--select is rejected without --session", () => {
     expect(() => parseArgs(["hello", "--select", "2"], noopIo as never)).toThrow("exit(1)");
   });
 

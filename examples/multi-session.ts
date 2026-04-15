@@ -50,8 +50,8 @@ const approve = async (request: { options: Array<{ optionId: string }> }) => ({
 console.log("Starting two sessions in parallel...\n");
 
 const [a, b] = await Promise.all([
-  runtime.startSession({ cwd, onPermissionRequest: approve }),
-  runtime.startSession({ cwd, onPermissionRequest: approve }),
+  runtime.openSession({ cwd, onPermissionRequest: approve }),
+  runtime.openSession({ cwd, onPermissionRequest: approve }),
 ]);
 
 const streamA = streamSession(a, BLUE, "A");

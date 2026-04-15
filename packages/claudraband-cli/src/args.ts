@@ -2,6 +2,7 @@ import {
   parseClaudeArgs,
   type PermissionMode,
   type TerminalBackend,
+  type TurnDetectionMode,
 } from "claudraband-core";
 import { renderHelp, type HelpTopic } from "./help";
 
@@ -19,7 +20,9 @@ const defaultIo: ParseIo = {
 
 export type CliCommand =
   | "prompt"
-  | "continue"
+  | "send"
+  | "watch"
+  | "interrupt"
   | "attach"
   | "sessions"
   | "session-close"
@@ -37,14 +40,19 @@ export interface CliConfig {
   cwd: string;
   hasExplicitCwd: boolean;
   debug: boolean;
+  json: boolean;
+  pretty: boolean;
+  follow: boolean;
   claudeArgs: string[];
   hasExplicitClaudeArgs: boolean;
   hasExplicitModel: boolean;
   hasExplicitPermissionMode: boolean;
   hasExplicitTerminalBackend: boolean;
+  hasExplicitTurnDetection: boolean;
   model: string;
   permissionMode: PermissionMode;
   terminalBackend: TerminalBackend;
+  turnDetection: TurnDetectionMode;
   connect: string;
   host: string;
   port: number;
@@ -61,14 +69,19 @@ export function parseArgs(argv: string[], io: ParseIo = defaultIo): CliConfig {
     cwd: process.cwd(),
     hasExplicitCwd: false,
     debug: false,
+    json: false,
+    pretty: false,
+    follow: true,
     claudeArgs: [],
     hasExplicitClaudeArgs: false,
     hasExplicitModel: false,
     hasExplicitPermissionMode: false,
     hasExplicitTerminalBackend: false,
+    hasExplicitTurnDetection: false,
     model: "sonnet",
     permissionMode: "default",
     terminalBackend: "auto",
+    turnDetection: "terminal",
     connect: "",
     host: "127.0.0.1",
     port: 7842,
@@ -118,6 +131,12 @@ export function parseArgs(argv: string[], io: ParseIo = defaultIo): CliConfig {
       continue;
     }
 
+    if (arg === "--turn-detection" && i + 1 < argv.length) {
+      config.turnDetection = argv[++i] as TurnDetectionMode;
+      config.hasExplicitTurnDetection = true;
+      continue;
+    }
+
     if (arg === "--model" && i + 1 < argv.length) {
       explicitModel = argv[++i];
       config.hasExplicitModel = true;
@@ -137,6 +156,26 @@ export function parseArgs(argv: string[], io: ParseIo = defaultIo): CliConfig {
 
     if (arg === "--select" && i + 1 < argv.length) {
       selectAlias = argv[++i];
+      continue;
+    }
+
+    if (arg === "--session" && i + 1 < argv.length) {
+      config.sessionId = argv[++i];
+      continue;
+    }
+
+    if (arg === "--json") {
+      config.json = true;
+      continue;
+    }
+
+    if (arg === "--pretty") {
+      config.pretty = true;
+      continue;
+    }
+
+    if (arg === "--no-follow") {
+      config.follow = false;
       continue;
     }
 
@@ -190,17 +229,23 @@ export function parseArgs(argv: string[], io: ParseIo = defaultIo): CliConfig {
     io.exit(0);
   }
 
-  if (selectAlias && config.command !== "continue") {
-    io.stderr("error: --select only works with 'cband continue <session-id> ...'.\n");
-    io.stderr(renderHelp("continue"));
+  if (selectAlias && config.command !== "prompt" && config.command !== "send") {
+    io.stderr("error: --select only works with 'cband prompt' or 'cband send'.\n");
+    io.stderr(renderHelp("prompt"));
     io.exit(1);
   }
 
-  if (positional[0] === "answer") {
+  if (selectAlias && !config.sessionId) {
+    io.stderr("error: --select requires --session <id>.\n");
+    io.stderr(renderHelp("prompt"));
+    io.exit(1);
+  }
+
+  if (positional[0] === "answer" || positional[0] === "continue") {
     io.stderr(
-      "error: 'claudraband answer' has been removed. Use 'cband continue <session-id> --select <choice> [text]'.\n",
+      "error: '" + positional[0] + "' has been removed. Use 'cband prompt --session <id> [--select <choice>] [text]' to continue a saved session.\n",
     );
-    io.stderr(renderHelp("continue"));
+    io.stderr(renderHelp("prompt"));
     io.exit(1);
   }
 
@@ -210,7 +255,10 @@ export function parseArgs(argv: string[], io: ParseIo = defaultIo): CliConfig {
 }
 
 function resolveHelpTopic(positional: string[]): HelpTopic {
-  if (positional[0] === "continue") return "continue";
+  if (positional[0] === "prompt") return "prompt";
+  if (positional[0] === "send") return "send";
+  if (positional[0] === "watch") return "watch";
+  if (positional[0] === "interrupt") return "interrupt";
   if (positional[0] === "attach") return "attach";
   if (positional[0] === "sessions" && positional[1] === "close") return "session-close";
   if (positional[0] === "sessions") return "sessions";
@@ -229,29 +277,51 @@ function resolveCommand(
   },
 ): void {
   switch (positional[0]) {
-    case "continue":
-      config.command = "continue";
-      config.sessionId = positional[1] ?? "";
+    case "prompt":
+      config.command = "prompt";
       config.answer = aliases.selectAlias;
-      config.prompt = positional.slice(2).join(" ");
+      config.prompt = positional.slice(1).join(" ");
+      return;
+    case "send":
+      config.command = "send";
+      config.answer = aliases.selectAlias;
+      config.prompt = positional.slice(1).join(" ");
+      return;
+    case "watch":
+      config.command = "watch";
+      if (!config.sessionId && positional[1]) {
+        config.sessionId = positional[1];
+      }
+      return;
+    case "interrupt":
+      config.command = "interrupt";
+      if (!config.sessionId && positional[1]) {
+        config.sessionId = positional[1];
+      }
       return;
     case "attach":
       config.command = "attach";
-      config.sessionId = positional[1] ?? "";
+      if (!config.sessionId && positional[1]) {
+        config.sessionId = positional[1];
+      }
       return;
     case "sessions":
       config.command = positional[1] === "close" ? "session-close" : "sessions";
-      if (config.command === "session-close") {
+      if (config.command === "session-close" && !config.sessionId) {
         config.sessionId = positional[2] ?? "";
       }
       return;
     case "status":
       config.command = "status";
-      config.sessionId = positional[1] ?? "";
+      if (!config.sessionId && positional[1]) {
+        config.sessionId = positional[1];
+      }
       return;
     case "last":
       config.command = "last";
-      config.sessionId = positional[1] ?? "";
+      if (!config.sessionId && positional[1]) {
+        config.sessionId = positional[1];
+      }
       return;
     case "serve":
       config.command = "serve";
@@ -263,7 +333,9 @@ function resolveCommand(
       break;
   }
 
+  // No keyword: default to prompt with all positionals as text.
   config.command = "prompt";
+  config.answer = aliases.selectAlias;
   config.prompt = positional.join(" ");
 }
 
@@ -271,8 +343,7 @@ function validateConfig(config: CliConfig, io: ParseIo): void {
   if (
     config.connect
     && (
-      config.command === "continue"
-      || config.command === "attach"
+      config.command === "attach"
       || config.command === "sessions"
       || config.command === "session-close"
       || config.command === "status"
@@ -295,7 +366,7 @@ function validateConfig(config: CliConfig, io: ParseIo): void {
 
   if (config.command === "status") {
     if (!config.sessionId) {
-      io.stderr("error: status requires <session-id>.\n");
+      io.stderr("error: status requires --session <id> (or positional <session-id>).\n");
       io.stderr(renderHelp("status"));
       io.exit(1);
     }
@@ -303,21 +374,24 @@ function validateConfig(config: CliConfig, io: ParseIo): void {
 
   if (config.command === "last") {
     if (!config.sessionId) {
-      io.stderr("error: last requires <session-id>.\n");
+      io.stderr("error: last requires --session <id> (or positional <session-id>).\n");
       io.stderr(renderHelp("last"));
       io.exit(1);
     }
   }
 
-  if (config.command === "continue") {
+  if (config.command === "watch") {
     if (!config.sessionId) {
-      io.stderr("error: continue requires <session-id>.\n");
-      io.stderr(renderHelp("continue"));
+      io.stderr("error: watch requires --session <id>.\n");
+      io.stderr(renderHelp("watch"));
       io.exit(1);
     }
-    if (!config.answer && !config.prompt) {
-      io.stderr("error: continue requires either <prompt...> or --select <choice>.\n");
-      io.stderr(renderHelp("continue"));
+  }
+
+  if (config.command === "interrupt") {
+    if (!config.sessionId) {
+      io.stderr("error: interrupt requires --session <id>.\n");
+      io.stderr(renderHelp("interrupt"));
       io.exit(1);
     }
   }
@@ -344,18 +418,17 @@ function validateConfig(config: CliConfig, io: ParseIo): void {
     io.exit(1);
   }
 
-  if (config.command === "prompt" && !config.prompt) {
+  if (config.command === "prompt" && !config.prompt && !config.answer) {
     io.stderr("error: no prompt provided.\n");
     io.stderr(renderHelp("top"));
     io.exit(1);
   }
 
-  if (config.command !== "continue" && config.answer) {
-    io.stderr("error: --select only works with 'cband continue <session-id> ...'.\n");
-    io.stderr(renderHelp("continue"));
+  if (config.command === "send" && !config.prompt && !config.answer) {
+    io.stderr("error: send requires text or --select <choice>.\n");
+    io.stderr(renderHelp("send"));
     io.exit(1);
   }
-
 }
 
 export function splitShellWords(input: string): string[] {

@@ -12,14 +12,19 @@ function makeConfig(overrides: Partial<CliConfig> = {}): CliConfig {
     cwd: "/daemon-cwd",
     hasExplicitCwd: false,
     debug: false,
+    json: false,
+    pretty: false,
+    follow: true,
     claudeArgs: ["--append-system-prompt", "daemon"],
     hasExplicitClaudeArgs: true,
     hasExplicitModel: true,
     hasExplicitPermissionMode: true,
     hasExplicitTerminalBackend: false,
+    hasExplicitTurnDetection: true,
     model: "sonnet",
     permissionMode: "default",
     terminalBackend: "auto",
+    turnDetection: "events",
     connect: "",
     host: "127.0.0.1",
     port: 7842,
@@ -65,6 +70,7 @@ describe("daemon server helpers", () => {
       claudeArgs: ["--effort", "high"],
       model: "opus",
       permissionMode: "bypassPermissions",
+      turnDetection: "events",
     });
 
     expect(resolved).toEqual({
@@ -72,6 +78,7 @@ describe("daemon server helpers", () => {
       claudeArgs: ["--effort", "high"],
       model: "opus",
       permissionMode: "bypassPermissions",
+      turnDetection: "events",
     });
   });
 
@@ -83,6 +90,7 @@ describe("daemon server helpers", () => {
       claudeArgs: ["--append-system-prompt", "daemon"],
       model: "sonnet",
       permissionMode: "default",
+      turnDetection: "events",
     });
   });
 
