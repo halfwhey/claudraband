@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { randomUUID } from "node:crypto";
 import { createServer } from "node:http";
 import { mkdtemp, mkdir, rm, writeFile } from "node:fs/promises";
-import { tmpdir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import { createClaudraband, EventKind, __test } from "./index";
 import { sessionPath } from "./claude";
@@ -343,6 +343,66 @@ describe("session discovery", () => {
     }
   });
 
+  test("keeps daemon-owned sessions live when the daemon pid is not local", async () => {
+    const sessionId = randomUUID();
+    const server = createServer((req, res) => {
+      if (req.method === "GET" && req.url === "/sessions") {
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({
+          sessions: [{ sessionId, alive: true }],
+        }));
+        return;
+      }
+      res.writeHead(404).end();
+    });
+
+    try {
+      await new Promise<void>((resolve) => server.listen(0, resolve));
+      const address = server.address();
+      if (!address || typeof address === "string") {
+        throw new Error("expected TCP server address");
+      }
+
+      const recordDir = join(registryHome, "sessions");
+      await mkdir(recordDir, { recursive: true });
+      await writeFile(
+        join(recordDir, `${sessionId}.json`),
+        JSON.stringify({
+          version: 1,
+          sessionId,
+          cwd: "/repo",
+          backend: "xterm",
+          title: "container daemon session",
+          createdAt: "2026-04-12T00:00:00.000Z",
+          updatedAt: "2026-04-12T00:00:00.000Z",
+          lastKnownAlive: true,
+          reattachable: true,
+          owner: {
+            kind: "daemon",
+            serverUrl: `http://127.0.0.1:${address.port}`,
+            serverPid: 999_999,
+            serverInstanceId: "container-daemon-test",
+          },
+        }),
+      );
+
+      const runtime = createClaudraband();
+      const sessions = await runtime.listSessions();
+      const found = sessions.find((session) => session.sessionId === sessionId);
+
+      expect(found?.owner.kind).toBe("daemon");
+      expect(found?.source).toBe("live");
+      expect(found?.alive).toBe(true);
+    } finally {
+      await new Promise<void>((resolve, reject) =>
+        server.close((err) => (err ? reject(err) : resolve())),
+      );
+      await rm(join(registryHome, "sessions", `${sessionId}.json`), {
+        force: true,
+      });
+    }
+  });
+
   test("lists only claudraband-tracked transcript sessions as history", async () => {
     const sessionId = randomUUID();
     const cwd = `/tmp/claudraband-history-${sessionId}`;
@@ -437,6 +497,93 @@ describe("session discovery", () => {
       expect(found?.owner.kind).toBe("daemon");
       expect(found?.source).toBe("live");
       expect(found?.alive).toBe(false);
+    } finally {
+      await rm(join(transcript, ".."), { recursive: true, force: true });
+    }
+  });
+
+  test("sessionPath matches Claude project directory escaping", () => {
+    expect(sessionPath("/tmp/claudraband-host-1.1b_IVaduZ", "sid")).toBe(
+      join(
+        homedir(),
+        ".claude",
+        "projects",
+        "-tmp-claudraband-host-1-1b-IVaduZ",
+        "sid.jsonl",
+      ),
+    );
+  });
+
+  test("detach keeps live tmux sessions tracked", async () => {
+    const sessionId = randomUUID();
+    const cwd = "/tmp/claudraband-host-1.1b.IVaduZ";
+    const session = __test.createSession(new FakeSessionWrapper() as never, {
+      sessionId,
+      cwd,
+      backend: "tmux",
+    });
+
+    await (session as unknown as { syncSessionRecord(): Promise<void> }).syncSessionRecord();
+    await session.detach();
+
+    const record = await readSessionRecord(sessionId);
+    expect(record?.lastKnownAlive).toBe(true);
+    expect(record?.reattachable).toBe(true);
+    expect(record?.transcriptPath).toBe(sessionPath(cwd, sessionId));
+  });
+
+  test("interrupt markers clear stale in-progress transcript state", async () => {
+    const sessionId = randomUUID();
+    const cwd = `/tmp/claudraband-interrupt-${sessionId}`;
+    const transcript = sessionPath(cwd, sessionId);
+
+    try {
+      await mkdir(join(transcript, ".."), { recursive: true });
+      await writeFile(
+        transcript,
+        [
+          JSON.stringify({
+            type: "user",
+            message: { role: "user", content: "run sleep" },
+            sessionId,
+          }),
+          JSON.stringify({
+            type: "assistant",
+            message: {
+              role: "assistant",
+              content: [{
+                type: "tool_use",
+                id: "toolu_interrupt",
+                name: "Bash",
+                input: { command: "sleep 30" },
+              }],
+              stop_reason: "tool_use",
+            },
+            sessionId,
+          }),
+          JSON.stringify({
+            type: "system",
+            subtype: "interrupt",
+            content: "interrupt",
+            sessionId,
+          }),
+          "",
+        ].join("\n"),
+      );
+      await writeKnownSessionRecord({
+        version: 1,
+        sessionId,
+        cwd,
+        backend: "tmux",
+        createdAt: "2026-04-12T00:00:00.000Z",
+        updatedAt: "2026-04-12T00:00:00.000Z",
+        transcriptPath: transcript,
+      });
+
+      const status = await createClaudraband().getStatus(sessionId, cwd);
+
+      expect(status?.alive).toBe(false);
+      expect(status?.turnInProgress).toBe(false);
     } finally {
       await rm(join(transcript, ".."), { recursive: true, force: true });
     }

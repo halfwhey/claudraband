@@ -80,6 +80,41 @@ export async function hasPendingQuestion(jsonlPath: string): Promise<boolean> {
   return pendingIds.size > 0;
 }
 
+export async function hasPendingToolUse(jsonlPath: string): Promise<boolean> {
+  let data: string;
+  try {
+    data = await readFile(jsonlPath, "utf-8");
+  } catch {
+    return false;
+  }
+
+  const pendingIds = new Set<string>();
+
+  for (const line of data.split("\n")) {
+    if (!line.trim()) continue;
+    let entry: JsonlEntry;
+    try {
+      entry = JSON.parse(line) as JsonlEntry;
+    } catch {
+      continue;
+    }
+
+    if (!entry.message || !Array.isArray(entry.message.content)) continue;
+    const blocks = entry.message.content as ContentBlock[];
+
+    for (const block of blocks) {
+      if (block.type === "tool_use" && block.id) {
+        pendingIds.add(block.id);
+      }
+      if (block.type === "tool_result" && block.tool_use_id) {
+        pendingIds.delete(block.tool_use_id);
+      }
+    }
+  }
+
+  return pendingIds.size > 0;
+}
+
 export function parseNativePermissionPrompt(
   paneText: string,
 ): NativePermissionPrompt | null {
@@ -104,7 +139,7 @@ export function parseNativePermissionPrompt(
     );
   } else {
     questionMatch = normalizedPane.match(
-      /(?:^|\n)\s*(Do you want to [^\n]+\?)/,
+      /(?:^|\n)\s*((?:Do you want to [^\n]+\?|This [^\n]* requires approval[^\n]*))/,
     );
   }
   if (!questionMatch) return null;

@@ -29,7 +29,16 @@ const YELLOW = "\x1b[33m";
 const RESET = "\x1b[0m";
 
 const runtime = createClaudraband();
-const events = await runtime.replaySession(sessionId, cwd);
+let events = await runtime.replaySession(sessionId, cwd);
+
+if (events.length === 0) {
+  const summary =
+    await runtime.inspectSession(sessionId, cwd) ??
+    await runtime.inspectSession(sessionId);
+  if (summary) {
+    events = await runtime.replaySession(sessionId, summary.cwd);
+  }
+}
 
 if (events.length === 0) {
   console.error(`no events found for session ${sessionId}`);

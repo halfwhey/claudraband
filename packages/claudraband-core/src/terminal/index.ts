@@ -76,6 +76,7 @@ interface PtyTransport {
     onExit: () => void,
   ): Promise<void>;
   stop(): Promise<void>;
+  interrupt(): Promise<boolean>;
   write(data: string): void;
   alive(): boolean;
   pid(): number | undefined;
@@ -408,9 +409,12 @@ class XtermTerminalHost implements TerminalHost {
 
   async interrupt(): Promise<void> {
     if (!this.transport) throw new Error("xterm terminal is not started");
-    if (!this.terminal) throw new Error("xterm terminal is not started");
     await this.outputDrain.catch(() => {});
-    this.terminal.input("\u0003");
+    const interrupted = await this.transport.interrupt().catch(() => false);
+    if (!interrupted) {
+      if (!this.terminal) throw new Error("xterm terminal is not started");
+      this.terminal.input("\u0003");
+    }
   }
 
   async capture(): Promise<string> {
@@ -508,6 +512,14 @@ class NodePtyTransport implements PtyTransport {
     this.aliveFlag = false;
   }
 
+  async interrupt(): Promise<boolean> {
+    if (!this.pty) {
+      return false;
+    }
+    this.pty.write("\u001b");
+    return true;
+  }
+
   write(data: string): void {
     if (!this.pty) throw new Error("node-pty transport is not started");
     this.pty.write(data);
@@ -595,6 +607,14 @@ class BunTerminalTransport implements PtyTransport {
     this.process = null;
     this.terminal = null;
     this.aliveFlag = false;
+  }
+
+  async interrupt(): Promise<boolean> {
+    if (!this.terminal) {
+      return false;
+    }
+    this.terminal.write("\u001b");
+    return true;
   }
 
   write(data: string): void {
