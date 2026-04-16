@@ -29,9 +29,13 @@ export function normalizeSessionCwd(cwd: string): string {
   return resolve(cwd);
 }
 
+function escapeProjectDirName(cwd: string): string {
+  return normalizeSessionCwd(cwd).replace(/[^A-Za-z0-9-]/g, "-");
+}
+
 export function sessionPath(cwd: string, sessionID: string): string {
   const home = homedir();
-  const escaped = normalizeSessionCwd(cwd).replace(/\//g, "-");
+  const escaped = escapeProjectDirName(cwd);
   return join(home, ".claude", "projects", escaped, `${sessionID}.jsonl`);
 }
 
@@ -231,6 +235,7 @@ export class ClaudeWrapper implements Wrapper {
     const MAX_WAIT_MS = 15_000;
     const POLL_MS = 300;
     const start = Date.now();
+    let lastStartupPromptFingerprint = "";
 
     while (Date.now() - start < MAX_WAIT_MS) {
       if (signal.aborted) return;
@@ -242,14 +247,23 @@ export class ClaudeWrapper implements Wrapper {
         // The trust prompt appears before Claude enters INSERT mode and before
         // any JSONL is written. Detect it from the terminal capture and
         // auto-select "Yes, I trust this folder" (option 1).
-        if (
-          (pane.includes("Yes, I trust this folder") &&
-            pane.includes("No, exit")) ||
-          (pane.includes("Bypass Permissions mode") &&
-            pane.includes("Yes, I accept"))
-        ) {
-          return;
+        const isTrustPrompt =
+          pane.includes("Yes, I trust this folder") &&
+          pane.includes("No, exit");
+        const isBypassPrompt =
+          pane.includes("Bypass Permissions mode") &&
+          pane.includes("Yes, I accept");
+        const startupPromptFingerprint =
+          isTrustPrompt ? "trust" : isBypassPrompt ? "bypass" : "";
+        if (startupPromptFingerprint) {
+          if (lastStartupPromptFingerprint !== startupPromptFingerprint) {
+            await this.terminal!.send("1").catch(() => {});
+            lastStartupPromptFingerprint = startupPromptFingerprint;
+          }
+          await new Promise((resolve) => setTimeout(resolve, POLL_MS));
+          continue;
         }
+        lastStartupPromptFingerprint = "";
       } catch {
         // pane not ready yet
       }

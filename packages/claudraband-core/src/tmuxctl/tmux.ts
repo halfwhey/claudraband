@@ -69,6 +69,10 @@ function windowTarget(sessionName: string, windowName: string): string {
   return `${sessionName}:${windowName}`;
 }
 
+function isDuplicateSessionError(error: unknown): boolean {
+  return /duplicate session/i.test(String(error));
+}
+
 export async function killSession(name: string): Promise<void> {
   if (!hasSession(name)) return;
   await tmux("kill-session", "-t", name);
@@ -154,80 +158,93 @@ export class Session {
 
     const format = ["#{window_id}", "#{pane_id}"].join(FIELD_DELIM);
     const target = windowTarget(name, windowName);
-    const result = hasSession(name)
-      ? await tmux(
-        "new-window",
-        "-P",
-        "-F",
-        format,
-        "-t",
-        name,
-        "-n",
-        windowName,
-        ...(workingDir ? ["-c", workingDir] : []),
-        ...command,
-        ";",
-        "set-option",
-        "-q",
-        "-t",
-        name,
-        "destroy-unattached",
-        "off",
-        ";",
-        "set-option",
-        "-q",
-        "-t",
-        name,
-        "status",
-        "off",
-        ";",
-        "resize-window",
-        "-t",
-        target,
-        "-x",
-        String(width),
-        "-y",
-        String(height),
-      )
-      : await tmux(
-        "new-session",
-        "-d",
-        "-P",
-        "-F",
-        format,
-        "-s",
-        name,
-        "-n",
-        windowName,
-        "-x",
-        String(width),
-        "-y",
-        String(height),
-        ...(workingDir ? ["-c", workingDir] : []),
-        ...command,
-        ";",
-        "set-option",
-        "-q",
-        "-t",
-        name,
-        "destroy-unattached",
-        "off",
-        ";",
-        "set-option",
-        "-q",
-        "-t",
-        name,
-        "status",
-        "off",
-        ";",
-        "resize-window",
-        "-t",
-        target,
-        "-x",
-        String(width),
-        "-y",
-        String(height),
-      );
+    const createWindow = () => tmux(
+      "new-window",
+      "-P",
+      "-F",
+      format,
+      "-t",
+      name,
+      "-n",
+      windowName,
+      ...(workingDir ? ["-c", workingDir] : []),
+      ...command,
+      ";",
+      "set-option",
+      "-q",
+      "-t",
+      name,
+      "destroy-unattached",
+      "off",
+      ";",
+      "set-option",
+      "-q",
+      "-t",
+      name,
+      "status",
+      "off",
+      ";",
+      "resize-window",
+      "-t",
+      target,
+      "-x",
+      String(width),
+      "-y",
+      String(height),
+    );
+    const createSession = () => tmux(
+      "new-session",
+      "-d",
+      "-P",
+      "-F",
+      format,
+      "-s",
+      name,
+      "-n",
+      windowName,
+      "-x",
+      String(width),
+      "-y",
+      String(height),
+      ...(workingDir ? ["-c", workingDir] : []),
+      ...command,
+      ";",
+      "set-option",
+      "-q",
+      "-t",
+      name,
+      "destroy-unattached",
+      "off",
+      ";",
+      "set-option",
+      "-q",
+      "-t",
+      name,
+      "status",
+      "off",
+      ";",
+      "resize-window",
+      "-t",
+      target,
+      "-x",
+      String(width),
+      "-y",
+      String(height),
+    );
+
+    let result: { stdout: string; stderr: string };
+    if (hasSession(name)) {
+      result = await createWindow();
+    } else {
+      try {
+        result = await createSession();
+      } catch (error) {
+        if (!isDuplicateSessionError(error) && !hasSession(name)) {
+          throw error;
+        }
+        result = await createWindow();
+      }
+    }
 
     const [windowId, paneId] = result.stdout.trim().split(FIELD_DELIM, 2);
     if (!windowId || !paneId) {
@@ -306,7 +323,17 @@ export class Session {
   }
 
   async interrupt(): Promise<void> {
-    await this.sendSpecial("C-c");
+    const panePid = await this.panePID().catch(() => 0);
+    if (panePid > 0) {
+      try {
+        process.kill(panePid, "SIGINT");
+        return;
+      } catch {
+        // Fall back to sending an in-terminal key if signaling fails.
+      }
+    }
+
+    await this.sendSpecial("Escape");
   }
 
   async capturePane(opts: CaptureOpts = {}): Promise<string> {

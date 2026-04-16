@@ -22,13 +22,13 @@ function listWindows(name: string): string[] {
 }
 
 async function waitFor(
-  predicate: () => boolean,
+  predicate: () => boolean | Promise<boolean>,
   timeoutMs = 1500,
   intervalMs = 50,
 ): Promise<void> {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
-    if (predicate()) {
+    if (await predicate()) {
       return;
     }
     await Bun.sleep(intervalMs);
@@ -100,6 +100,42 @@ describe("tmuxctl", () => {
     }
   });
 
+  test("concurrent session creation falls back to new-window without racing", async () => {
+    const name = sharedSessionName();
+    let first: Session | undefined;
+    let second: Session | undefined;
+    try {
+      [first, second] = await Promise.all([
+        Session.newSession(name, 80, 24, "/tmp", [
+          "bash",
+          "-c",
+          "echo FIRST_OK; sleep 3",
+        ], "claude-session-1"),
+        Session.newSession(name, 80, 24, "/tmp", [
+          "bash",
+          "-c",
+          "echo SECOND_OK; sleep 3",
+        ], "claude-session-2"),
+      ]);
+    } catch (err) {
+      if (isSandboxTmuxError(err)) return;
+      throw err;
+    }
+    try {
+      await Bun.sleep(500);
+      expect(listWindows(name).sort()).toEqual([
+        "claude-session-1",
+        "claude-session-2",
+      ]);
+      expect(await first.capturePane()).toContain("FIRST_OK");
+      expect(await second.capturePane()).toContain("SECOND_OK");
+    } finally {
+      await first?.kill().catch(() => {});
+      await second?.kill().catch(() => {});
+      await killSession(name).catch(() => {});
+    }
+  });
+
   test("killing one Claude window leaves sibling windows alive", async () => {
     const name = sharedSessionName();
     let first: Session | undefined;
@@ -141,6 +177,30 @@ describe("tmuxctl", () => {
     } finally {
       await first?.kill().catch(() => {});
       await second?.kill().catch(() => {});
+      await killSession(name).catch(() => {});
+    }
+  });
+
+  test("interrupt signals the tmux pane process", async () => {
+    const name = sharedSessionName();
+    let sess: Session | undefined;
+    try {
+      sess = await Session.newSession(name, 80, 24, "/tmp", [
+        "bash",
+        "-lc",
+        "sleep 30",
+      ], "claude-session-interrupt");
+    } catch (err) {
+      if (isSandboxTmuxError(err)) return;
+      throw err;
+    }
+    try {
+      await Bun.sleep(500);
+      await sess.interrupt();
+      await waitFor(() => !sess!.isAlive, 5000);
+      expect(sess.isAlive).toBe(false);
+    } finally {
+      await sess?.kill().catch(() => {});
       await killSession(name).catch(() => {});
     }
   });

@@ -1,5 +1,12 @@
 import { describe, expect, test } from "bun:test";
-import { hasPendingNativePrompt, parseNativePermissionPrompt } from "./inspect";
+import { mkdtemp, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import {
+  hasPendingNativePrompt,
+  hasPendingToolUse,
+  parseNativePermissionPrompt,
+} from "./inspect";
 
 describe("claude session inspection", () => {
   test("detects native Claude permission prompts from pane text", () => {
@@ -15,6 +22,25 @@ Do you want to make this edit?
       options: [
         { number: "1", label: "Yes, allow once" },
         { number: "2", label: "No, and tell Claude what to do differently" },
+      ],
+    });
+  });
+
+  test("detects command approval prompts from pane text", () => {
+    const pane = `
+This command requires approval
+❯ 1. Yes, allow once
+  2. Yes, allow all commands during this session
+  3. No
+`;
+
+    expect(hasPendingNativePrompt(pane)).toBe(true);
+    expect(parseNativePermissionPrompt(pane)).toEqual({
+      question: "This command requires approval",
+      options: [
+        { number: "1", label: "Yes, allow once" },
+        { number: "2", label: "Yes, allow all commands during this session" },
+        { number: "3", label: "No" },
       ],
     });
   });
@@ -122,5 +148,61 @@ Do you want to make this edit?
   test("ignores unrelated pane content", () => {
     expect(hasPendingNativePrompt("INSERT\nClaude is idle\n")).toBe(false);
     expect(parseNativePermissionPrompt("plain text")).toBeNull();
+  });
+
+  test("detects unresolved tool calls in the transcript", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "claudraband-inspect-"));
+    const path = join(dir, "session.jsonl");
+    await writeFile(
+      path,
+      [
+        JSON.stringify({
+          message: {
+            content: [
+              {
+                type: "tool_use",
+                id: "toolu_pending",
+                name: "Bash",
+              },
+            ],
+          },
+        }),
+      ].join("\n"),
+    );
+
+    expect(await hasPendingToolUse(path)).toBe(true);
+  });
+
+  test("clears resolved tool calls from the transcript", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "claudraband-inspect-"));
+    const path = join(dir, "session.jsonl");
+    await writeFile(
+      path,
+      [
+        JSON.stringify({
+          message: {
+            content: [
+              {
+                type: "tool_use",
+                id: "toolu_done",
+                name: "Bash",
+              },
+            ],
+          },
+        }),
+        JSON.stringify({
+          message: {
+            content: [
+              {
+                type: "tool_result",
+                tool_use_id: "toolu_done",
+              },
+            ],
+          },
+        }),
+      ].join("\n"),
+    );
+
+    expect(await hasPendingToolUse(path)).toBe(false);
   });
 });

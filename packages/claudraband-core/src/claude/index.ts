@@ -7,6 +7,7 @@ export { Tailer, parseLineEvents } from "./parser";
 export {
   hasPendingNativePrompt,
   hasPendingQuestion,
+  hasPendingToolUse,
   parseNativePermissionPrompt,
 } from "./inspect";
 export { createTerminalHost, hasTmuxBinary, resolveTerminalBackend } from "../terminal";

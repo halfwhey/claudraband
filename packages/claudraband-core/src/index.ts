@@ -1,9 +1,12 @@
-import { open, readFile, stat } from "node:fs/promises";
+import { appendFile, open, readFile, readdir, stat } from "node:fs/promises";
+import { homedir } from "node:os";
+import { join } from "node:path";
 import { request as httpRequest } from "node:http";
 import {
   ClaudeWrapper,
   hasPendingNativePrompt,
   hasPendingQuestion,
+  hasPendingToolUse,
   parseClaudeArgs,
   parseLineEvents,
   parseNativePermissionPrompt,
@@ -49,6 +52,7 @@ const TURN_IDLE_OPTIONS: PaneActivityOptions = {
 export { EventKind };
 export { hasPendingNativePrompt };
 export { hasPendingQuestion };
+export { hasPendingToolUse };
 export { parseClaudeArgs };
 export { resolveTerminalBackend };
 export { sessionPath };
@@ -74,6 +78,34 @@ export async function closeLiveProcess(sessionId: string): Promise<boolean> {
     backend: "tmux",
     tmuxSessionName: SHARED_TMUX_SESSION_NAME,
   }).closeLiveSession(sessionId);
+}
+
+export async function interruptLiveProcess(sessionId: string): Promise<boolean> {
+  const { Session } = await import("./tmuxctl");
+  const found = await Session.find(SHARED_TMUX_SESSION_NAME, sessionId);
+  if (!found) return false;
+  try {
+    process.kill(await found.panePID(), "SIGINT");
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+export async function recordInterruptEvent(
+  sessionId: string,
+  cwd: string,
+): Promise<void> {
+  await appendFile(
+    sessionPath(cwd, sessionId),
+    `${JSON.stringify({
+      type: "system",
+      subtype: "interrupt",
+      content: "interrupt",
+      timestamp: new Date().toISOString(),
+      sessionId,
+    })}\n`,
+  );
 }
 
 export type PermissionMode =
@@ -223,6 +255,63 @@ export interface Claudraband {
   getLastMessage(sessionId: string, cwd: string): Promise<string | null>;
   closeSession(sessionId: string): Promise<boolean>;
   replaySession(sessionId: string, cwd: string): Promise<ClaudrabandEvent[]>;
+}
+
+export async function trackSessionStatus(status: SessionStatus): Promise<void> {
+  const transcriptPath = sessionPath(status.cwd, status.sessionId);
+  const updatedAt = status.updatedAt ?? new Date().toISOString();
+  await writeKnownSessionRecord({
+    version: 1,
+    sessionId: status.sessionId,
+    cwd: status.cwd,
+    backend: status.backend,
+    title: status.title,
+    createdAt: status.createdAt,
+    updatedAt,
+    transcriptPath,
+    owner: status.owner,
+  });
+
+  if (!status.alive) {
+    await deleteSessionRecord(status.sessionId);
+    return;
+  }
+
+  await writeSessionRecord({
+    version: 1,
+    sessionId: status.sessionId,
+    cwd: status.cwd,
+    backend: status.backend,
+    title: status.title,
+    createdAt: status.createdAt,
+    updatedAt,
+    lastKnownAlive: status.alive,
+    reattachable: status.reattachable,
+    transcriptPath,
+    owner: status.owner,
+  });
+}
+
+export async function countTranscriptLocations(sessionId: string): Promise<number> {
+  const projectsDir = join(homedir(), ".claude", "projects");
+  let projectEntries: string[] = [];
+  try {
+    projectEntries = await readdir(projectsDir);
+  } catch {
+    return 0;
+  }
+
+  let matches = 0;
+  for (const entry of projectEntries) {
+    try {
+      const transcriptPath = join(projectsDir, entry, `${sessionId}.jsonl`);
+      await stat(transcriptPath);
+      matches++;
+    } catch {
+      continue;
+    }
+  }
+  return matches;
 }
 
 export const MODEL_OPTIONS = [
@@ -452,10 +541,47 @@ class ClaudrabandRuntime implements Claudraband {
     const summary = await inspectSession(sessionId, cwd);
     if (!summary) return null;
     const jsonlPath = sessionPath(summary.cwd, sessionId);
-    const [turnInProgress, pendingQuestion] = await Promise.all([
+    let [turnInProgress, pendingQuestion] = await Promise.all([
       hasTranscriptTurnInProgress(jsonlPath),
       hasPendingQuestion(jsonlPath),
     ]);
+    if (
+      summary.alive
+      && summary.reattachable
+      && summary.owner.kind === "local"
+    ) {
+      const session = await this.openSession({
+        sessionId,
+        cwd: summary.cwd,
+        terminalBackend: summary.backend,
+        turnDetection: this.defaults.turnDetection,
+        logger: this.defaults.logger,
+      }).catch(() => null);
+      if (session) {
+        try {
+          const pane = await session.capturePane().catch(() => "");
+          if (
+            !turnInProgress
+            && !pendingQuestion
+            && pane
+            && hasActivePaneTurn(pane)
+          ) {
+            turnInProgress = true;
+          } else if (
+            turnInProgress
+            && !pendingQuestion
+            && pane
+            && hasReadyModePrompt(pane)
+            && !hasPendingNativePrompt(pane)
+            && !hasActivePaneTurn(pane)
+          ) {
+            turnInProgress = false;
+          }
+        } finally {
+          await session.detach().catch(() => {});
+        }
+      }
+    }
     return {
       ...summary,
       turnInProgress,
@@ -814,12 +940,16 @@ class ClaudrabandSessionImpl implements ClaudrabandSession {
   }
 
   async detach(): Promise<void> {
+    const owner = await this.resolveSessionOwner().catch((): SessionOwnerRecord =>
+      this.sessionOwner ?? { kind: "local" }
+    );
+    const alive = this.isProcessAlive() && this.supportsReconnect(owner);
     this.stopped = true;
     this.promptAbortController?.abort();
     await this.wrapper.detach();
     await this.pumpPromise.catch(() => {});
     this.closeSubscribers();
-    await this.syncSessionRecord();
+    await this.syncSessionRecord(alive, owner);
   }
 
   isProcessAlive(): boolean {
@@ -830,7 +960,10 @@ class ClaudrabandSessionImpl implements ClaudrabandSession {
     return this.wrapper.capturePane();
   }
 
-  async syncSessionRecord(alive = this.isProcessAlive()): Promise<void> {
+  async syncSessionRecord(
+    alive = this.isProcessAlive(),
+    ownerOverride?: SessionOwnerRecord,
+  ): Promise<void> {
     const existing = await readSessionRecord(this.sessionId);
     const known = await readKnownSessionRecord(this.sessionId);
     const transcriptPath = sessionPath(this.cwd, this.sessionId);
@@ -840,9 +973,14 @@ class ClaudrabandSessionImpl implements ClaudrabandSession {
       ?? known?.title
       ?? await extractSessionTitle(transcriptPath)
       ?? undefined;
+    const resolvedOwner = ownerOverride ?? await this.resolveSessionOwner();
     const owner = alive
-      ? await this.resolveSessionOwner()
-      : existing?.owner ?? known?.owner ?? await this.resolveSessionOwner();
+      ? (
+        resolvedOwner.kind === "local" && resolvedOwner.pid === undefined
+          ? existing?.owner ?? known?.owner ?? resolvedOwner
+          : resolvedOwner
+      )
+      : existing?.owner ?? known?.owner ?? resolvedOwner;
 
     await writeKnownSessionRecord({
       version: 1,
@@ -1575,15 +1713,16 @@ function buildAskUserQuestionOptions(
   ];
 }
 
-function hasReadyModePrompt(paneText: string): boolean {
-  // Strip ANSI/CSI escape sequences (xterm serialize output includes them)
-  // and carriage returns before looking for the TUI mode indicator.
-  const stripped = paneText
+function normalizePaneText(paneText: string): string {
+  return paneText
     .replace(/\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)/g, "")
     .replace(/\x1b\[[0-9;?]*[ -/]*[@-~]/g, "")
     .replace(/\x1b[()][A-Za-z0-9]/g, "")
     .replace(/\r/g, "");
-  const lines = stripped.split("\n");
+}
+
+function hasReadyModePrompt(paneText: string): boolean {
+  const lines = normalizePaneText(paneText).split("\n");
   // Scan the trailing non-empty lines. Some TUI frames render trailing
   // border or padding lines after the status bar, so don't require the mode
   // indicator to be literally the last non-empty line.
@@ -1597,6 +1736,11 @@ function hasReadyModePrompt(paneText: string): boolean {
   return false;
 }
 
+function hasActivePaneTurn(paneText: string): boolean {
+  const normalized = normalizePaneText(paneText);
+  return /(?:^|\n)\s*[^\n]*Running(?:…|\.{3})\s*\([^)\n]+\)/.test(normalized);
+}
+
 async function hasTranscriptTurnInProgress(jsonlPath: string): Promise<boolean> {
   let data: string;
   try {
@@ -1607,6 +1751,18 @@ async function hasTranscriptTurnInProgress(jsonlPath: string): Promise<boolean> 
 
   let inProgress = false;
   for (const line of data.split("\n")) {
+    if (!line.trim()) {
+      continue;
+    }
+    try {
+      const entry = JSON.parse(line) as { type?: string; subtype?: string };
+      if (entry.type === "system" && entry.subtype === "interrupt") {
+        inProgress = false;
+        continue;
+      }
+    } catch {
+      // Fall through to event parsing below.
+    }
     for (const event of parseLineEvents(line)) {
       switch (event.kind) {
         case EventKind.UserMessage:
@@ -1852,12 +2008,7 @@ async function refreshSessionRecords(records: SessionRecord[]): Promise<SessionR
     if (record.owner.kind === "daemon") {
       const serverUrl = normalizeServerUrl(record.owner.serverUrl);
       if (!daemonByUrl.has(serverUrl)) {
-        daemonByUrl.set(
-          serverUrl,
-          isPidAlive(record.owner.serverPid)
-            ? await fetchDaemonSessionStates(serverUrl)
-            : null,
-        );
+        daemonByUrl.set(serverUrl, await fetchDaemonSessionStates(serverUrl));
       }
       const daemonSessions = daemonByUrl.get(serverUrl);
       const alive = daemonSessions?.get(record.sessionId) ?? false;

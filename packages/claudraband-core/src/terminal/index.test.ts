@@ -134,16 +134,21 @@ describe("terminal backend selection", () => {
     const host = __test.createXtermTerminalHost() as unknown as {
       send(input: string): Promise<void>;
       interrupt(): Promise<void>;
-      transport: { write(data: string): void } | null;
+      transport: { write(data: string): void; interrupt(): Promise<boolean> } | null;
       terminal: { input(data: string): void } | null;
     };
 
     const transportWrites: string[] = [];
+    const transportInterrupts: string[] = [];
     const terminalInputs: string[] = [];
 
     host.transport = {
       write(data: string) {
         transportWrites.push(data);
+      },
+      async interrupt() {
+        transportInterrupts.push("SIGINT");
+        return true;
       },
     };
     host.terminal = {
@@ -155,7 +160,8 @@ describe("terminal backend selection", () => {
     await host.send("2");
     await host.interrupt();
 
-    expect(terminalInputs).toEqual(["2", "\r", "\u0003"]);
+    expect(terminalInputs).toEqual(["2", "\r"]);
+    expect(transportInterrupts).toEqual(["SIGINT"]);
     expect(transportWrites).toEqual([]);
   });
 
