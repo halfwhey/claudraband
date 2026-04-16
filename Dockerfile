@@ -20,7 +20,7 @@ FROM oven/bun:1-slim
 WORKDIR /app
 
 RUN DEBIAN_FRONTEND=noninteractive apt-get update \
-  && apt-get install -y --no-install-recommends tmux ca-certificates \
+  && apt-get install -y --no-install-recommends tmux ca-certificates git g++ binutils \
   && rm -rf /var/lib/apt/lists/*
 
 COPY --from=build /app /app
