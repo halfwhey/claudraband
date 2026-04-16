@@ -14,6 +14,7 @@ import {
   type TurnDetectionMode,
 } from "claudraband-core";
 import type { CliConfig } from "./args";
+import { autoDecisionForPermissionMode } from "./permissions";
 
 const UUID_RE =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
@@ -230,6 +231,18 @@ function createDaemonServer(
     ds: DaemonSession,
     request: ClaudrabandPermissionRequest,
   ): Promise<ClaudrabandPermissionDecision> {
+    const autoDecision = autoDecisionForPermissionMode(
+      ds.session.permissionMode,
+      request,
+    );
+    if (autoDecision) {
+      broadcastSse(ds, {
+        type: "permission_request",
+        autoSelected: true,
+        ...request,
+      });
+      return autoDecision;
+    }
     return new Promise<ClaudrabandPermissionDecision>((resolve) => {
       ds.pendingPermission = { request, resolve };
       broadcastSse(ds, {
@@ -633,7 +646,10 @@ function createDaemonServer(
       if (method === "POST" && action === "interrupt") {
         if (!requireLiveSession(res, sessionId, ds)) return;
         const outcome = await runSessionOp(res, sessionId, ds, () =>
-          ds.session.interrupt(),
+          (async () => {
+            await ds.session.interrupt();
+            await (ds.session as InternalClaudrabandSession).awaitTurn();
+          })(),
         );
         if (!outcome.ok) return;
         json(res, 200, { ok: true });
