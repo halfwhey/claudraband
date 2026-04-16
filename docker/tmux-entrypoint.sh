@@ -124,6 +124,10 @@ start_serve() {
     serve_args=(--port "$default_port" "${serve_args[@]}")
   fi
 
+  if ! has_flag --permission-mode "${serve_args[@]}"; then
+    serve_args=(--permission-mode auto "${serve_args[@]}")
+  fi
+
   exec cband serve "${serve_args[@]}"
 }
 
