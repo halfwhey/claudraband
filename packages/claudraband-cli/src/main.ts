@@ -3,40 +3,32 @@ import { openSync, mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import * as acp from "@agentclientprotocol/sdk";
 import type {
+  Claudraband,
   ClaudrabandEvent,
   ClaudrabandLogger,
+  InternalClaudrabandSession,
   ClaudrabandPermissionRequest,
   ClaudrabandSession,
   SessionSummary,
 } from "claudraband-core";
-import { createClaudraband } from "claudraband-core";
+import {
+  countTranscriptLocations,
+  createClaudraband,
+  EventKind,
+  interruptLiveProcess,
+  recordInterruptEvent,
+  trackSessionStatus,
+} from "claudraband-core";
 import type { TerminalBackend } from "claudraband-core";
 import { Bridge } from "./acpbridge";
+import { extractAttachTurnText } from "./attach-output";
 import { parseArgs, type CliConfig } from "./args";
 import { requestPermission } from "./client";
+import { streamInputLines } from "./input-lines";
+import { autoDecisionForPermissionMode } from "./permissions";
 import { Renderer } from "./render";
 import { formatLocalSessionList } from "./session-format";
-
-function readLine(): Promise<string> {
-  return new Promise((resolve) => {
-    let buf = "";
-    const onData = (chunk: Buffer) => {
-      buf += chunk.toString();
-      const nl = buf.indexOf("\n");
-      if (nl !== -1) {
-        process.stdin.removeListener("data", onData);
-        process.stdin.removeListener("end", onEnd);
-        resolve(buf.slice(0, nl).trim());
-      }
-    };
-    const onEnd = () => {
-      process.stdin.removeListener("data", onData);
-      resolve(buf.trim());
-    };
-    process.stdin.on("data", onData);
-    process.stdin.on("end", onEnd);
-  });
-}
+import { replayAndFollowEvents } from "./watch-events";
 
 function makeLogger(debug: boolean): ClaudrabandLogger {
   if (!debug) {
@@ -168,6 +160,12 @@ async function resolveTrackedSession(
   if (!config.sessionId) {
     return null;
   }
+  if (!config.hasExplicitCwd && await countTranscriptLocations(config.sessionId) > 1) {
+    process.stderr.write(
+      `error: session ${config.sessionId} matched multiple transcript locations. Re-run with --cwd <dir>.\n`,
+    );
+    process.exit(1);
+  }
   const runtime = createClaudraband({
     logger,
     terminalBackend: config.terminalBackend,
@@ -187,7 +185,25 @@ async function resolveTrackedSession(
 }
 
 function validateLocalLaunchPermissions(config: CliConfig): void {
-  void config;
+  const isLocalXterm =
+    config.terminalBackend === "xterm"
+    && !config.connect
+    && config.command !== "serve";
+  if (!isLocalXterm) {
+    return;
+  }
+
+  const hasDangerousFlag =
+    config.permissionMode === "bypassPermissions"
+    || config.claudeArgs.includes("--dangerously-skip-permissions");
+  if (hasDangerousFlag) {
+    return;
+  }
+
+  process.stderr.write(
+    "error: local xterm backend requires dangerous permission settings. Re-run with `-c '--dangerously-skip-permissions'` or `--permission-mode bypassPermissions`.\n",
+  );
+  process.exit(1);
 }
 
 async function pumpEvents(
@@ -260,6 +276,12 @@ async function showStatus(
   logger: ClaudrabandLogger,
   asJson: boolean,
 ): Promise<void> {
+  if (!cwd && await countTranscriptLocations(sessionId) > 1) {
+    process.stderr.write(
+      `error: session ${sessionId} matched multiple transcript locations. Re-run with --cwd <dir>.\n`,
+    );
+    process.exit(1);
+  }
   const runtime = createClaudraband({ logger, terminalBackend });
   const status = await runtime.getStatus(sessionId, cwd);
   if (!status) {
@@ -307,6 +329,12 @@ async function showLast(
   logger: ClaudrabandLogger,
   asJson: boolean,
 ): Promise<void> {
+  if (!cwd && await countTranscriptLocations(sessionId) > 1) {
+    process.stderr.write(
+      `error: session ${sessionId} matched multiple transcript locations. Re-run with --cwd <dir>.\n`,
+    );
+    process.exit(1);
+  }
   const runtime = createClaudraband({ logger, terminalBackend });
   const summary = await runtime.inspectSession(sessionId, cwd);
   if (!summary) {
@@ -319,8 +347,6 @@ async function showLast(
   if (text === null) {
     if (asJson) {
       process.stdout.write(`${JSON.stringify({ sessionId, cwd: summary.cwd, text: null })}\n`);
-    } else {
-      process.stderr.write("no assistant message found.\n");
     }
     process.exit(1);
   }
@@ -364,14 +390,46 @@ async function runWatch(
     return;
   }
 
-  const events = await runtime.replaySession(sessionId, summary.cwd);
-  for (const ev of events) {
-    writeWatchEvent(ev, pretty);
+  let session: ClaudrabandSession | null = null;
+  let liveEvents: AsyncIterable<ClaudrabandEvent> | undefined;
+  if (summary.alive && summary.reattachable) {
+    session = await runtime.openSession({
+      sessionId,
+      cwd: summary.cwd,
+      terminalBackend,
+      logger,
+    });
+    liveEvents = session.events();
   }
-  if (!follow) return;
-  // For local non-daemon sessions we don't have a live tailer handle through
-  // the runtime without opening the session, so historical replay is the best
-  // effort here; use `attach` for interactive follow on local sessions.
+
+  const replayed = await runtime.replaySession(sessionId, summary.cwd);
+  if (!session) {
+    for (const ev of replayed) {
+      writeWatchEvent(ev, pretty);
+    }
+    return;
+  }
+
+  let interrupted = false;
+  const onSigint = () => {
+    interrupted = true;
+    void session.detach().catch(() => {});
+  };
+  process.once("SIGINT", onSigint);
+  try {
+    for await (const frame of replayAndFollowEvents(replayed, liveEvents)) {
+      writeWatchEvent(frame.event, pretty);
+      if (!follow && frame.source === "live" && frame.event.kind === EventKind.TurnEnd) {
+        break;
+      }
+      if (interrupted) {
+        break;
+      }
+    }
+  } finally {
+    process.removeListener("SIGINT", onSigint);
+    await session.detach().catch(() => {});
+  }
 }
 
 function writeWatchEvent(ev: ClaudrabandEvent, pretty: boolean): void {
@@ -390,6 +448,93 @@ function writeWatchEvent(ev: ClaudrabandEvent, pretty: boolean): void {
     toolInput: ev.toolInput || undefined,
     role: ev.role || undefined,
   })}\n`);
+}
+
+async function captureTurnText(
+  runtime: Claudraband,
+  session: ClaudrabandSession,
+  sendPrompt: () => Promise<void>,
+): Promise<string> {
+  const before = await runtime.replaySession(session.sessionId, session.cwd);
+  await sendPrompt();
+  const after = await runtime.replaySession(session.sessionId, session.cwd);
+  return extractAttachTurnText(before, after);
+}
+
+async function handleAttachLine(
+  runtime: Claudraband,
+  session: ClaudrabandSession,
+  renderer: Renderer,
+  line: string,
+  directTurnOutput: boolean,
+): Promise<void> {
+  if (directTurnOutput) {
+    const text = await captureTurnText(runtime, session, () => session.prompt(line).then(() => {}));
+    if (text) {
+      process.stdout.write(text);
+      if (!text.endsWith("\n")) {
+        process.stdout.write("\n");
+      }
+    }
+    return;
+  }
+
+  await session.prompt(line);
+  renderer.ensureNewline();
+}
+
+async function repl(
+  runtime: Claudraband,
+  session: ClaudrabandSession,
+  renderer: Renderer,
+  directTurnOutput = false,
+): Promise<void> {
+  process.stdin.setEncoding("utf8");
+
+  if (!process.stdin.isTTY) {
+    for await (const rawLine of streamInputLines(process.stdin)) {
+      const line = rawLine.trim();
+      if (!line) {
+        continue;
+      }
+      try {
+        await handleAttachLine(runtime, session, renderer, line, directTurnOutput);
+      } catch (err) {
+        process.stderr.write(`prompt error: ${err}\n`);
+      }
+    }
+    return;
+  }
+
+  process.stderr.write("(interactive mode, Ctrl+C to cancel, Ctrl+D to exit)\n");
+  const readline = await import("node:readline/promises");
+  const rl = readline.createInterface({
+    input: process.stdin,
+    output: process.stderr,
+  });
+
+  try {
+    process.stderr.write("\n> ");
+    for await (const line of rl) {
+      const trimmed = line.trim();
+      if (!trimmed) {
+        process.stderr.write("\n> ");
+        continue;
+      }
+
+      try {
+        await handleAttachLine(runtime, session, renderer, trimmed, directTurnOutput);
+      } catch (err) {
+        process.stderr.write(`prompt error: ${err}\n`);
+      }
+      if (process.stdin.readableEnded) {
+        break;
+      }
+      process.stderr.write("\n> ");
+    }
+  } finally {
+    rl.close();
+  }
 }
 
 async function runInterrupt(
@@ -423,6 +568,24 @@ async function runInterrupt(
     process.exit(1);
   }
 
+  if (summary.backend === "tmux") {
+    const interrupted = await interruptLiveProcess(sessionId);
+    if (!interrupted) {
+      process.stderr.write(`error: session ${sessionId} is not live.\n`);
+      process.exit(1);
+    }
+    await new Promise((resolve) => setTimeout(resolve, 300));
+    let refreshed = await runtime.getStatus(sessionId, summary.cwd);
+    if (refreshed && !refreshed.alive && refreshed.turnInProgress) {
+      await recordInterruptEvent(sessionId, summary.cwd).catch(() => {});
+      refreshed = await runtime.getStatus(sessionId, summary.cwd);
+    }
+    if (refreshed) {
+      await trackSessionStatus(refreshed).catch(() => {});
+    }
+    return;
+  }
+
   const session = await runtime.openSession({
     sessionId,
     cwd: summary.cwd,
@@ -430,29 +593,8 @@ async function runInterrupt(
     logger,
   });
   await session.interrupt();
+  await (session as InternalClaudrabandSession).awaitTurn().catch(() => {});
   await session.detach();
-}
-
-async function repl(
-  session: ClaudrabandSession,
-  renderer: Renderer,
-): Promise<void> {
-  process.stderr.write("(interactive mode, Ctrl+C to cancel, Ctrl+D to exit)\n");
-  process.stdin.setEncoding("utf8");
-
-  while (true) {
-    process.stderr.write("\n> ");
-    const line = await readLine();
-    if (!line && process.stdin.readableEnded) break;
-    if (!line) continue;
-
-    try {
-      await session.prompt(line);
-      renderer.ensureNewline();
-    } catch (err) {
-      process.stderr.write(`prompt error: ${err}\n`);
-    }
-  }
 }
 
 export async function runCli(argv: string[] = process.argv.slice(2)): Promise<void> {
@@ -624,6 +766,7 @@ export async function runCli(argv: string[] = process.argv.slice(2)): Promise<vo
   });
 
   try {
+    const pipedAttach = config.command === "attach" && !process.stdin.isTTY;
     const sessionOptions = {
       cwd: config.cwd,
       claudeArgs: config.claudeArgs,
@@ -633,12 +776,20 @@ export async function runCli(argv: string[] = process.argv.slice(2)): Promise<vo
       terminalBackend: config.terminalBackend,
       turnDetection: config.turnDetection,
       logger,
-      onPermissionRequest: (request: ClaudrabandPermissionRequest) =>
-        requestPermission(renderer, {
+      onPermissionRequest: (request: ClaudrabandPermissionRequest) => {
+        const autoDecision = autoDecisionForPermissionMode(
+          config.permissionMode,
+          request,
+        );
+        if (autoDecision) {
+          return Promise.resolve(autoDecision);
+        }
+        return requestPermission(renderer, {
           interactive: isInteractiveCommand(config.command),
           answerChoice: config.answer,
           promptText: config.prompt,
-        }, request),
+        }, request);
+      },
     };
 
     session = await runtime.openSession({
@@ -646,7 +797,9 @@ export async function runCli(argv: string[] = process.argv.slice(2)): Promise<vo
       ...(config.sessionId ? { sessionId: config.sessionId } : {}),
     });
 
-    const eventPump = pumpEvents(session, renderer);
+    const eventPump = pipedAttach
+      ? Promise.resolve()
+      : pumpEvents(session, renderer);
 
     if (!config.sessionId) {
       process.stderr.write(`session: ${session.sessionId}\n`);
@@ -705,7 +858,12 @@ export async function runCli(argv: string[] = process.argv.slice(2)): Promise<vo
     }
 
     if (config.command === "attach") {
-      await repl(session, renderer);
+      await repl(runtime, session, renderer, pipedAttach);
+    }
+
+    if (pipedAttach) {
+      void session.detach().catch(() => {});
+      return;
     }
 
     await session.detach();

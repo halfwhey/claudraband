@@ -1,5 +1,4 @@
 import { request as httpRequest } from "node:http";
-import { randomUUID } from "node:crypto";
 import type {
   ClaudrabandEvent,
   ClaudrabandLogger,
@@ -9,11 +8,13 @@ import type {
   PermissionMode,
   PromptResult,
   ResolvedTerminalBackend,
+  SessionStatus,
   TurnDetectionMode,
 } from "claudraband-core";
-import { EventKind } from "claudraband-core";
+import { EventKind, trackSessionStatus } from "claudraband-core";
 import type { CliConfig } from "./args";
 import { requestPermission } from "./client";
+import { streamInputLines } from "./input-lines";
 import type { Renderer } from "./render";
 
 interface DaemonSessionInfo {
@@ -32,9 +33,7 @@ interface DaemonSessionRequestBody {
   requireLive?: boolean;
 }
 
-interface DaemonStatusResponse {
-  pendingInput: "none" | "question" | "permission";
-}
+type DaemonStatusResponse = Pick<SessionStatus, "pendingInput">;
 
 interface DaemonPromptResult extends PromptResult {
   sessionId: string;
@@ -461,6 +460,7 @@ export async function runWithDaemon(
 
   let sessionId: string;
   let sessionBackend: ResolvedTerminalBackend;
+  let trackedStatus: SessionStatus | null = null;
 
   if (config.sessionId) {
     // Resume existing session (or reattach if already live on the daemon).
@@ -477,14 +477,19 @@ export async function runWithDaemon(
     sessionBackend = result.backend;
   } else {
     // Create new session on daemon.
-    const newId = randomUUID();
-    process.stderr.write(`session: ${newId}\n`);
     const result = (await daemonPost(config.connect, "/sessions", {
-      ...buildSessionRequestBody(config, { sessionId: newId }),
+      ...buildSessionRequestBody(config),
     })) as DaemonSessionInfo;
     sessionId = result.sessionId;
     sessionBackend = result.backend;
+    process.stderr.write(`session: ${sessionId}\n`);
   }
+
+  trackedStatus = (await daemonGet(
+    config.connect,
+    `/sessions/${sessionId}/status`,
+  )) as SessionStatus;
+  await trackSessionStatus(trackedStatus);
 
   let session: DaemonSessionProxy | null = null;
   let eventPump: Promise<void> | null = null;
@@ -572,9 +577,22 @@ export async function runWithDaemon(
       if (!session) {
         throw new Error("attach session was not initialized");
       }
-      process.stderr.write("(interactive mode, Ctrl+C to cancel, Ctrl+D to exit)\n");
       process.stdin.setEncoding("utf8");
+      const pipedAttach = !process.stdin.isTTY;
 
+      if (pipedAttach) {
+        for await (const rawLine of streamInputLines(process.stdin)) {
+          const line = rawLine.trim();
+          if (!line) continue;
+          const result = (await session.prompt(line)) as DaemonPromptResult;
+          await session.waitForRenderedSeq(result.eventSeq);
+          renderer.ensureNewline();
+        }
+        void session.detach().catch(() => {});
+        return;
+      }
+
+      process.stderr.write("(interactive mode, Ctrl+C to cancel, Ctrl+D to exit)\n");
       const readline = await import("node:readline/promises");
       const rl = readline.createInterface({
         input: process.stdin,

@@ -131,8 +131,9 @@ Examples:
   cband watch --session <id> [--pretty] [--no-follow]
 
 Stream events from a session. When a daemon owns the session this connects to
-the SSE stream; otherwise it polls the local event iterator. One event per line
-as JSON by default. For daemon-backed sessions, watch is the streaming
+the SSE stream; otherwise it replays the local transcript and, if the session
+is still live, continues following new events. One event per line as JSON by
+default. For daemon-backed sessions, watch is the streaming
 companion to 'cband send'; 'cband prompt' already waits and prints the
 completed response.
 
@@ -140,7 +141,7 @@ Options:
   -h, --help                     Show this help
   --session <id>                 Target session (required)
   --pretty                       Render events as human-readable text
-  --no-follow                    Exit after the next turn ends
+  --no-follow                    Exit after the next live turn ends
   --debug                        Show debug logging
 
 Examples:

@@ -56,12 +56,12 @@ cband send --session abc-123 --select 3 "new direction"
 
 ### `cband watch --session <id> [--pretty] [--no-follow]`
 
-Stream events from a session. When a daemon owns the session this connects to the SSE stream; otherwise it replays the local transcript. One event per line as JSON by default.
+Stream events from a session. When a daemon owns the session this connects to the SSE stream; otherwise it replays the local transcript and, if the local session is still live, continues following new events. One event per line as JSON by default.
 
 For daemon-backed sessions, `watch` is mainly the streaming companion to `send`. `prompt` already waits for the turn and prints the completed assistant response directly.
 
 - `--pretty` renders events as human-readable text.
-- `--no-follow` exits after the next `turn_end`.
+- `--no-follow` exits after the next live `turn_end` when the session is still running; otherwise it exits after replaying the transcript.
 
 ### `cband interrupt --session <id>`
 
