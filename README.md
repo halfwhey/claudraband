@@ -9,6 +9,7 @@ Claude Code for the power user
 [CLI](docs/cli.md) •
 [Library](docs/library.md) •
 [Daemon API](docs/daemon-api.md) •
+[Docker](docs/docker.md) •
 [Examples](examples/)
 
 </div>
