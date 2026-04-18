@@ -28,13 +28,16 @@ COPY docker/tmux-entrypoint.sh /usr/local/bin/entrypoint
 COPY docker/claude.sh /usr/local/bin/claude
 COPY docker/claudraband.sh /usr/local/bin/claudraband
 
-RUN chmod +x /usr/local/bin/entrypoint /usr/local/bin/claude /usr/local/bin/claudraband && \
+RUN mkdir -p /claude-account && \
+  chmod +x /usr/local/bin/entrypoint /usr/local/bin/claude /usr/local/bin/claudraband && \
   ln -sf /usr/local/bin/claude /usr/local/bin/claude-code && \
   ln -sf /usr/local/bin/claudraband /usr/local/bin/cband
 
 ENV CLAUDE_ACCOUNT_DIR=/claude-account
 ENV CBAND_DEFAULT_HOST=0.0.0.0
 ENV CBAND_DEFAULT_PORT=7842
+ENV HOME=/root
+ENV IS_SANDBOX=1
 
 EXPOSE 7842
 

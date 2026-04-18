@@ -4,6 +4,10 @@ set -euo pipefail
 account_dir="${CLAUDE_ACCOUNT_DIR:-/claude-account}"
 default_host="${CBAND_DEFAULT_HOST:-0.0.0.0}"
 default_port="${CBAND_DEFAULT_PORT:-7842}"
+runtime_home="${HOME:-/root}"
+runtime_claude_dir="${runtime_home}/.claude"
+runtime_claude_json="${runtime_home}/.claude.json"
+runtime_credentials_json="${runtime_claude_dir}/.credentials.json"
 
 usage() {
   cat <<'EOF'
@@ -33,7 +37,82 @@ bundle_account_dir_available() {
 }
 
 legacy_account_ready() {
-  [ -f /root/.claude.json ] && [ -d /root/.claude ]
+  [ -f "$runtime_claude_json" ] && [ -d "$runtime_claude_dir" ]
+}
+
+not_onboarded_error() {
+  local detail="$1"
+
+  cat >&2 <<EOF
+error: Claude account state is mounted but onboarding is incomplete.
+
+${detail}
+
+Expected:
+  - ${runtime_claude_json} with "hasCompletedOnboarding": true
+  - ${runtime_credentials_json} as a non-empty file
+
+Run the image once in "claude" mode with the same /claude-account mount to
+finish onboarding, then retry "serve".
+EOF
+  exit 1
+}
+
+require_onboarded_account_state() {
+  local status=0
+
+  set +e
+  bun - "$runtime_claude_json" "$runtime_credentials_json" <<'EOF'
+const fs = require("node:fs");
+
+const configPath = process.argv[2];
+const credentialsPath = process.argv[3];
+
+let parsed;
+try {
+  parsed = JSON.parse(fs.readFileSync(configPath, "utf8"));
+} catch {
+  process.exit(10);
+}
+
+if (!parsed || parsed.hasCompletedOnboarding !== true) {
+  process.exit(11);
+}
+
+let stat;
+try {
+  stat = fs.statSync(credentialsPath);
+} catch {
+  process.exit(12);
+}
+
+if (!stat.isFile() || stat.size < 2) {
+  process.exit(13);
+}
+EOF
+  status=$?
+  set -e
+
+  if [ "$status" -eq 0 ]; then
+    return
+  fi
+  case "$status" in
+    10)
+      not_onboarded_error "${runtime_claude_json} is missing or contains invalid JSON."
+      ;;
+    11)
+      not_onboarded_error "${runtime_claude_json} does not indicate completed onboarding."
+      ;;
+    12)
+      not_onboarded_error "Missing credential file at ${runtime_credentials_json}."
+      ;;
+    13)
+      not_onboarded_error "${runtime_credentials_json} is empty."
+      ;;
+    *)
+      not_onboarded_error "Claude account state could not be validated."
+      ;;
+  esac
 }
 
 initialize_bundle_account_state() {
@@ -56,17 +135,17 @@ initialize_bundle_account_state() {
 
 prepare_account_state() {
   if bundle_account_ready; then
-    rm -rf /root/.claude /root/.claude.json
-    ln -s "$account_dir/.claude" /root/.claude
-    ln -s "$account_dir/.claude.json" /root/.claude.json
+    rm -rf "$runtime_claude_dir" "$runtime_claude_json"
+    ln -s "$account_dir/.claude" "$runtime_claude_dir"
+    ln -s "$account_dir/.claude.json" "$runtime_claude_json"
     return
   fi
 
   if bundle_account_dir_available; then
     initialize_bundle_account_state
-    rm -rf /root/.claude /root/.claude.json
-    ln -s "$account_dir/.claude" /root/.claude
-    ln -s "$account_dir/.claude.json" /root/.claude.json
+    rm -rf "$runtime_claude_dir" "$runtime_claude_json"
+    ln -s "$account_dir/.claude" "$runtime_claude_dir"
+    ln -s "$account_dir/.claude.json" "$runtime_claude_json"
     return
   fi
 
@@ -74,7 +153,7 @@ prepare_account_state() {
     return
   fi
 
-  cat >&2 <<'EOF'
+  cat >&2 <<EOF
 error: Claude account state is not mounted correctly.
 
 Preferred mount:
@@ -93,8 +172,8 @@ Expected inside the mounted account directory:
   - /claude-account/.claude as a directory
 
 Legacy direct mounts are also accepted:
-  - host-account/.claude.json -> /root/.claude.json
-  - host-account/.claude      -> /root/.claude
+  - host-account/.claude.json -> ${runtime_claude_json}
+  - host-account/.claude      -> ${runtime_claude_dir}
 EOF
   exit 1
 }
@@ -139,6 +218,7 @@ fi
 case "$mode" in
   serve)
     prepare_account_state
+    require_onboarded_account_state
     start_serve "$@"
     ;;
   claude)
