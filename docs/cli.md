@@ -28,6 +28,8 @@ Send a prompt and wait for Claude to finish its turn.
 - Without `--session`, a new session is created.
 - With `--session <id>`, the saved session is auto-resumed. If the id has no saved transcript, the command errors with `session not found`.
 - With `--select <choice>`, answers a pending `AskUserQuestion` or permission prompt, then returns the turn that follows. If the selected option accepts free text, pass it as the trailing prompt argument.
+- `--select` uses Claude's raw option numbers. For example, the bypass-permissions warning is accepted with `--select 2`.
+- New sessions can stop immediately on a startup permission prompt. When that happens, `cband` prints the new session id and waits for a follow-up `--select` command unless you opt into `--auto-accept-startup-prompts`.
 
 Examples:
 
@@ -45,6 +47,7 @@ Send input without waiting for a turn to complete. Returns as soon as the input 
 
 - `--session <id>` auto-resumes the saved session (errors if missing).
 - `--select <choice>` fires a pending-answer selection. If the selected option accepts free text, pass it as the trailing argument.
+- `--select` uses Claude's raw option numbers.
 
 Examples:
 
@@ -134,6 +137,7 @@ Run `claudraband` as an ACP server over stdio.
 | `--cwd <dir>` | Working directory for new sessions, or filter for `sessions` |
 | `--model <model>` | `haiku`, `sonnet`, or `opus` |
 | `--permission-mode <mode>` | Claude permission mode |
+| `--auto-accept-startup-prompts` | Auto-accept startup-native prompts like trust-folder or bypass-permissions warnings |
 | `--backend <backend>` | `auto`, `tmux`, or `xterm` |
 | `-c`, `--claude <flags>` | Advanced Claude CLI passthrough flags |
 | `--json` | Emit JSON for `status`, `last`, `watch` |
@@ -146,7 +150,8 @@ Run `claudraband` as an ACP server over stdio.
 | Flag | Description |
 |---|---|
 | `--session <id>` | Resume the saved session with this id |
-| `--select <choice>` | Answer a pending question or permission prompt. If that option expects text, pass it as the trailing argument. Requires `--session`. |
+| `--select <choice>` | Answer a pending question or permission prompt. If that option expects text, pass it as the trailing argument. Uses Claude's raw option number and requires `--session`. |
+| `--auto-accept-startup-prompts` | Auto-accept startup-native prompts instead of leaving the session blocked for a later `--select` |
 | `--connect <host:port>` | Route the session through a running daemon. Valid for new sessions. |
 
 ### `watch`

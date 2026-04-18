@@ -65,14 +65,14 @@ Returned by `openSession`.
 |---|---|
 | `prompt(text)` | Send a prompt and wait for the turn to complete |
 | `send(text)` | Send raw input to the terminal without waiting |
-| `answerPending(choice, text?)` | Answer a pending `AskUserQuestion`. Optional `text` is sent after the selection when the chosen option accepts free text. |
+| `answerPending(choice, text?)` | Answer a pending `AskUserQuestion` or visible native permission prompt. Optional `text` is sent after the selection when the chosen option accepts free text. |
 | `interrupt()` | Send Ctrl-C to cancel the in-progress turn |
 | `stop()` | Kill the Claude Code process |
 | `detach()` | Disconnect without killing (tmux window stays alive) |
 | `events()` | Async iterable of session events |
 | `capturePane()` | Snapshot of the terminal's visible content |
 | `isProcessAlive()` | Whether the backing terminal process is running |
-| `hasPendingInput()` | Check whether the live terminal still has a pending question |
+| `hasPendingInput()` | Check whether the live terminal still has pending question or permission input |
 | `setModel(model)` | Switch model mid-session |
 | `setPermissionMode(mode)` | Switch permission mode (restarts Claude) |
 
@@ -89,7 +89,7 @@ interface SessionStatus extends SessionSummary {
 }
 ```
 
-`pendingInput` is `"question"` when the transcript contains an unresolved `AskUserQuestion`, `"permission"` when a native permission prompt is visible in the live pane, and `"none"` otherwise.
+`pendingInput` is `"question"` when the transcript contains an unresolved `AskUserQuestion`, `"permission"` when a native permission prompt is visible in the live pane, and `"none"` otherwise. Native permission selections use Claude's raw option numbers.
 
 ### `SessionNotFoundError`
 
@@ -159,6 +159,7 @@ When Claude requests permission for a tool (or asks a question via `AskUserQuest
 ```typescript
 const session = await runtime.openSession({
   cwd: ".",
+  autoAcceptStartupPrompts: true,
   onPermissionRequest: async (request) => {
     console.log(`Permission: ${request.title}`);
     for (const opt of request.options) {

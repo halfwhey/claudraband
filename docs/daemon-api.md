@@ -42,7 +42,8 @@ Request body (all fields optional):
   "cwd": "/path/to/project",
   "claudeArgs": ["--effort", "high"],
   "model": "sonnet",
-  "permissionMode": "default"
+  "permissionMode": "default",
+  "autoAcceptStartupPrompts": false
 }
 ```
 
@@ -52,11 +53,13 @@ Response:
 {
   "sessionId": "abc-123",
   "backend": "tmux",
-  "resumed": true
+  "resumed": true,
+  "pendingInput": "none"
 }
 ```
 
 `resumed` is `true` when the body included a `sessionId` (whether the daemon reattached an existing live process or cold-resumed from disk), `false` for new sessions.
+`pendingInput` is `"permission"` when the newly created session is blocked on a startup-native prompt and must be continued with `select`.
 
 If `sessionId` is provided but no saved transcript exists for that id, the daemon returns `404`. If `sessionId` is not a valid UUID, the daemon returns `400`.
 
@@ -120,7 +123,7 @@ Response:
 }
 ```
 
-`pendingInput` is one of `"none"`, `"question"` (the transcript has an unresolved `AskUserQuestion`), or `"permission"` (the daemon is currently holding an unresolved native permission prompt).
+`pendingInput` is one of `"none"`, `"question"` (the transcript has an unresolved `AskUserQuestion`), or `"permission"` (a native permission prompt is currently visible for the session, including startup prompts).
 
 ### `GET /sessions/:id/last`
 
@@ -160,6 +163,8 @@ To answer a pending `AskUserQuestion` or permission prompt, pass `select` instea
 ```json
 { "select": "2" }
 ```
+
+`select` uses Claude's raw option numbers. For the bypass-permissions startup warning, acceptance is `2`, not `1`.
 
 When the selected option expects free text, include `text` as well:
 
