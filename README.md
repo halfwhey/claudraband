@@ -50,6 +50,27 @@ npm install -g @halfwhey/claudraband
 
 The package installs both `claudraband` and `cband`. `cband` is the recommended shorthand. The package bundles Claude Code `@anthropic-ai/claude-code@2.1.96`; set `CLAUDRABAND_CLAUDE_PATH` if you need to override the binary.
 
+Docker:
+
+```sh
+mkdir -p "$PWD/claude-account"
+
+# one-time onboarding for the mounted Claude account bundle
+docker run --rm -it \
+  -v "$PWD/claude-account:/claude-account" \
+  ghcr.io/halfwhey/claudraband:latest claude
+
+# start the daemon with the same mounted account bundle
+docker run --rm -d --name claudraband \
+  -p 7842:7842 \
+  -v "$PWD/claude-account:/claude-account" \
+  ghcr.io/halfwhey/claudraband:latest serve
+
+cband --connect localhost:7842 "hello from docker"
+```
+
+If Claude starts on a native startup permission prompt, answer it with `cband prompt --session <session-id> --select <option>`. For more container details, see [docs/docker.md](docs/docker.md).
+
 ## Quick Start
 
 The two first-class paths are local `tmux` sessions and daemon-backed sessions.

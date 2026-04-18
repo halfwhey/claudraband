@@ -34,7 +34,7 @@ The main product surfaces are:
 
 ### Library (`packages/claudraband-core/`)
 
-Controls Claude Code directly. It spawns Claude in tmux, tails Claude's JSONL session log, exposes typed events, supports session listing/resume/replay, and normalizes permission requests into a callback interface.
+Controls Claude Code directly. It spawns Claude in tmux, tails Claude's JSONL session log, exposes typed events, supports session listing/resume/replay, validates Claude account state before startup, and normalizes permission requests into a callback interface.
 
 Key pieces:
 
@@ -54,6 +54,20 @@ Direct first-party terminal client built on the library. It also exposes ACP ser
 - `src/bin.ts` -- published executable entry point
 - `src/main.ts` -- CLI runtime, ACP mode, REPL loop
 
+### Docker
+
+The Docker image uses a mounted account bundle at `/claude-account` and links:
+
+- `/root/.claude -> /claude-account/.claude`
+- `/root/.claude.json -> /claude-account/.claude.json`
+
+Expected flow:
+
+1. Run `claude` once with the mount to complete onboarding.
+2. Reuse the same mount with `serve`.
+
+`serve` should fail fast when the mounted Claude state is missing onboarding markers or credentials.
+
 ## JSONL Session File Format
 
 **Claude Code:** `~/.claude/projects/<escaped-cwd>/<session-uuid>.jsonl` -- one JSON object per line. Key `type` values: `"user"`, `"assistant"`, `"system"`, `"progress"`, `"attachment"`, `"permission-mode"`. Messages live in the `message` field with `role` and `content` (string or array of content blocks: text, thinking, tool_use, tool_result).
@@ -68,9 +82,12 @@ tmux-backed Claude sessions run inside a shared tmux session named `claudraband-
 
 Turn completion detection uses an idle timer: after receiving assistant text with no pending tool calls, if no new events arrive within 3 seconds, the turn is considered complete.
 
+Startup-native prompts such as workspace trust and bypass-permissions warnings are parsed from the visible terminal state. By default they surface as `pendingInput: "permission"` and must be answered with `--select` or the daemon `select` field using Claude's raw option numbers. `--auto-accept-startup-prompts` and `autoAcceptStartupPrompts` are the explicit opt-in escape hatches for unattended startup.
+
 ## CLI Conventions
 
 - For local built usage, run `node packages/claudraband-cli/dist/bin.js ...` or `bun packages/claudraband-cli/dist/bin.js ...`.
 - For published usage, run `npx @halfwhey/claudraband ...` or `bunx @halfwhey/claudraband ...`.
 - Claude launch flags are passed through a single option: `--claude "<flags>"`.
-- Local wrapper flags such as `--acp`, `--terminal-backend`, `--approve-all`, `--select`, and `--debug` stay at the claudraband layer.
+- Local wrapper flags such as `--acp`, `--backend`, `--turn-detection`, `--select`, `--auto-accept-startup-prompts`, and `--debug` stay at the claudraband layer.
+- `--select` uses Claude's raw native prompt numbering. For the bypass-permissions startup warning, accepting the prompt is `--select 2`, not `--select 1`.

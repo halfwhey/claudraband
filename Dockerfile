@@ -19,6 +19,17 @@ FROM oven/bun:1-slim
 
 WORKDIR /app
 
+ARG VERSION=dev
+ARG REVISION=unknown
+
+LABEL org.opencontainers.image.title="claudraband" \
+  org.opencontainers.image.description="Claude Code for the power user" \
+  org.opencontainers.image.source="https://github.com/halfwhey/claudraband" \
+  org.opencontainers.image.url="https://github.com/halfwhey/claudraband" \
+  org.opencontainers.image.licenses="MIT" \
+  org.opencontainers.image.version="${VERSION}" \
+  org.opencontainers.image.revision="${REVISION}"
+
 RUN DEBIAN_FRONTEND=noninteractive apt-get update \
   && apt-get install -y --no-install-recommends tmux ca-certificates git g++ binutils \
   && rm -rf /var/lib/apt/lists/*
