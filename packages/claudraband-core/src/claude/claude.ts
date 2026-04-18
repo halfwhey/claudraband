@@ -3,6 +3,10 @@ import { join, resolve } from "node:path";
 import { randomUUID } from "node:crypto";
 import { existsSync, statSync } from "node:fs";
 import { Tailer } from "./parser";
+import {
+  parseNativePermissionPrompt,
+  pickDefaultNativePermissionOption,
+} from "./inspect";
 import type { Event } from "../wrap/event";
 import type { Wrapper } from "../wrap/wrapper";
 import {
@@ -18,12 +22,15 @@ export interface ClaudeConfig {
   claudeExecutable?: string;
   model: string;
   permissionMode: string;
+  autoAcceptStartupPrompts?: boolean;
   workingDir: string;
   terminalBackend: TerminalBackend;
   tmuxSession: string;
   paneWidth: number;
   paneHeight: number;
 }
+
+export type ClaudeStartupState = "ready" | "blocked_native_prompt";
 
 export function normalizeSessionCwd(cwd: string): string {
   return resolve(cwd);
@@ -39,6 +46,45 @@ export function sessionPath(cwd: string, sessionID: string): string {
   return join(home, ".claude", "projects", escaped, `${sessionID}.jsonl`);
 }
 
+export class ClaudeStartupError extends Error {
+  readonly paneSnapshot: string;
+
+  constructor(message: string, paneSnapshot = "") {
+    super(message);
+    this.name = "ClaudeStartupError";
+    this.paneSnapshot = paneSnapshot;
+  }
+}
+
+function stripAnsi(value: string): string {
+  return value.replace(
+    // Matches common CSI/OSC ANSI escape sequences.
+    /\x1B(?:\[[0-?]*[ -/]*[@-~]|\][^\x07]*(?:\x07|\x1B\\))/g,
+    "",
+  );
+}
+
+function summarizePaneSnapshot(pane: string): string {
+  const cleaned = stripAnsi(pane)
+    .split(/\r?\n/)
+    .map((line) => line.replace(/\s+/g, " ").trim())
+    .filter(Boolean);
+  if (cleaned.length === 0) {
+    return "";
+  }
+  return cleaned.slice(-4).join(" | ").slice(0, 280);
+}
+
+export function buildClaudeStartupError(paneSnapshot = ""): ClaudeStartupError {
+  const summary = summarizePaneSnapshot(paneSnapshot);
+  return new ClaudeStartupError(
+    summary
+      ? `Claude exited during startup. Last pane output: ${summary}`
+      : "Claude exited during startup.",
+    paneSnapshot,
+  );
+}
+
 export class ClaudeWrapper implements Wrapper {
   private cfg: ClaudeConfig;
   private terminal: TerminalHost | null = null;
@@ -47,6 +93,7 @@ export class ClaudeWrapper implements Wrapper {
   private _signal: AbortSignal | null = null;
   private abortController: AbortController | null = null;
   private eventIterable: AsyncGenerator<Event> | null = null;
+  private _startupState: ClaudeStartupState = "ready";
 
   constructor(cfg: ClaudeConfig) {
     this.cfg = {
@@ -78,6 +125,10 @@ export class ClaudeWrapper implements Wrapper {
 
   get workingDir(): string {
     return this.cfg.workingDir;
+  }
+
+  get startupState(): ClaudeStartupState {
+    return this._startupState;
   }
 
   async start(signal: AbortSignal): Promise<void> {
@@ -201,7 +252,7 @@ export class ClaudeWrapper implements Wrapper {
     await this.syncWorkingDirFromTerminal();
 
     // Wait for Claude Code to be ready (showing INSERT mode or ❯ prompt)
-    await this.waitForReady(signal);
+    this._startupState = await this.waitForReady(signal);
 
     const jsonlPath = sessionPath(this.cfg.workingDir, this._claudeSessionId);
     this.tailer = new Tailer(jsonlPath, tailOffset);
@@ -225,39 +276,42 @@ export class ClaudeWrapper implements Wrapper {
   }
 
   /**
-   * Poll the terminal until Claude Code is ready to accept input.
-   * Looks for "INSERT" in the status bar, which indicates the TUI has loaded.
-   *
-   * Also handles the "trust this folder" prompt that appears before any JSONL
-   * is written when Claude Code runs in a directory for the first time.
+   * Poll the terminal until Claude Code is ready to accept input, or until a
+   * startup-native prompt is visible. By default startup prompts block session
+   * readiness; callers can opt into auto-accept for unattended flows.
    */
-  private async waitForReady(signal: AbortSignal): Promise<void> {
+  private async waitForReady(signal: AbortSignal): Promise<ClaudeStartupState> {
     const MAX_WAIT_MS = 15_000;
     const POLL_MS = 300;
     const start = Date.now();
     let lastStartupPromptFingerprint = "";
+    let lastPaneSnapshot = "";
 
     while (Date.now() - start < MAX_WAIT_MS) {
-      if (signal.aborted) return;
+      if (signal.aborted) return "ready";
+      if (!this.terminal?.alive()) {
+        throw buildClaudeStartupError(lastPaneSnapshot);
+      }
       try {
         const pane = await this.terminal!.capture();
+        lastPaneSnapshot = pane;
         if (pane.includes("INSERT") || pane.includes("NORMAL")) {
-          return;
+          return "ready";
         }
-        // The trust prompt appears before Claude enters INSERT mode and before
-        // any JSONL is written. Detect it from the terminal capture and
-        // auto-select "Yes, I trust this folder" (option 1).
-        const isTrustPrompt =
-          pane.includes("Yes, I trust this folder") &&
-          pane.includes("No, exit");
-        const isBypassPrompt =
-          pane.includes("Bypass Permissions mode") &&
-          pane.includes("Yes, I accept");
-        const startupPromptFingerprint =
-          isTrustPrompt ? "trust" : isBypassPrompt ? "bypass" : "";
-        if (startupPromptFingerprint) {
-          if (lastStartupPromptFingerprint !== startupPromptFingerprint) {
-            await this.terminal!.send("1").catch(() => {});
+        const startupPrompt = parseNativePermissionPrompt(pane);
+        if (startupPrompt) {
+          if (!this.cfg.autoAcceptStartupPrompts) {
+            return "blocked_native_prompt";
+          }
+          const startupPromptFingerprint = `${startupPrompt.question}\n${startupPrompt.options
+            .map((option) => `${option.number}:${option.label}`)
+            .join("\n")}`;
+          const allowOption = pickDefaultNativePermissionOption(startupPrompt);
+          if (
+            allowOption
+            && lastStartupPromptFingerprint !== startupPromptFingerprint
+          ) {
+            await this.terminal!.send(allowOption).catch(() => {});
             lastStartupPromptFingerprint = startupPromptFingerprint;
           }
           await new Promise((resolve) => setTimeout(resolve, POLL_MS));
@@ -265,10 +319,21 @@ export class ClaudeWrapper implements Wrapper {
         }
         lastStartupPromptFingerprint = "";
       } catch {
+        if (!this.terminal?.alive()) {
+          throw buildClaudeStartupError(lastPaneSnapshot);
+        }
         // pane not ready yet
       }
       await new Promise((r) => setTimeout(r, POLL_MS));
     }
+
+    if (!this.terminal?.alive()) {
+      throw buildClaudeStartupError(lastPaneSnapshot);
+    }
+    if (lastPaneSnapshot && parseNativePermissionPrompt(lastPaneSnapshot)) {
+      return "blocked_native_prompt";
+    }
+    return "ready";
   }
 
   async stop(): Promise<void> {

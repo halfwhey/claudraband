@@ -1,10 +1,10 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { randomUUID } from "node:crypto";
 import { createServer } from "node:http";
-import { mkdtemp, mkdir, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdtemp, mkdir, rm, writeFile } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
-import { createClaudraband, EventKind, __test } from "./index";
+import { ClaudeAccountStateError, createClaudraband, EventKind, __test } from "./index";
 import { sessionPath } from "./claude";
 import { readSessionRecord, writeKnownSessionRecord } from "./session-registry";
 import { awaitPaneIdle } from "./terminal/activity";
@@ -132,6 +132,88 @@ class PromptLifecycleWrapper extends FakeSessionWrapper {
 const TRUST_FOLDER_PROMPT = `Is this a project you created and trust?
 ❯ 1. Yes, I trust this folder
   2. No, exit`;
+
+const BYPASS_PERMISSIONS_PROMPT = `By proceeding, you accept all responsibility for actions taken while running in Bypass Permissions mode.
+❯ 1. No, exit
+  2. Yes, I accept`;
+
+async function makeClaudeHome(
+  name: string,
+  options: {
+    config?: Record<string, unknown>;
+    credentials?: string;
+  } = {},
+): Promise<string> {
+  const homeDir = await mkdtemp(join(tmpdir(), `${name}-`));
+  const claudeDir = join(homeDir, ".claude");
+  await mkdir(claudeDir, { recursive: true });
+  await writeFile(
+    join(homeDir, ".claude.json"),
+    JSON.stringify(options.config ?? {}, null, 2),
+  );
+  if (options.credentials !== undefined) {
+    await writeFile(join(claudeDir, ".credentials.json"), options.credentials);
+  }
+  return homeDir;
+}
+
+describe("Claude account preflight", () => {
+  const tempHomes: string[] = [];
+
+  afterEach(async () => {
+    while (tempHomes.length > 0) {
+      await rm(tempHomes.pop()!, { recursive: true, force: true });
+    }
+  });
+
+  test("accepts onboarded Claude state", async () => {
+    const homeDir = await makeClaudeHome("claude-account-ok", {
+      config: { hasCompletedOnboarding: true },
+      credentials: "{\"token\":\"ok\"}\n",
+    });
+    tempHomes.push(homeDir);
+
+    const state = await __test.inspectClaudeAccountState({ homeDir });
+    expect(state.hasCompletedOnboarding).toBe(true);
+    expect(state.paths.claudeDir).toBe(join(homeDir, ".claude"));
+  });
+
+  test("rejects missing onboarding markers", async () => {
+    const homeDir = await makeClaudeHome("claude-account-missing", {
+      config: {},
+      credentials: "",
+    });
+    tempHomes.push(homeDir);
+
+    await expect(
+      __test.inspectClaudeAccountState({ homeDir }),
+    ).rejects.toMatchObject({
+      name: "ClaudeAccountStateError",
+      kind: "not_onboarded",
+    } satisfies Partial<ClaudeAccountStateError>);
+  });
+
+  test("rejects non-writable Claude bundles", async () => {
+    const homeDir = await makeClaudeHome("claude-account-perms", {
+      config: { hasCompletedOnboarding: true },
+      credentials: "{\"token\":\"ok\"}\n",
+    });
+    tempHomes.push(homeDir);
+    const claudeDir = join(homeDir, ".claude");
+    await chmod(claudeDir, 0o555);
+
+    try {
+      await expect(
+        __test.inspectClaudeAccountState({ homeDir }),
+      ).rejects.toMatchObject({
+        name: "ClaudeAccountStateError",
+        kind: "bundle_not_writable",
+      } satisfies Partial<ClaudeAccountStateError>);
+    } finally {
+      await chmod(claudeDir, 0o755);
+    }
+  });
+});
 
 describe("session discovery", () => {
   let previousRegistryHome: string | undefined;
@@ -789,6 +871,75 @@ describe("session discovery", () => {
 
     expect(result).toEqual({ stopReason: "end_turn" });
     expect(wrapper.sent).toEqual(["1"]);
+  });
+
+  test("answerPending sends the raw visible native prompt selection", async () => {
+    class VisibleNativePromptWrapper extends FakeSessionWrapper {
+      sent: string[] = [];
+      private pane = BYPASS_PERMISSIONS_PROMPT;
+
+      override async send(input: string): Promise<void> {
+        this.sent.push(input);
+        this.pane = "INSERT";
+      }
+
+      override async capturePane(): Promise<string> {
+        return this.pane;
+      }
+    }
+
+    const wrapper = new VisibleNativePromptWrapper();
+    const session = __test.createSession(wrapper as never, {
+      onPermissionRequest: async () => {
+        throw new Error("startup prompt should not re-enter permission handler");
+      },
+    });
+
+    const result = await session.answerPending("2");
+
+    expect(result).toEqual({ stopReason: "end_turn" });
+    expect(wrapper.sent).toEqual(["2"]);
+  });
+
+  test("hasPendingInput reports visible native prompts as permission", async () => {
+    class PendingNativePromptWrapper extends FakeSessionWrapper {
+      override async capturePane(): Promise<string> {
+        return TRUST_FOLDER_PROMPT;
+      }
+    }
+
+    const session = __test.createSession(new PendingNativePromptWrapper() as never);
+
+    await expect(session.hasPendingInput()).resolves.toEqual({
+      pending: true,
+      source: "permission",
+    });
+  });
+
+  test("prompt leaves a startup native prompt pending when no handler is installed", async () => {
+    class DeferredStartupWrapper extends FakeSessionWrapper {
+      sent: string[] = [];
+
+      override async send(input: string): Promise<void> {
+        this.sent.push(input);
+      }
+
+      override async capturePane(): Promise<string> {
+        return TRUST_FOLDER_PROMPT;
+      }
+    }
+
+    const wrapper = new DeferredStartupWrapper();
+    const session = __test.createSession(wrapper as never);
+
+    const result = await session.prompt("hello");
+
+    expect(result).toEqual({ stopReason: "end_turn" });
+    expect(wrapper.sent).toEqual([]);
+    await expect(session.hasPendingInput()).resolves.toEqual({
+      pending: true,
+      source: "permission",
+    });
   });
 
   test("prompt stops cleanly after rejecting a startup native prompt", async () => {

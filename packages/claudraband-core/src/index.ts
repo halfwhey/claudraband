@@ -4,15 +4,20 @@ import { join } from "node:path";
 import { request as httpRequest } from "node:http";
 import {
   ClaudeWrapper,
+  ClaudeAccountStateError,
+  ClaudeStartupError,
   hasPendingNativePrompt,
   hasPendingQuestion,
   hasPendingToolUse,
+  inspectClaudeAccountState,
+  isRejectingNativeOptionLabel,
   parseClaudeArgs,
   parseLineEvents,
   parseNativePermissionPrompt,
   resolveTerminalBackend,
   sessionPath,
   type TerminalBackend,
+  type NativePermissionPrompt,
 } from "./claude";
 import {
   createTerminalBackendDriver,
@@ -54,6 +59,8 @@ export { hasPendingNativePrompt };
 export { hasPendingQuestion };
 export { hasPendingToolUse };
 export { parseClaudeArgs };
+export { ClaudeAccountStateError };
+export { ClaudeStartupError };
 export { resolveTerminalBackend };
 export { sessionPath };
 export { awaitPaneIdle } from "./terminal/activity";
@@ -62,6 +69,7 @@ export type { ClaudrabandEvent };
 export type { TerminalBackend };
 export type { ResolvedTerminalBackend };
 export type { SessionOwnerRecord };
+export type { ClaudeAccountStateErrorKind } from "./claude/account";
 
 const SHARED_TMUX_SESSION_NAME = "claudraband-working-session";
 
@@ -168,6 +176,7 @@ export interface ClaudrabandOptions {
   claudeExecutable?: string;
   model?: string;
   permissionMode?: PermissionMode;
+  autoAcceptStartupPrompts?: boolean;
   turnDetection?: TurnDetectionMode;
   allowTextResponses?: boolean;
   terminalBackend?: TerminalBackend;
@@ -234,7 +243,10 @@ export interface ClaudrabandSession {
   detach(): Promise<void>;
   isProcessAlive(): boolean;
   capturePane(): Promise<string>;
-  hasPendingInput(): Promise<{ pending: boolean; source: "none" | "terminal" }>;
+  hasPendingInput(): Promise<{
+    pending: boolean;
+    source: SessionStatus["pendingInput"];
+  }>;
   setModel(model: string): Promise<void>;
   setPermissionMode(mode: PermissionMode): Promise<void>;
   flushEvents(): Promise<void>;
@@ -391,11 +403,6 @@ type NativePermissionHandling =
   | "consumed"
   | "pending_clear";
 
-function isRejectingNativeOption(label: string): boolean {
-  const normalized = label.trim().toLowerCase();
-  return normalized.startsWith("no") || normalized.startsWith("reject");
-}
-
 interface AskUserQuestionOption {
   label: string;
   description: string;
@@ -446,6 +453,10 @@ function normalizeOptions(
       (parsedClaudeArgs.permissionMode as PermissionMode | undefined) ??
       defaults.permissionMode ??
       "default",
+    autoAcceptStartupPrompts:
+      options?.autoAcceptStartupPrompts ??
+      defaults.autoAcceptStartupPrompts ??
+      false,
     turnDetection:
       options?.turnDetection ??
       defaults.turnDetection ??
@@ -486,6 +497,7 @@ class ClaudrabandRuntime implements Claudraband {
     const { sessionId, ...opts } = options ?? {};
     const cfg = normalizeOptions(this.defaults, opts);
     const backend = resolveTerminalBackend(cfg.terminalBackend);
+    await inspectClaudeAccountState();
 
     if (sessionId) {
       const existing = await inspectSession(sessionId, cfg.cwd);
@@ -499,6 +511,7 @@ class ClaudrabandRuntime implements Claudraband {
       claudeArgs: cfg.claudeArgs,
       claudeExecutable: cfg.claudeExecutable || undefined,
       permissionMode: cfg.permissionMode,
+      autoAcceptStartupPrompts: cfg.autoAcceptStartupPrompts,
       terminalBackend: cfg.terminalBackend,
       workingDir: cfg.cwd,
       tmuxSession: SHARED_TMUX_SESSION,
@@ -510,6 +523,9 @@ class ClaudrabandRuntime implements Claudraband {
       await wrapper.startResume(sessionId, lifetime.signal);
     } else {
       await wrapper.start(lifetime.signal);
+    }
+    if (!wrapper.isProcessAlive()) {
+      throw new ClaudeStartupError("Claude exited during startup.");
     }
     const session = new ClaudrabandSessionImpl(
       wrapper,
@@ -545,6 +561,7 @@ class ClaudrabandRuntime implements Claudraband {
       hasTranscriptTurnInProgress(jsonlPath),
       hasPendingQuestion(jsonlPath),
     ]);
+    let pendingPermission = false;
     if (
       summary.alive
       && summary.reattachable
@@ -560,6 +577,7 @@ class ClaudrabandRuntime implements Claudraband {
       if (session) {
         try {
           const pane = await session.capturePane().catch(() => "");
+          pendingPermission = Boolean(pane && hasPendingNativePrompt(pane));
           if (
             !turnInProgress
             && !pendingQuestion
@@ -585,7 +603,11 @@ class ClaudrabandRuntime implements Claudraband {
     return {
       ...summary,
       turnInProgress,
-      pendingInput: pendingQuestion ? "question" : "none",
+      pendingInput: pendingPermission
+        ? "permission"
+        : pendingQuestion
+          ? "question"
+          : "none",
     };
   }
 
@@ -886,6 +908,16 @@ class ClaudrabandSessionImpl implements ClaudrabandSession {
     choice: string,
     text?: string,
   ): Promise<PromptResult> {
+    const nativePrompt = await this.visibleNativePrompt();
+    if (nativePrompt) {
+      if (text !== undefined) {
+        throw new Error(
+          `selection ${JSON.stringify(choice)} does not accept \`text\``,
+        );
+      }
+      await this.answerVisibleNativePrompt(nativePrompt, choice);
+      return { stopReason: this.wrapper.isProcessAlive() ? "end_turn" : "cancelled" };
+    }
     // "0" is the sentinel for the "Other" option, which always needs a
     // follow-up text payload (the free-form answer).
     if (choice === "0" && text) {
@@ -1028,7 +1060,10 @@ class ClaudrabandSessionImpl implements ClaudrabandSession {
     return owner.kind === "daemon" || this.backend === "tmux";
   }
 
-  async hasPendingInput(): Promise<{ pending: boolean; source: "none" | "terminal" }> {
+  async hasPendingInput(): Promise<{
+    pending: boolean;
+    source: SessionStatus["pendingInput"];
+  }> {
     const jsonlPath = sessionPath(this.cwd, this.sessionId);
     const pendingQuestion = await hasPendingQuestion(jsonlPath);
     const pendingNativePrompt = hasPendingNativePrompt(
@@ -1037,7 +1072,11 @@ class ClaudrabandSessionImpl implements ClaudrabandSession {
 
     return {
       pending: pendingQuestion || pendingNativePrompt,
-      source: pendingQuestion || pendingNativePrompt ? "terminal" : "none",
+      source: pendingNativePrompt
+        ? "permission"
+        : pendingQuestion
+          ? "question"
+          : "none",
     };
   }
 
@@ -1505,8 +1544,7 @@ class ClaudrabandSessionImpl implements ClaudrabandSession {
       ],
       options: prompt.options.map((opt) => ({
         kind:
-          opt.label.toLowerCase().startsWith("no") ||
-          opt.label.toLowerCase().startsWith("reject")
+          isRejectingNativeOptionLabel(opt.label)
             ? "reject_once"
             : "allow_once",
         optionId: opt.number,
@@ -1525,7 +1563,9 @@ class ClaudrabandSessionImpl implements ClaudrabandSession {
       outcome = decision.text === intendedText ? "consumed" : "handled";
     } else {
       const selected = prompt.options.find((option) => option.number === decision.optionId);
-      const tolerateExit = selected ? isRejectingNativeOption(selected.label) : false;
+      const tolerateExit = selected
+        ? isRejectingNativeOptionLabel(selected.label)
+        : false;
       await this.safeSendNativePermission(decision.optionId, tolerateExit);
       outcome = decision.optionId === intendedText ? "consumed" : "handled";
     }
@@ -1583,6 +1623,31 @@ class ClaudrabandSessionImpl implements ClaudrabandSession {
     return false;
   }
 
+  private async visibleNativePrompt() {
+    try {
+      return parseNativePermissionPrompt(await this.wrapper.capturePane());
+    } catch {
+      return null;
+    }
+  }
+
+  private async answerVisibleNativePrompt(
+    prompt: NativePermissionPrompt,
+    choice: string,
+  ): Promise<void> {
+    const option = prompt.options.find((candidate) => candidate.number === choice);
+    if (!option) {
+      throw new Error(`invalid selection ${JSON.stringify(choice)}`);
+    }
+    await this.safeSendNativePermission(
+      choice,
+      isRejectingNativeOptionLabel(option.label),
+    );
+    if (this.wrapper.isProcessAlive()) {
+      await this.waitForInsertMode();
+    }
+  }
+
   private async handleUserQuestion(ev: ClaudrabandEvent): Promise<boolean> {
     const parsed = parseAskUserQuestion(ev.toolInput);
     if (!parsed) {
@@ -1636,7 +1701,7 @@ class ClaudrabandSessionImpl implements ClaudrabandSession {
     request: ClaudrabandPermissionRequest,
   ): Promise<ClaudrabandPermissionDecision> {
     if (!this.onPermissionRequest) {
-      return { outcome: "cancelled" };
+      return { outcome: "deferred" };
     }
 
     try {
@@ -1656,6 +1721,7 @@ export interface InternalClaudrabandSession extends ClaudrabandSession {
 
 export const __test = {
   buildAskUserQuestionOptions,
+  inspectClaudeAccountState,
   createSession(
     wrapper: SessionWrapper,
     options: {

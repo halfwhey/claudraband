@@ -5,6 +5,7 @@ import { join } from "node:path";
 import {
   hasPendingNativePrompt,
   hasPendingToolUse,
+  pickDefaultNativePermissionOption,
   parseNativePermissionPrompt,
 } from "./inspect";
 
@@ -97,6 +98,7 @@ This command requires approval
       { number: "1", label: "No, exit" },
       { number: "2", label: "Yes, I accept" },
     ]);
+    expect(pickDefaultNativePermissionOption(parsed!)).toBe("2");
   });
 
   test("detects bypass permissions prompt from xterm serialized pane text", () => {
@@ -127,6 +129,23 @@ This command requires approval
       { number: "1", label: "No, exit" },
       { number: "2", label: "Yes, I accept" },
     ]);
+  });
+
+  test("picks the first non-reject startup option", () => {
+    expect(pickDefaultNativePermissionOption({
+      question: "startup",
+      options: [
+        { number: "1", label: "No, exit" },
+        { number: "2", label: "Yes, I accept" },
+      ],
+    })).toBe("2");
+    expect(pickDefaultNativePermissionOption({
+      question: "trust",
+      options: [
+        { number: "1", label: "Yes, I trust this folder" },
+        { number: "2", label: "No, exit" },
+      ],
+    })).toBe("1");
   });
 
   test("does not match trust prompt without both options", () => {

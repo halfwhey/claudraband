@@ -22,6 +22,18 @@ export interface NativePermissionPrompt {
   options: { number: string; label: string }[];
 }
 
+export function isRejectingNativeOptionLabel(label: string): boolean {
+  const normalized = label.trim().toLowerCase();
+  return normalized.startsWith("no") || normalized.startsWith("reject");
+}
+
+export function pickDefaultNativePermissionOption(
+  prompt: NativePermissionPrompt,
+): string | null {
+  const selected = prompt.options.find((option) => !isRejectingNativeOptionLabel(option.label));
+  return selected?.number ?? null;
+}
+
 function normalizeCapturedPane(paneText: string): string {
   return paneText
     .replace(/\r/g, "")
