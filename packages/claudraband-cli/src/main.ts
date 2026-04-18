@@ -772,6 +772,7 @@ export async function runCli(argv: string[] = process.argv.slice(2)): Promise<vo
       claudeArgs: config.claudeArgs,
       model: config.model,
       permissionMode: config.permissionMode,
+      autoAcceptStartupPrompts: config.autoAcceptStartupPrompts,
       allowTextResponses: true,
       terminalBackend: config.terminalBackend,
       turnDetection: config.turnDetection,
@@ -805,6 +806,22 @@ export async function runCli(argv: string[] = process.argv.slice(2)): Promise<vo
       process.stderr.write(`session: ${session.sessionId}\n`);
     } else if (config.debug) {
       process.stderr.write(`session: ${session.sessionId}\n`);
+    }
+
+    if (
+      !config.sessionId
+      && !config.answer
+      && (config.command === "prompt" || config.command === "send")
+    ) {
+      const pendingInput = await session.hasPendingInput();
+      if (pendingInput.source === "permission") {
+        await session.detach().catch(() => {});
+        await eventPump.catch(() => {});
+        process.stderr.write(
+          `session ${session.sessionId} is waiting for startup permission input. Use 'cband prompt --session ${session.sessionId} --select <choice>'.\n`,
+        );
+        return;
+      }
     }
 
     if (config.command === "send") {

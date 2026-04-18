@@ -48,6 +48,7 @@ Common options:
   --cwd <dir>                    Working directory for new sessions
   --model <model>                haiku | sonnet | opus
   --permission-mode <mode>       default | plan | auto | acceptEdits | dontAsk | bypassPermissions
+  --auto-accept-startup-prompts  Auto-accept native startup prompts like trust-folder warnings
   --backend <backend>            auto | tmux | xterm (default: auto)
   --turn-detection <mode>        terminal | events (default: terminal)
   -c, --claude <flags>           Advanced Claude CLI passthrough flags
@@ -83,6 +84,8 @@ id has no saved transcript, the command errors.
 
 --select answers a pending AskUserQuestion or permission prompt.
 If the selected option expects text, pass it as the trailing prompt argument.
+New sessions may also stop immediately on a startup permission prompt. In that
+case, use '--select' with Claude's raw option number on a follow-up command.
 
 Options:
   -h, --help                     Show this help
@@ -90,6 +93,7 @@ Options:
   --select <choice>              Answer a pending question or permission prompt
   --model <model>                Override the model for this turn
   --permission-mode <mode>       Override Claude permission mode
+  --auto-accept-startup-prompts  Auto-accept native startup prompts
   --backend <backend>            Local backend when starting a new session
   --turn-detection <mode>        terminal | events
   --cwd <dir>                    Working directory for new sessions
@@ -119,6 +123,7 @@ Options:
   --session <id>                 Resume the saved session with this id
   --select <choice>              Fire a pending answer selection
   --cwd <dir>                    Working directory for new sessions
+  --auto-accept-startup-prompts  Auto-accept native startup prompts
   --debug                        Show debug logging
 
 Examples:
@@ -258,6 +263,7 @@ Options:
   --port <n>                     Port to listen on (default: 7842)
   --model <model>                Default model for daemon-created sessions
   --permission-mode <mode>       Default permission mode
+  --auto-accept-startup-prompts  Auto-accept native startup prompts by default
   --backend <backend>            Backend for daemon-created sessions
   --turn-detection <mode>        terminal | events
   --cwd <dir>                    Default cwd for daemon-created sessions

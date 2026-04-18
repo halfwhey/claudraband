@@ -47,6 +47,7 @@ export interface CliConfig {
   hasExplicitClaudeArgs: boolean;
   hasExplicitModel: boolean;
   hasExplicitPermissionMode: boolean;
+  autoAcceptStartupPrompts: boolean;
   hasExplicitTerminalBackend: boolean;
   hasExplicitTurnDetection: boolean;
   model: string;
@@ -76,6 +77,7 @@ export function parseArgs(argv: string[], io: ParseIo = defaultIo): CliConfig {
     hasExplicitClaudeArgs: false,
     hasExplicitModel: false,
     hasExplicitPermissionMode: false,
+    autoAcceptStartupPrompts: false,
     hasExplicitTerminalBackend: false,
     hasExplicitTurnDetection: false,
     model: "sonnet",
@@ -146,6 +148,11 @@ export function parseArgs(argv: string[], io: ParseIo = defaultIo): CliConfig {
     if (arg === "--permission-mode" && i + 1 < argv.length) {
       explicitPermissionMode = argv[++i] as PermissionMode;
       config.hasExplicitPermissionMode = true;
+      continue;
+    }
+
+    if (arg === "--auto-accept-startup-prompts") {
+      config.autoAcceptStartupPrompts = true;
       continue;
     }
 

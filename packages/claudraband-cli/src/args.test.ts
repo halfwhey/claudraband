@@ -37,6 +37,12 @@ describe("claudraband cli args", () => {
     expect(args.prompt).toBe("hello");
   });
 
+  test("parses startup auto-accept flag", () => {
+    const args = parseArgs(["--auto-accept-startup-prompts", "hello"]);
+    expect(args.autoAcceptStartupPrompts).toBe(true);
+    expect(args.prompt).toBe("hello");
+  });
+
   test("allows local xterm prompts without forcing dangerous permission flags", () => {
     const args = parseArgs(["--backend", "xterm", "hello"]);
     expect(args.terminalBackend).toBe("xterm");

@@ -21,6 +21,7 @@ interface DaemonSessionInfo {
   sessionId: string;
   resumed?: boolean;
   backend: ResolvedTerminalBackend;
+  pendingInput: SessionStatus["pendingInput"];
 }
 
 interface DaemonSessionRequestBody {
@@ -29,6 +30,7 @@ interface DaemonSessionRequestBody {
   claudeArgs?: string[];
   model?: string;
   permissionMode?: PermissionMode;
+  autoAcceptStartupPrompts?: boolean;
   turnDetection?: TurnDetectionMode;
   requireLive?: boolean;
 }
@@ -129,6 +131,7 @@ function buildSessionRequestBody(
     ...(config.hasExplicitPermissionMode
       ? { permissionMode: config.permissionMode }
       : {}),
+    autoAcceptStartupPrompts: config.autoAcceptStartupPrompts,
     ...(config.hasExplicitTurnDetection
       ? { turnDetection: config.turnDetection }
       : {}),
@@ -399,14 +402,17 @@ class DaemonSessionProxy implements ClaudrabandSession {
     return "";
   }
 
-  async hasPendingInput(): Promise<{ pending: boolean; source: "none" | "terminal" }> {
+  async hasPendingInput(): Promise<{
+    pending: boolean;
+    source: SessionStatus["pendingInput"];
+  }> {
     const result = (await daemonGet(
       this.server,
       `/sessions/${this.sessionId}/status`,
     )) as DaemonStatusResponse;
     return {
       pending: result.pendingInput !== "none",
-      source: result.pendingInput === "none" ? "none" : "terminal",
+      source: result.pendingInput,
     };
   }
 
@@ -469,7 +475,7 @@ export async function runWithDaemon(
     })) as DaemonSessionInfo;
     if (isSelectionFlow(config) && result.resumed !== true) {
       process.stderr.write(
-        `error: session ${config.sessionId} is not live on the daemon. Cannot use --select on a pending question.\n`,
+        `error: session ${config.sessionId} is not live on the daemon. Cannot use --select on a pending question or permission prompt.\n`,
       );
       process.exit(1);
     }
@@ -490,6 +496,18 @@ export async function runWithDaemon(
     `/sessions/${sessionId}/status`,
   )) as SessionStatus;
   await trackSessionStatus(trackedStatus);
+
+  if (
+    !config.sessionId
+    && !config.answer
+    && trackedStatus?.pendingInput === "permission"
+    && (config.command === "prompt" || config.command === "send")
+  ) {
+    process.stderr.write(
+      `session ${sessionId} is waiting for startup permission input. Use 'cband prompt --session ${sessionId} --select <choice>'.\n`,
+    );
+    return;
+  }
 
   let session: DaemonSessionProxy | null = null;
   let eventPump: Promise<void> | null = null;

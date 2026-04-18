@@ -19,6 +19,7 @@ function makeConfig(overrides: Partial<CliConfig> = {}): CliConfig {
     hasExplicitClaudeArgs: true,
     hasExplicitModel: true,
     hasExplicitPermissionMode: true,
+    autoAcceptStartupPrompts: false,
     hasExplicitTerminalBackend: false,
     hasExplicitTurnDetection: true,
     model: "sonnet",
@@ -78,6 +79,7 @@ describe("daemon server helpers", () => {
       claudeArgs: ["--effort", "high"],
       model: "opus",
       permissionMode: "bypassPermissions",
+      autoAcceptStartupPrompts: false,
       turnDetection: "events",
     });
   });
@@ -90,6 +92,7 @@ describe("daemon server helpers", () => {
       claudeArgs: ["--append-system-prompt", "daemon"],
       model: "sonnet",
       permissionMode: "default",
+      autoAcceptStartupPrompts: false,
       turnDetection: "events",
     });
   });

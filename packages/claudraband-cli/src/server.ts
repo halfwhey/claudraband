@@ -1,6 +1,8 @@
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { randomUUID } from "node:crypto";
 import {
+  ClaudeAccountStateError,
+  ClaudeStartupError,
   createClaudraband,
   SessionNotFoundError,
   type Claudraband,
@@ -48,6 +50,7 @@ interface SessionRequestBody {
   claudeArgs?: string[];
   model?: string;
   permissionMode?: string;
+  autoAcceptStartupPrompts?: boolean;
   turnDetection?: TurnDetectionMode;
   requireLive?: boolean;
 }
@@ -74,6 +77,7 @@ function resolveSessionConfig(
   claudeArgs: string[];
   model: string;
   permissionMode: string;
+  autoAcceptStartupPrompts: boolean;
   turnDetection: TurnDetectionMode;
 } {
   return {
@@ -81,6 +85,8 @@ function resolveSessionConfig(
     claudeArgs: body.claudeArgs ?? config.claudeArgs,
     model: body.model ?? config.model,
     permissionMode: body.permissionMode ?? config.permissionMode,
+    autoAcceptStartupPrompts:
+      body.autoAcceptStartupPrompts ?? config.autoAcceptStartupPrompts,
     turnDetection: body.turnDetection ?? config.turnDetection,
   };
 }
@@ -171,7 +177,7 @@ function createDaemonServer(
       return "permission";
     }
     const pendingState = await ds.session.hasPendingInput();
-    return pendingState.pending ? "question" : "none";
+    return pendingState.pending ? pendingState.source : "none";
   }
 
   async function getStatusWithDaemonPending(
@@ -317,6 +323,14 @@ function createDaemonServer(
         err(res, 409, `session ${sessionId} is not live`);
         return { ok: false };
       }
+      if (
+        /invalid selection/i.test(message)
+        || /does not accept `text`/i.test(message)
+        || /requires `text`/i.test(message)
+      ) {
+        err(res, 400, message);
+        return { ok: false };
+      }
       throw e;
     }
   }
@@ -347,6 +361,7 @@ function createDaemonServer(
               sessionId: body.sessionId,
               backend: existing.session.backend,
               resumed: true,
+              pendingInput: await getPendingInput(existing),
             });
             return;
           }
@@ -377,6 +392,7 @@ function createDaemonServer(
             claudeArgs: sessionConfig.claudeArgs,
             model: sessionConfig.model,
             permissionMode: sessionConfig.permissionMode as typeof config.permissionMode,
+            autoAcceptStartupPrompts: sessionConfig.autoAcceptStartupPrompts,
             turnDetection: sessionConfig.turnDetection,
             allowTextResponses: true,
             logger,
@@ -389,6 +405,14 @@ function createDaemonServer(
             err(res, 404, e.message);
             return;
           }
+          if (e instanceof ClaudeAccountStateError) {
+            err(res, 409, e.message);
+            return;
+          }
+          if (e instanceof ClaudeStartupError) {
+            err(res, 409, e.message);
+            return;
+          }
           throw e;
         }
         ds.session = session;
@@ -398,6 +422,7 @@ function createDaemonServer(
           sessionId: session.sessionId,
           backend: session.backend,
           resumed: Boolean(body.sessionId),
+          pendingInput: await getPendingInput(ds),
         });
         return;
       }
@@ -413,10 +438,11 @@ function createDaemonServer(
             dropDeadSession(id, ds);
             continue;
           }
+          const pendingInput = await getPendingInput(ds);
           list.push({
             sessionId: id,
             alive,
-            hasPendingPermission: ds.pendingPermission !== null,
+            hasPendingPermission: pendingInput === "permission",
           });
         }
         json(res, 200, { sessions: list });
@@ -514,25 +540,30 @@ function createDaemonServer(
           return;
         }
         let permissionDecision: ClaudrabandPermissionDecision | null = null;
+        const directNativeSelection = body.select
+          && pendingInput === "permission"
+          && ds.pendingPermission === null;
+        if (directNativeSelection && body.text !== undefined) {
+          err(res, 400, `selection ${JSON.stringify(body.select)} does not accept \`text\``);
+          return;
+        }
         if (body.select && pendingInput === "permission") {
           const pending = ds.pendingPermission;
-          if (!pending) {
-            json(res, 409, promptConflictBody(sessionId, ds.session.cwd, "none"));
-            return;
-          }
-          try {
-            permissionDecision = permissionDecisionFromSelect(
-              pending.request,
-              body.select,
-              body.text,
-            );
-          } catch (error) {
-            err(
-              res,
-              400,
-              error instanceof Error ? error.message : String(error),
-            );
-            return;
+          if (pending) {
+            try {
+              permissionDecision = permissionDecisionFromSelect(
+                pending.request,
+                body.select,
+                body.text,
+              );
+            } catch (error) {
+              err(
+                res,
+                400,
+                error instanceof Error ? error.message : String(error),
+              );
+              return;
+            }
           }
         }
         if (body.select && pendingInput === "none") {
@@ -546,6 +577,9 @@ function createDaemonServer(
             const result = body.select
               ? pendingInput === "permission"
                 ? await (async () => {
+                  if (directNativeSelection) {
+                    return ds.session.answerPending(body.select, body.text);
+                  }
                   const pending = ds.pendingPermission;
                   if (!pending || !permissionDecision) {
                     throw new Error("pending permission disappeared");
@@ -595,25 +629,30 @@ function createDaemonServer(
           return;
         }
         let permissionDecision: ClaudrabandPermissionDecision | null = null;
+        const directNativeSelection = body.select
+          && pendingInput === "permission"
+          && ds.pendingPermission === null;
+        if (directNativeSelection && body.text !== undefined) {
+          err(res, 400, `selection ${JSON.stringify(body.select)} does not accept \`text\``);
+          return;
+        }
         if (body.select && pendingInput === "permission") {
           const pending = ds.pendingPermission;
-          if (!pending) {
-            json(res, 409, promptConflictBody(sessionId, ds.session.cwd, "none"));
-            return;
-          }
-          try {
-            permissionDecision = permissionDecisionFromSelect(
-              pending.request,
-              body.select,
-              body.text,
-            );
-          } catch (error) {
-            err(
-              res,
-              400,
-              error instanceof Error ? error.message : String(error),
-            );
-            return;
+          if (pending) {
+            try {
+              permissionDecision = permissionDecisionFromSelect(
+                pending.request,
+                body.select,
+                body.text,
+              );
+            } catch (error) {
+              err(
+                res,
+                400,
+                error instanceof Error ? error.message : String(error),
+              );
+              return;
+            }
           }
         }
         if (body.select && pendingInput === "none") {
@@ -622,6 +661,9 @@ function createDaemonServer(
         }
         const outcome = await runSessionOp(res, sessionId, ds, async () => {
           if (body.select && pendingInput === "permission") {
+            if (directNativeSelection) {
+              return ds.session.send(body.select);
+            }
             const pending = ds.pendingPermission;
             if (!pending || !permissionDecision) {
               throw new Error("pending permission disappeared");
@@ -704,6 +746,7 @@ export async function startServer(config: CliConfig): Promise<void> {
     claudeArgs: config.claudeArgs,
     model: config.model,
     permissionMode: config.permissionMode,
+    autoAcceptStartupPrompts: config.autoAcceptStartupPrompts,
     terminalBackend: resolveServerTerminalBackend(config),
     turnDetection: config.turnDetection,
     logger,

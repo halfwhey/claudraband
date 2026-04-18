@@ -19,6 +19,7 @@ function makeConfig(overrides: Partial<CliConfig> = {}): CliConfig {
     hasExplicitClaudeArgs: true,
     hasExplicitModel: true,
     hasExplicitPermissionMode: true,
+    autoAcceptStartupPrompts: false,
     hasExplicitTerminalBackend: false,
     hasExplicitTurnDetection: true,
     model: "opus",
@@ -45,6 +46,7 @@ describe("daemon client helpers", () => {
       claudeArgs: ["--effort", "high"],
       model: "opus",
       permissionMode: "bypassPermissions",
+      autoAcceptStartupPrompts: false,
       turnDetection: "events",
       requireLive: true,
     });
@@ -64,6 +66,7 @@ describe("daemon client helpers", () => {
 
     expect(body).toEqual({
       cwd: "/repo",
+      autoAcceptStartupPrompts: false,
     });
   });
 

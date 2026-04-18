@@ -4,6 +4,7 @@ import type { AddressInfo } from "node:net";
 import type {
   Claudraband,
   ClaudrabandEvent,
+  ClaudeAccountStateErrorKind,
   ClaudrabandPermissionRequest,
   ClaudrabandSession,
   OpenSessionOptions,
@@ -11,7 +12,12 @@ import type {
   SessionStatus,
   SessionSummary,
 } from "claudraband-core";
-import { EventKind, SessionNotFoundError } from "claudraband-core";
+import {
+  ClaudeAccountStateError,
+  ClaudeStartupError,
+  EventKind,
+  SessionNotFoundError,
+} from "claudraband-core";
 import type { CliConfig } from "./args";
 import { __test } from "./server";
 
@@ -32,6 +38,7 @@ function makeConfig(overrides: Partial<CliConfig> = {}): CliConfig {
     hasExplicitClaudeArgs: false,
     hasExplicitModel: false,
     hasExplicitPermissionMode: false,
+    autoAcceptStartupPrompts: false,
     hasExplicitTerminalBackend: false,
     hasExplicitTurnDetection: false,
     model: "haiku",
@@ -52,6 +59,7 @@ interface MockState {
   pendingInput: SessionStatus["pendingInput"];
   turnInProgress: boolean;
   permissionHandler?: OpenSessionOptions["onPermissionRequest"];
+  openSessionError: Error | null;
 }
 
 interface MockSession extends ClaudrabandSession {
@@ -197,8 +205,8 @@ function makeMockSession(id: string, state: MockState): MockSession {
     },
     async hasPendingInput() {
       return {
-        pending: state.pendingInput === "question",
-        source: state.pendingInput === "question" ? "terminal" as const : "none" as const,
+        pending: state.pendingInput !== "none",
+        source: state.pendingInput,
       };
     },
     async setModel() {},
@@ -217,6 +225,7 @@ function makeMockRuntime(): MockRuntime {
     lastText: "latest answer",
     pendingInput: "none",
     turnInProgress: false,
+    openSessionError: null,
   };
 
   const rt: MockRuntime = {
@@ -249,6 +258,9 @@ function makeMockRuntime(): MockRuntime {
       state.turnInProgress = false;
     },
     async openSession(options?: OpenSessionOptions) {
+      if (state.openSessionError) {
+        throw state.openSessionError;
+      }
       const id = options?.sessionId ?? randomUUID();
       if (options?.sessionId && rt._lastSession?.sessionId !== options.sessionId) {
         throw new SessionNotFoundError(options.sessionId);
@@ -375,6 +387,22 @@ describe("daemon HTTP API", () => {
     const body = await res.json();
     expect(body.sessionId).toBeString();
     expect(body.backend).toBe("xterm");
+    expect(body.pendingInput).toBe("none");
+  });
+
+  test("create session returns pendingInput for a startup-blocked permission prompt", async () => {
+    const { runtime } = await startTestServer();
+    runtime._state.pendingInput = "permission";
+
+    const res = await fetch(`${baseUrl}/sessions`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({}),
+    });
+
+    expect(res.status).toBe(201);
+    const body = await res.json();
+    expect(body.pendingInput).toBe("permission");
   });
 
   test("create session accepts an empty request body", async () => {
@@ -398,6 +426,47 @@ describe("daemon HTTP API", () => {
     expect(res.status).toBe(400);
     const body = await res.json();
     expect(body.error).toContain("UUID");
+  });
+
+  test("create session returns 409 when Claude account state is not ready", async () => {
+    const { runtime } = await startTestServer();
+    runtime._state.openSessionError = new ClaudeAccountStateError(
+      "not_onboarded" satisfies ClaudeAccountStateErrorKind,
+      "Claude account state is not onboarded yet.",
+      {
+        homeDir: "/home/claude",
+        claudeDir: "/home/claude/.claude",
+        claudeJsonPath: "/home/claude/.claude.json",
+        credentialsPath: "/home/claude/.claude/.credentials.json",
+      },
+    );
+
+    const res = await fetch(`${baseUrl}/sessions`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({}),
+    });
+
+    expect(res.status).toBe(409);
+    const body = await res.json();
+    expect(body.error).toContain("not onboarded");
+  });
+
+  test("create session returns 409 when Claude exits during startup", async () => {
+    const { runtime } = await startTestServer();
+    runtime._state.openSessionError = new ClaudeStartupError(
+      "Claude exited during startup. Last pane output: permission error",
+    );
+
+    const res = await fetch(`${baseUrl}/sessions`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({}),
+    });
+
+    expect(res.status).toBe(409);
+    const body = await res.json();
+    expect(body.error).toContain("Claude exited during startup");
   });
 
   // --- GET /sessions ---
@@ -689,6 +758,28 @@ describe("daemon HTTP API", () => {
     const body = await res.json();
     expect(body.stopReason).toBe("end_turn");
     expect(body.text).toBe("selected 1");
+    expect(body.pendingInput).toBe("none");
+  });
+
+  test("prompt with select answers a visible native permission prompt", async () => {
+    const { runtime } = await startTestServer();
+    const createRes = await fetch(`${baseUrl}/sessions`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({}),
+    });
+    const { sessionId } = await createRes.json();
+    runtime._state.pendingInput = "permission";
+
+    const res = await fetch(`${baseUrl}/sessions/${sessionId}/prompt`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ select: "2" }),
+    });
+
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.text).toBe("selected 2");
     expect(body.pendingInput).toBe("none");
   });
 
